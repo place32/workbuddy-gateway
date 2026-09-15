@@ -14,7 +14,7 @@
 ## 核心特性
 
 - **国内 / 国际双站反代**：国际站 `www.workbuddy.ai` 与国内站走同一套 `/v2/plugin/*` 协议，凭据文件通过 `edition` 字段区分站点，刷新 / 对话自动路由到各自上游。
-- **模型完全透传**：客户端（OpenAI SDK、Cursor、Claude Code、DSH 等）传什么 `model`（如 `hy4-preview`、`hy3-preview-agent`、`hy3`、`deepseek-v4-pro`、`glm-5.2`…），网关原样透传至腾讯上游，无白名单限制。
+- **模型完全透传**：客户端（OpenAI SDK、Cursor、Claude Code、DSH 等）传什么 `model`（如 `default-model`、`gpt-5.5`、`gpt-5.3-codex`、`gemini-3.1-pro`、`deepseek-v3-2-volc`、`kimi-k2.5`…），网关原样透传至腾讯上游，无白名单限制；`/v1/models` 返回官方客户端实际可用的模型清单。
 - **纯 CLI 控制**：终端内嵌 ASCII 二维码，国内站微信 / 企业微信扫码登录；`status` / `refresh` / `serve` 子命令完成全部管理。
 - **多账号池 + 轮询负载均衡**：支持同时挂载多个 CodeBuddy 账号（`-auth` 逗号分隔或 `-auth-dir` 目录），请求按轮询（round-robin）均匀分配到各账号，保持多账号额度使用一致；**国内站与国际站账号可混挂在同一池中**。
 - **凭据热加载（免重启）**：`serve` 运行期间自动扫描凭据来源（默认每 5 秒，`-reload-interval` 可调）：新增凭据文件自动入池、重新登录/手动更新凭据原地生效、删除凭据自动移出，全程无需重启服务。
@@ -23,7 +23,7 @@
 - **后台自动续期**：运行期间每 5 分钟检查所有账号 Token，距过期不足 15 分钟自动刷新并持久化回各自凭据文件。
 - **OpenAI 兼容协议**：`POST /v1/chat/completions`（SSE 流式 + 非流式聚合）、`POST /v1/responses`（OpenAI Responses API，支持流式语义事件、非流式与 function tools）、`GET /v1/models`、`GET /health`。
 - **深度思考透传规则**：仅当客户端显式请求 `reasoning_effort` 时转发；绝不强制注入，避免触发上游内容安全策略。
-- **反审查净化**：自动改写 Claude Code 等框架被上游逐字拉黑的固定 Prompt 语句。
+- **上游指纹对齐**：请求头逐项对齐官方客户端（详见[客户端指纹对齐](#客户端指纹对齐)），消除自造头与缺失头构成的可识别特征。
 - **会话结构自动归一化**：自动保证首条消息为 `system`，修复部分非 harness 客户端（以 `assistant` 续写或以 `tool` 回传工具结果开头）触发的上游 `first message is not system prompt` (code 11128) 报错；同时兼容 OpenAI 新版 `developer` 角色。
 - **单账号串行化**：同一账号请求自动排队，避免并发双发触发上游风控；不同账号之间可并行。
 
@@ -238,7 +238,7 @@ workbuddy-gateway monitor -journal workbuddy-gateway -lines 8
 ```bash
 curl -N -s http://127.0.0.1:8317/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"hy4-preview","messages":[{"role":"user","content":"你好"}],"stream":true}'
+  -d '{"model":"default-model","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
 Python OpenAI SDK：
@@ -248,7 +248,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8317/v1", api_key="none")
 resp = client.chat.completions.create(
-    model="hy4-preview",
+    model="default-model",
     messages=[{"role": "user", "content": "写一个快速排序"}],
 )
 print(resp.choices[0].message.content)
@@ -264,7 +264,7 @@ llm-pi-ai:
       apiKeyEnv: LOCAL_API_KEY   # 任意字符串即可
       api: openai-completions
       models:
-        - id: hy4-preview
+        - id: default-model
           contextWindow: 1000000
           maxTokens: 128000
 ```
@@ -402,6 +402,40 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
    launchctl load ~/Library/LaunchAgents/com.workbuddy.gateway.plist
    ```
 
+## 客户端指纹对齐
+
+网关向上游发起请求时，会逐项对齐官方客户端（WorkBuddyAI desktop **5.5.2** + bundled CLI **2.137.1**）的请求头，避免因自造字段或缺失字段形成可静态识别的机器特征。
+
+**对齐基线**：官方客户端发往 `/v2/chat/completions` 的真实请求头（抓包实测，共 38 项，含 3 项传输层头）。
+
+### 关键结论与依据
+
+| 项目 | 处理方式 | 依据 |
+|---|---|---|
+| `X-Client-ID` / `X-Client-Version` | **移除** | 客户端全量安装目录（含 `app.asar`）字节级 0 命中；旧值 `codebuddy-cli` / `2.143.1` 属网关自造 |
+| `Origin` / `Referer` | **移除** | Node/Electron 运行时无浏览器语义，客户端实测不发送；发送反而是不一致特征 |
+| `Accept` | `application/json`（单一值） | 客户端实测非浏览器默认的 `*/*` 列表 |
+| `User-Agent` | `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1` | 客户端 UA 组装口径：`${platform}/${ver} ${name} AI/${ver} CLI/${cliVer}` |
+| `X-Request-ID` | 32 位小写 hex，每请求唯一 | 客户端 `generateUUUID().replace(/-/g,"")` |
+| `X-Trace-ID` | 与 `X-Request-ID` **解耦**，为 OTel traceId（全链路同值） | 实测 `X-Trace-ID` == `traceparent` 的 traceId，且同一 session 内稳定 |
+| `traceparent` / `b3` / `X-B3-*` | 补齐（OTel + B3 双份） | 客户端同时发送两套传播头 |
+| `X-Conversation-*` / `X-Root-Request-ID` / `X-Agent-*` | 补齐 | 客户端会话与 Agent 语义骨架，缺失即特征 |
+| `X-Stainless-*` | 合成（7 项） | 客户端 chat 请求由 bundled OpenAI Node SDK 发出，上游始终可见该指纹族；网关用 Go `net/http` 发起，不合成即为缺失 |
+| `Accept-Encoding` | **不发送** | 客户端实测不发送；Go transport 默认自动补 `gzip`，故设 `DisableCompression: true` |
+| `X-No-*` | 仅未鉴权时成组发送，值 `"true"` | 实测两种形态：已鉴权（`Authorization`+`X-User-Id`+`X-Domain`+`X-Product`，无任何 `X-No-*`）；未鉴权仅 `X-No-*` |
+| `X-Refresh-Token` | 仅刷新链路发送，chat 不发送 | 客户端源码中该头只出现在 `auth/token/refresh` 与 `account/switch` 调用 |
+| `x-codebuddy-request` | **不合成**，仅在客户端自带时透传 | 它是客户端**本地网关**安全头（源码 `GatewayLocalServer` 模块 `withSecurityHeader` 注入），语义上非上游必需 |
+
+### 透传与合成的边界
+
+下游客户端自带的身份/会话头（`X-Conversation-ID`、`X-Agent-Intent`、`X-IDE-*`、`User-Agent`、`traceparent` 等）**优先透传**，网关仅在缺失时回退合成值。
+
+鉴权类头（`Authorization`、`X-User-Id`、`X-Enterprise-Id`、`X-Domain`、`X-Product`、`X-Refresh-Token`）**一律由账号池生成，不接受下游覆盖**，以防串号或泄权。
+
+### 回归保障
+
+`main_test.go` 中的 `TestUpstreamFingerprintMatchesRealClient` 以真实抓包基线逐项校验（不多、不少、值一致、链路 ID 形态自洽）；`TestSmokeEndToEndUpstreamHeaders` 驱动完整请求链路（含生产 transport）抓取实际发出请求头，覆盖单测无法触及的传输层差异。
+
 ## 安全提示
 
 - `workbuddy.json` 包含真实 CodeBuddy 访问凭据（Access Token / Refresh Token），**严禁提交到 Git 仓库或公开分享**；本仓库 `.gitignore` 已将其排除。
@@ -419,7 +453,7 @@ monitor: -interval <sec> · -journal <svc> · -logfile <path> · -lines <n>
 
 ## 从源码构建
 
-需要 Go 1.20+：
+需要 Go 1.26+：
 
 ```bash
 git clone https://github.com/CangShui/workbuddy-gateway.git

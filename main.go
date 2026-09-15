@@ -31,7 +31,7 @@ import (
 )
 
 const (
-	version = "1.8.1"
+	version = "1.8.2"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -54,31 +54,44 @@ const (
 // -----------------------------------------------------------------------------
 
 type upstreamProfile struct {
-	Key       string        // 存储于凭据文件 edition 字段的站点标识
-	Label     string        // 控制台展示名
-	Base      string        // 上游 API 基础地址
-	Origin    string        // Origin/Referer 伪装来源（各站 Web 控制台）
-	Platform  string        // auth/state 的 platform 参数
-	ClientUA  string        // User-Agent
-	ClientID  string        // X-Client-ID
-	ClientVer string        // X-Client-Version
-	Product   string        // X-Product
-	LoginTTL  time.Duration // login 命令等待授权完成的超时
+	Key             string        // 存储于凭据文件 edition 字段的站点标识
+	Label           string        // 控制台展示名
+	Base            string        // 上游 API 基础地址
+	Platform        string        // auth/state 的 platform 参数
+	PlatformName    string        // X-IDE-Type / X-IDE-Name（宿主产品标识）
+	PlatformVersion string        // X-IDE-Version（宿主产品版本）
+	CliVersion      string        // X-IDE-Version 回退值 + UA 尾段（bundled CLI 版本）
+	Product         string        // X-Product
+	LoginTTL        time.Duration // login 命令等待授权完成的超时
 }
+
+// 客户端身份常量：与真实客户端实测流量对齐（详见 README「客户端指纹对齐」）。
+// 这些取值来源于 WorkBuddyAI desktop 5.5.2 + bundled CLI 2.137.1 的真实抓包，
+// 而非臆造——任何自造字段（如 X-Client-ID）都会形成可静态识别的机器特征。
+const (
+	// clientDomain 是上游请求携带的 X-Domain 默认值（账号未记录 domain 时使用）。
+	clientDomain = "www.workbuddy.ai"
+	// agentIntent 对应客户端 session meta 的 codebuddy.ai/mode，默认 craft。
+	agentIntent = "craft"
+	// agentPurpose 对应主会话（非子代理）的 agentPurpose。
+	agentPurpose = "conversation"
+	// agentType 为主会话 agent 类型。
+	agentType = "main"
+)
 
 var (
 	profileCN = upstreamProfile{
 		Key: "cn", Label: "国内站",
-		Base: "https://copilot.tencent.com", Origin: "https://www.codebuddy.cn",
-		Platform: "VSCode", ClientUA: "CLI/2.143.1 CodeBuddy/2.143.1",
-		ClientID: "codebuddy-cli", ClientVer: "2.143.1", Product: "SaaS",
+		Base:     "https://copilot.tencent.com",
+		Platform: "VSCode", PlatformName: "CodeBuddy", PlatformVersion: "5.5.2",
+		CliVersion: "2.137.1", Product: "SaaS",
 		LoginTTL: 5 * time.Minute,
 	}
 	profileINTL = upstreamProfile{
 		Key: "intl", Label: "国际站",
-		Base: "https://www.workbuddy.ai", Origin: "https://www.workbuddy.ai",
-		Platform: "workbuddy-ai", ClientUA: "CLI/2.143.1 CodeBuddy/2.143.1",
-		ClientID: "codebuddy-cli", ClientVer: "2.143.1", Product: "SaaS",
+		Base:     "https://www.workbuddy.ai",
+		Platform: "workbuddy-ai", PlatformName: "WorkBuddy", PlatformVersion: "5.5.2",
+		CliVersion: "2.137.1", Product: "SaaS",
 		LoginTTL: 15 * time.Minute, // 浏览器内登录（邮箱/验证码/SSO）比扫码慢，放宽超时
 	}
 )
@@ -167,7 +180,7 @@ type Config struct {
 	AuthFile        string
 	AuthDir         string
 	AuthExplicit    bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
-	LoginIntl       bool  // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
+	LoginIntl       bool // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
 	APIKey          string
 	ProxyURL        string
 	Verbose         bool
@@ -377,6 +390,10 @@ func initHTTPClient() {
 		IdleConnTimeout:     90 * time.Second,
 		MaxIdleConnsPerHost: 10,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
+		// 真实客户端（Node/Electron + openai SDK）不发送 Accept-Encoding，而 Go transport
+		// 默认会自动补 "Accept-Encoding: gzip"。该差异属可静态识别的指纹偏差，故禁用自动压缩。
+		// 副作用仅为不再自动解压上游响应——上游因未被请求压缩也不会压缩，行为与真实客户端一致。
+		DisableCompression: true,
 	}
 	if cfg.ProxyURL != "" {
 		pURL, err := url.Parse(cfg.ProxyURL)
@@ -486,9 +503,9 @@ func isCredentialFile(name string) bool {
 }
 
 // collectConfiguredAuthPaths 解析应加载的凭据路径列表：
-//  1) -auth-dir 指定目录 → 目录下所有 workbuddy*.json
-//  2) 显式 -auth → 逗号分隔的凭据文件列表（保持用户顺序）
-//  3) 均未指定（自动发现模式）→ 扫描当前目录下所有 workbuddy*.json，
+//  1. -auth-dir 指定目录 → 目录下所有 workbuddy*.json
+//  2. 显式 -auth → 逗号分隔的凭据文件列表（保持用户顺序）
+//  3. 均未指定（自动发现模式）→ 扫描当前目录下所有 workbuddy*.json，
 //     这样把多个凭据文件放进工作目录即可自动组成多账号池；若一个都没有则回退默认 cfg.AuthFile
 func collectConfiguredAuthPaths() []string {
 	var paths []string
@@ -1008,11 +1025,13 @@ func refreshTokenPayload(sa *StoredAuth) (int, error) {
 	prof := profileForEdition(sa.Edition)
 	headers := func(r *http.Request) {
 		commonHeaders(r, prof)
+		// 客户端刷新链路实测同样携带 OTel/B3 传播头（traceSpan.requestHeaders）。
+		setTraceHeaders(r, newTraceID(), newTraceID())
 		r.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
 		if sa.Account.EnterpriseID != "" {
 			r.Header.Set("X-Enterprise-Id", sa.Account.EnterpriseID)
 		}
-		r.Header.Set("X-Auth-Refresh-Source", "workbuddy")
+		r.Header.Set("X-Auth-Refresh-Source", "plugin")
 	}
 
 	data, status, err := doJSON(cfg.HttpClient, http.MethodPost, prof.tokenRefreshURL(), headers, nil)
@@ -1420,7 +1439,7 @@ func runLogin() {
 	// 轮询 auth/token 时与官方客户端一致，显式声明无 Authorization
 	pollHeaders := func(r *http.Request) {
 		commonHeaders(r, prof)
-		r.Header.Set("X-No-Authorization", "1")
+		r.Header.Set("X-No-Authorization", "true")
 	}
 
 	data, _, err := doJSON(loginClient, http.MethodPost, prof.authStateURL(), nil, bytes.NewReader([]byte("{}")))
@@ -1732,7 +1751,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstream
 			return nil, nil, nil, false
 		}
 		// 注入 CodeBuddy 凭据与指纹 Header
-		backendHeaders(upstreamReq, acc.Auth, prof)
+		backendHeaders(upstreamReq, acc.Auth, prof, r.Header)
 
 		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控
 		acc.lock.Lock()
@@ -1808,7 +1827,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 客户端传什么 model，我们就透传什么 model 给上游，不做任何硬编码限制！
 	modelName, _ := reqObj["model"].(string)
 	if modelName == "" {
-		modelName = "hy4-preview" // 默认保底
+		modelName = "default-model" // 保底取官方客户端默认模型（product config isDefault）
 		reqObj["model"] = modelName
 	}
 
@@ -1820,7 +1839,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 深度思考 (Thinking) 自动适配：混元系列如果未关闭思考，自动赋予 high 档位保证深度思考输出
 	applyThinkingRules(reqObj, modelName)
 
-	// 模板净化：改写 Claude Code 等框架被腾讯官方逐字拉黑的固定 prompt 语句
+	// 消息归一化：developer 角色（OpenAI 新版 system 别名）在上游会被拒，统一转 system
 	sanitizeMessages(reqObj)
 
 	// 会话结构归一化：保证首条消息为 system，修复部分非 harness 客户端
@@ -1903,19 +1922,27 @@ func writeChatAggregate(w http.ResponseWriter, resp *http.Response, modelName st
 // 路由处理: /v1/models (列出常见模型供客户端自动补全)
 // -----------------------------------------------------------------------------
 
+// upstreamModelIDs 是官方客户端从远端 product config 实际获取到的模型清单
+// （acc-product-config-v3.json，26 项，国际站）。网关此前硬编码的 10 个模型与该清单
+// 零交集，会使 /v1/models 返回上游根本不存在的模型，构成可识别特征。
+// 传入未列出的 model 仍会原样透传到上游。
+var upstreamModelIDs = []string{
+	"default-model", "default-model-lite",
+	"gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gpt-5.1-codex", "gpt-5.1-codex-mini",
+	"gemini-3.1-pro", "gemini-3.0-flash", "gemini-3.5-flash", "gemini-2.5-flash",
+	"gemini-3.1-flash-lite", "gemini-2.5-pro",
+	"deepseek-v3-2-volc", "glm-5.0", "kimi-k2.5",
+	"gemini-3.0-pro-image", "gemini-3.1-flash-image", "gemini-2.5-flash-image",
+	"hunyuan-image-v3.0", "hunyuan-image-v2.0-general-edit", "hunyuan-video-art",
+	"fast-model", "balanced-model", "primary-model", "deep-model",
+}
+
 func handleModels(w http.ResponseWriter, r *http.Request) {
-	// 动态内置常见模型，用户直接传入任何未列出的 model 也会直接透传到上游
-	modelsList := []map[string]any{
-		{"id": "hy4-preview", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "hy3-preview-agent", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "hy3-preview", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "hy3", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "glm-5.2", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "glm-5.1", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "kimi-k2.7", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "deepseek-v4-pro", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "deepseek-v4-flash", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
-		{"id": "minimax-m3-pay", "object": "model", "owned_by": "workbuddy", "permission": []any{}},
+	modelsList := make([]map[string]any, 0, len(upstreamModelIDs))
+	for _, id := range upstreamModelIDs {
+		modelsList = append(modelsList, map[string]any{
+			"id": id, "object": "model", "owned_by": "workbuddy", "permission": []any{},
+		})
 	}
 	resp := map[string]any{
 		"object": "list",
@@ -1975,20 +2002,6 @@ func sanitizeMessages(obj map[string]any) {
 		// 统一归一化为 system（语义等价）。
 		if roleOfMessage(msg) == "developer" {
 			msg["role"] = "system"
-		}
-		switch c := msg["content"].(type) {
-		case string:
-			msg["content"] = sanitizeBlockedTemplates(c)
-		case []any:
-			for _, partAny := range c {
-				part, ok := partAny.(map[string]any)
-				if !ok {
-					continue
-				}
-				if t, ok := part["text"].(string); ok {
-					part["text"] = sanitizeBlockedTemplates(t)
-				}
-			}
 		}
 	}
 }
@@ -2053,59 +2066,203 @@ func roleOfMessage(m any) string {
 	return strings.ToLower(strings.TrimSpace(role))
 }
 
-func sanitizeBlockedTemplates(s string) string {
-	s = strings.ReplaceAll(s,
-		"You are Claude Code, Anthropic's official CLI for Claude.",
-		"You are Claude Code, Anthropic's official CLI tool for Claude.")
-	s = strings.ReplaceAll(s,
-		"Main branch (you will usually use this for PRs)",
-		"Default branch (you will usually use this for PRs)")
-	return s
+// newTraceID 生成 32 位小写十六进制 trace id（OTel traceId 形态，无连字符）。
+func newTraceID() string {
+	return strings.ReplaceAll(uuid.New().String(), "-", "")
 }
 
-// backendHeaders 设置 CodeBuddy 上游专用指纹与鉴权 Header（按站点 Profile 生成）
-func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile) {
-	commonHeaders(req, prof)
-	reqID := uuid.New().String()
-	req.Header.Set("X-Request-ID", reqID)
-	req.Header.Set("X-Trace-ID", reqID)
-	req.Header.Set("X-Client-ID", prof.ClientID)
-	req.Header.Set("X-Client-Version", prof.ClientVer)
+// newSpanID 生成 16 位小写十六进制 span id（OTel spanId 形态）。
+func newSpanID() string {
+	return strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+}
 
-	if sa != nil && sa.Auth.AccessToken != "" {
+// buildUserAgent 复刻客户端的 UA 组装口径：
+// `${platform}/${platformVersion} ${productName}/${productVersion} ${userAgentExtension}`。
+// 真实桌面客户端实测值为 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1`。
+func buildUserAgent(prof *upstreamProfile) string {
+	return fmt.Sprintf("%s/%s %s AI/%s CLI/%s",
+		prof.PlatformName, prof.PlatformVersion,
+		prof.PlatformName, prof.PlatformVersion,
+		prof.CliVersion)
+}
+
+// setTraceHeaders 写入 OTel + B3 双份链路传播头（客户端两套同时发送）。
+// requestID 为本次请求的唯一 ID；traceID 为全链路同一值（客户端实测 X-Trace-ID == OTel traceId）。
+// 返回 traceID 供调用方复用。
+func setTraceHeaders(req *http.Request, requestID, traceID string) {
+	spanID := newSpanID()
+	parentSpanID := newSpanID()
+
+	req.Header.Set("X-Request-ID", requestID)
+	req.Header.Set("X-Trace-ID", traceID)
+	req.Header.Set("traceparent", fmt.Sprintf("00-%s-%s-01", traceID, spanID))
+	req.Header.Set("b3", fmt.Sprintf("%s-%s-1-%s", traceID, spanID, parentSpanID))
+	req.Header.Set("X-B3-TraceId", traceID)
+	req.Header.Set("X-B3-ParentSpanId", parentSpanID)
+	req.Header.Set("X-B3-SpanId", spanID)
+	req.Header.Set("X-B3-Sampled", "1")
+}
+
+// clientPassthroughHeaders 是允许从下游客户端原样透传到上游的 Header 白名单。
+//
+// 仅包含「客户端身份 / 会话链路 / SDK 指纹」这类与账号凭据无关的字段。鉴权类字段
+// （Authorization / X-User-Id / X-Enterprise-Id / X-Domain / X-Refresh-Token / X-Product
+// / Cookie）一律不在此列——它们必须由网关按当前账号池中的账号生成，透传会串号或泄权。
+//
+// 语义：客户端真实携带时原样转发（避免网关臆造值造成特征偏差）；未携带时由
+// backendHeaders 回退到合成值。
+var clientPassthroughHeaders = []string{
+	// 会话链路
+	"X-Conversation-ID",
+	"X-Conversation-Request-ID",
+	"X-Conversation-Message-ID",
+	"X-Root-Request-ID",
+	// Agent 语义
+	"X-Agent-Type",
+	"X-Agent-Intent",
+	"X-Agent-Purpose",
+	// 宿主 IDE 标识
+	"X-IDE-Type",
+	"X-IDE-Name",
+	"X-IDE-Version",
+	// 隐私通道与本地安全头
+	"X-Private-Data",
+	"x-codebuddy-request",
+	// 链路追踪（OTel + B3）
+	"traceparent",
+	"b3",
+	"X-B3-TraceId",
+	"X-B3-ParentSpanId",
+	"X-B3-SpanId",
+	"X-B3-Sampled",
+	"X-Trace-ID",
+	"X-Request-ID",
+	"X-Requested-With",
+	"User-Agent",
+	"Accept",
+}
+
+// applyClientPassthrough 把下游客户端携带的白名单 Header 原样复制到上游请求。
+// 客户端未提供对应头时不写入，交由调用方回退合成值。
+func applyClientPassthrough(dst *http.Request, in http.Header) {
+	if in == nil {
+		return
+	}
+	for _, name := range clientPassthroughHeaders {
+		if v := in.Get(name); v != "" {
+			dst.Header.Set(name, v)
+		}
+	}
+	// OpenAI SDK（stainless）指纹族按前缀整体透传
+	for name, vals := range in {
+		if len(vals) == 0 || !strings.HasPrefix(strings.ToLower(name), "x-stainless-") {
+			continue
+		}
+		dst.Header.Set(name, vals[0])
+	}
+}
+
+// stainlessFingerprint 复刻官方客户端 chat 链路的 OpenAI Node SDK（stainless）指纹族。
+// 客户端 chat 请求由 bundled openai SDK 发出，因此上游始终能看到这一组头；
+// 网关自身用 Go net/http 发起请求，若不合成即为可识别的缺失特征。
+// 取值来自真实抓包（WorkBuddyAI desktop 5.5.2 / Node v22.22.2）。
+var stainlessFingerprint = map[string]string{
+	"X-Stainless-Arch":            "x64",
+	"X-Stainless-Lang":            "js",
+	"X-Stainless-Os":              "Windows",
+	"X-Stainless-Package-Version": "6.25.0",
+	"X-Stainless-Retry-Count":     "0",
+	"X-Stainless-Runtime":         "node",
+	"X-Stainless-Runtime-Version": "v22.22.2",
+}
+
+// backendHeaders 设置上游专用鉴权 Header 与链路追踪 Header（按站点 Profile 生成）。
+//
+// 与真实客户端实测流量的对齐要点：
+//   - 不发送 X-Client-ID / X-Client-Version：官方客户端全库无此字段，属可静态识别的机器特征。
+//   - X-Request-ID 为 32 位 hex（客户端 generateUUUID().replace(/-/g,"")），
+//     与 X-Trace-ID 解耦：后者是 OTel traceId，全链路同一值。
+//   - 补齐会话/Agent/IDE 骨架、OTel + B3 双份传播头与 stainless 指纹族，缺失同样是可识别特征。
+//   - 下游客户端自带身份头时优先透传（applyClientPassthrough），仅在缺失时合成。
+func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, in http.Header) {
+	commonHeaders(req, prof)
+
+	// 会话链路标识：requestId 每次请求唯一，traceId 在单次网关请求内固定。
+	requestID := newTraceID()
+	setTraceHeaders(req, requestID, newTraceID())
+
+	req.Header.Set("X-Conversation-Message-ID", requestID)
+	req.Header.Set("X-Conversation-Request-ID", requestID)
+	req.Header.Set("X-Root-Request-ID", requestID)
+	req.Header.Set("X-Conversation-ID", uuid.New().String())
+
+	// Agent 语义头
+	req.Header.Set("X-Agent-Type", agentType)
+	req.Header.Set("X-Agent-Intent", agentIntent)
+	req.Header.Set("X-Agent-Purpose", agentPurpose)
+
+	// 隐私通道标记：客户端 enableModelOptimization 未启用时为 "true"
+	// （国际站 product.json 的 DisableYuanbaoChannel=true ⇒ 恒为 true）。
+	req.Header.Set("X-Private-Data", "true")
+
+	// OpenAI SDK 指纹族
+	for k, v := range stainlessFingerprint {
+		req.Header.Set(k, v)
+	}
+
+	// 客户端自带身份/链路头优先（覆盖上面的合成值）
+	applyClientPassthrough(req, in)
+
+	// 鉴权与账号标识。实测两种形态：
+	//   - 已鉴权：Authorization + X-User-Id + X-Domain + X-Product（不发任何 X-No-*）
+	//   - 未鉴权（如 auth/state 轮询）：仅 X-No-* 置 "true"
+	// 因此 X-No-* 只在缺少对应凭据时成组出现，不与已鉴权字段混发。
+	authed := sa != nil && sa.Auth.AccessToken != ""
+	if authed {
 		req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
 	} else {
-		req.Header.Set("X-No-Authorization", "1")
+		req.Header.Set("X-No-Authorization", "true")
 	}
+
 	if sa != nil && sa.Account.UID != "" {
 		req.Header.Set("X-User-Id", sa.Account.UID)
 	} else {
-		req.Header.Set("X-No-User-Id", "1")
+		req.Header.Set("X-No-User-Id", "true")
 	}
+
 	if sa != nil && sa.Account.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", sa.Account.EnterpriseID)
-	} else {
-		req.Header.Set("X-No-Enterprise-Id", "1")
+	} else if !authed {
+		req.Header.Set("X-No-Enterprise-Id", "true")
+		req.Header.Set("X-No-Department-Info", "true")
 	}
-	if sa != nil && sa.Auth.RefreshToken != "" {
-		req.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
-	}
+
+	// 注意：X-Refresh-Token 只出现在 auth/token/refresh 与 account/switch 链路
+	// （客户端源码 enterpriseHeaders 之外单独注入），chat 请求实测不携带，故此处不设置。
+
+	// X-Domain 是 chat 请求的常驻头（客户端实测始终携带），无凭据时回退站点默认域名。
 	if sa != nil && sa.Auth.Domain != "" {
 		req.Header.Set("X-Domain", sa.Auth.Domain)
 	} else {
-		req.Header.Set("X-No-Department-Info", "1")
+		req.Header.Set("X-Domain", clientDomain)
 	}
+
 	req.Header.Set("X-Product", prof.Product)
 }
 
-// commonHeaders 按站点 Profile 设置通用伪装 Header（Origin/Referer/UA 因站点而异）。
+// commonHeaders 按站点 Profile 设置通用 Header。
+//
+// 与真实客户端对齐：Node/Electron 运行时不会产生浏览器语义的 Origin / Referer，
+// 客户端实测亦不发送；发送它们反而构成与官方客户端不一致的特征。
+// Accept 客户端实测为单一 application/json（非浏览器默认的 */* 列表）。
 func commonHeaders(req *http.Request, prof *upstreamProfile) {
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Origin", prof.Origin)
-	req.Header.Set("Referer", prof.Origin+"/")
-	req.Header.Set("User-Agent", prof.ClientUA)
+	req.Header.Set("User-Agent", buildUserAgent(prof))
+	req.Header.Set("X-IDE-Type", prof.PlatformName)
+	req.Header.Set("X-IDE-Name", prof.PlatformName)
+	req.Header.Set("X-IDE-Version", prof.PlatformVersion)
 }
 
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {

@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,11 +71,17 @@ func TestProfileForEdition(t *testing.T) {
 			t.Errorf("profileForEdition(%q).Key = %s, want %s", c.edition, got, c.wantKey)
 		}
 	}
-	if p := profileForEdition("intl"); p.Base != "https://www.workbuddy.ai" || p.Origin != "https://www.workbuddy.ai" {
-		t.Errorf("intl profile base/origin unexpected: %+v", p)
+	if p := profileForEdition("intl"); p.Base != "https://www.workbuddy.ai" || p.PlatformName != "WorkBuddy" {
+		t.Errorf("intl profile base/platformName unexpected: %+v", p)
 	}
 	if p := profileForEdition("cn"); p.Base != "https://copilot.tencent.com" || p.Platform != "VSCode" {
 		t.Errorf("cn profile base/platform unexpected: %+v", p)
+	}
+	// 两个站点共享同一客户端版本基线（desktop 5.5.2 + bundled CLI 2.137.1）
+	for _, p := range []*upstreamProfile{&profileCN, &profileINTL} {
+		if p.PlatformVersion != "5.5.2" || p.CliVersion != "2.137.1" {
+			t.Errorf("profile %s client version baseline unexpected: %+v", p.Key, p)
+		}
 	}
 }
 
@@ -285,7 +294,7 @@ func TestDisableAccount(t *testing.T) {
 	}
 
 	acc := &Account{Path: authPath, Auth: &StoredAuth{
-		Auth: StoredTokens{AccessToken: "x"},
+		Auth:    StoredTokens{AccessToken: "x"},
 		Account: StoredAccount{Nickname: "tester", UID: "uid-1"},
 	}}
 
@@ -909,4 +918,407 @@ func TestChatCompletionToResponses(t *testing.T) {
 		t.Fatalf("usage total = %#v", usage["total_tokens"])
 	}
 	t.Logf("responses object output items: %d", len(output))
+}
+
+// -----------------------------------------------------------------------------
+// 上游请求头指纹对齐回归
+//
+// 背景：网关此前发送的 35 个应用层头中仅 7 项与真实客户端一致（自造的 X-Client-ID /
+// X-Client-Version / Origin / Referer，以及缺失的会话、Agent、链路传播与 SDK 指纹头），
+// 构成可静态识别的机器特征。以下测试锁定与官方客户端基线的逐项一致性。
+// -----------------------------------------------------------------------------
+
+// realClientChatHeaders 是官方客户端（WorkBuddyAI desktop 5.5.2 + bundled CLI 2.137.1）
+// 发往 /v2/chat/completions 的真实请求头基线，逐字取自抓包。
+//
+// 基线含两类不参与应用层对齐的头：
+//   - 传输层：Host / Content-Length / Connection（由 net/http 自行管理）
+//   - 客户端本地网关安全头：x-codebuddy-request（源码 GatewayLocalServer 模块的
+//     withSecurityHeader 注入，仅存在于「客户端 → 本地网关」这一跳）
+var realClientChatHeaders = [][2]string{
+	{"Accept", "application/json"},
+	{"Content-Type", "application/json"},
+	{"x-requested-with", "XMLHttpRequest"},
+	{"x-stainless-arch", "x64"},
+	{"x-stainless-lang", "js"},
+	{"x-stainless-os", "Windows"},
+	{"x-stainless-package-version", "6.25.0"},
+	{"x-stainless-retry-count", "0"},
+	{"x-stainless-runtime", "node"},
+	{"x-stainless-runtime-version", "v22.22.2"},
+	{"X-Conversation-ID", "04bad56e-08d5-4647-9c3c-28e12897c1af"},
+	{"X-Conversation-Request-ID", "a2a2a25c3094ee6e6203d9e014ba6e8c"},
+	{"X-Agent-Intent", "craft"},
+	{"X-Agent-Purpose", "conversation"},
+	{"X-IDE-Type", "WorkBuddy"},
+	{"X-IDE-Name", "WorkBuddy"},
+	{"X-IDE-Version", "5.5.2"},
+	{"X-Private-Data", "true"},
+	{"X-Request-ID", "8e48c9ed463d48d08dce1185ed92b200"},
+	{"X-Conversation-Message-ID", "8e48c9ed463d48d08dce1185ed92b200"},
+	{"X-Root-Request-ID", "a2a2a25c3094ee6e6203d9e014ba6e8c"},
+	{"X-Agent-Type", "main"},
+	{"traceparent", "00-a2a2a25c3094ee6e6203d9e014ba6e8c-61cc1c019243bd0c-01"},
+	{"b3", "a2a2a25c3094ee6e6203d9e014ba6e8c-61cc1c019243bd0c-1-298ea3b5a5796f21"},
+	{"X-B3-TraceId", "a2a2a25c3094ee6e6203d9e014ba6e8c"},
+	{"X-B3-ParentSpanId", "298ea3b5a5796f21"},
+	{"X-B3-SpanId", "61cc1c019243bd0c"},
+	{"X-B3-Sampled", "1"},
+	{"X-Trace-ID", "a2a2a25c3094ee6e6203d9e014ba6e8c"},
+	// 基线中为真实 Bearer JWT，此处保留前缀（仅校验存在性与方案，不校验具体令牌）
+	{"Authorization", "Bearer eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJXVzhVVkZuS0l"},
+	{"X-User-Id", "8efc9f5d-4289-445e-b503-c8a49eeb52c5"},
+	{"X-Domain", "www.workbuddy.ai"},
+	{"X-Product", "SaaS"},
+	{"User-Agent", "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1"},
+}
+
+// nonApplicationHeaders 是不参与应用层对齐的头。
+var nonApplicationHeaders = map[string]bool{
+	"Host": true, "Content-Length": true, "Connection": true,
+	"X-Codebuddy-Request": true,
+}
+
+// 上游请求头指纹必须与真实客户端逐项一致：不多、不少、关键字段形态正确。
+func TestUpstreamFingerprintMatchesRealClient(t *testing.T) {
+	real := http.Header{}
+	for _, kv := range realClientChatHeaders {
+		real.Set(kv[0], kv[1])
+	}
+
+	sa := &StoredAuth{
+		Auth:    StoredTokens{AccessToken: "tok", RefreshToken: "ref", Domain: "www.workbuddy.ai"},
+		Account: StoredAccount{UID: "8efc9f5d-4289-445e-b503-c8a49eeb52c5"},
+		Edition: "intl",
+	}
+	req, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
+	backendHeaders(req, sa, &profileINTL, nil)
+	h := req.Header
+
+	// 1. 基线中的每个头都必须存在（凭据类值由账号池生成，故只校验存在性）
+	for name := range real {
+		if nonApplicationHeaders[http.CanonicalHeaderKey(name)] {
+			continue
+		}
+		if h.Get(name) == "" {
+			t.Errorf("MISSING header present in real client: %s = %q", name, real.Get(name))
+		}
+	}
+	// 2. 不得出现真实客户端没有的头（多余头同样是可识别特征）
+	for name := range h {
+		if nonApplicationHeaders[http.CanonicalHeaderKey(name)] {
+			continue
+		}
+		if real.Get(name) == "" {
+			t.Errorf("EXTRA header absent in real client: %s = %q", name, h.Get(name))
+		}
+	}
+
+	// 3. 值必须逐字一致的头
+	for _, name := range []string{
+		"User-Agent", "Accept", "X-IDE-Type", "X-IDE-Name", "X-IDE-Version",
+		"X-Agent-Intent", "X-Agent-Purpose", "X-Agent-Type", "X-Private-Data", "X-Product",
+	} {
+		if got, want := h.Get(name), real.Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+
+	// 4. 链路 ID 形态：32 位小写 hex，且 requestId 与 traceId 解耦
+	for _, n := range []string{"X-Request-ID", "X-Trace-ID", "X-Conversation-Request-ID", "X-Root-Request-ID", "X-Conversation-Message-ID"} {
+		v := h.Get(n)
+		if len(v) != 32 || strings.Trim(v, "0123456789abcdef") != "" {
+			t.Errorf("%s = %q, want 32 lowercase hex chars", n, v)
+		}
+	}
+	if h.Get("X-Request-ID") == h.Get("X-Trace-ID") {
+		t.Error("X-Request-ID must be decoupled from X-Trace-ID")
+	}
+	if h.Get("X-Conversation-Message-ID") != h.Get("X-Request-ID") {
+		t.Error("X-Conversation-Message-ID must equal X-Request-ID (observed client behavior)")
+	}
+	if cid := h.Get("X-Conversation-ID"); len(cid) != 36 || strings.Count(cid, "-") != 4 {
+		t.Errorf("X-Conversation-ID = %q, want dashed UUID", cid)
+	}
+
+	// 5. 链路传播头必须互相自洽
+	traceID := h.Get("X-Trace-ID")
+	if tp := h.Get("traceparent"); !strings.HasPrefix(tp, "00-"+traceID+"-") || !strings.HasSuffix(tp, "-01") {
+		t.Errorf("traceparent %q not linked to X-Trace-ID %q", tp, traceID)
+	}
+	if b3 := h.Get("b3"); !strings.HasPrefix(b3, traceID+"-"+h.Get("X-B3-SpanId")+"-1-") {
+		t.Errorf("b3 %q not linked to trace/span ids (%s/%s)", b3, traceID, h.Get("X-B3-SpanId"))
+	}
+	if h.Get("X-B3-TraceId") != traceID {
+		t.Errorf("X-B3-TraceId %q != X-Trace-ID %q", h.Get("X-B3-TraceId"), traceID)
+	}
+}
+
+// 已鉴权请求不得携带任何 X-No-*（实测未鉴权时才成组出现）。
+func TestAuthedRequestHasNoNoHeaders(t *testing.T) {
+	sa := &StoredAuth{
+		Auth:    StoredTokens{AccessToken: "tok", Domain: "www.workbuddy.ai"},
+		Account: StoredAccount{UID: "u"},
+	}
+	req, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
+	backendHeaders(req, sa, &profileINTL, nil)
+	for name := range req.Header {
+		if strings.HasPrefix(name, "X-No-") {
+			t.Errorf("authed request must not carry %s = %q", name, req.Header.Get(name))
+		}
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer tok" {
+		t.Errorf("Authorization = %q", got)
+	}
+}
+
+// 未鉴权请求（登录轮询链路）应携带 X-No-Authorization: true 并回退 X-Domain。
+func TestUnauthedRequestDeclaresNoAuth(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
+	backendHeaders(req, nil, &profileINTL, nil)
+	if got := req.Header.Get("X-No-Authorization"); got != "true" {
+		t.Errorf("X-No-Authorization = %q, want \"true\"", got)
+	}
+	if got := req.Header.Get("X-No-User-Id"); got != "true" {
+		t.Errorf("X-No-User-Id = %q, want \"true\"", got)
+	}
+	if got := req.Header.Get("X-Domain"); got != clientDomain {
+		t.Errorf("X-Domain = %q, want fallback %q", got, clientDomain)
+	}
+}
+
+// x-codebuddy-request 是客户端本地网关安全头，网关不得自行合成（会构成假特征），
+// 但客户端真带上时必须原样透传；同时客户端身份/会话头应优先于网关合成值。
+func TestClientPassthroughAndSynthesisBoundary(t *testing.T) {
+	sa := &StoredAuth{
+		Auth:    StoredTokens{AccessToken: "tok", Domain: "www.workbuddy.ai"},
+		Account: StoredAccount{UID: "u"},
+	}
+
+	// 未携带时不合成
+	req, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
+	backendHeaders(req, sa, &profileINTL, nil)
+	if v := req.Header.Get("x-codebuddy-request"); v != "" {
+		t.Errorf("gateway must not synthesize x-codebuddy-request, got %q", v)
+	}
+
+	// 携带时透传，且优先于合成值
+	in := http.Header{}
+	in.Set("x-codebuddy-request", "1")
+	in.Set("X-Conversation-ID", "11111111-2222-3333-4444-555555555555")
+	in.Set("X-Agent-Intent", "ask")
+	in.Set("User-Agent", "custom/1.0")
+	req2, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
+	backendHeaders(req2, sa, &profileINTL, in)
+	if v := req2.Header.Get("x-codebuddy-request"); v != "1" {
+		t.Errorf("client-provided x-codebuddy-request must pass through, got %q", v)
+	}
+	if v := req2.Header.Get("X-Conversation-ID"); v != "11111111-2222-3333-4444-555555555555" {
+		t.Errorf("client-provided X-Conversation-ID must win, got %q", v)
+	}
+	if v := req2.Header.Get("X-Agent-Intent"); v != "ask" {
+		t.Errorf("client-provided X-Agent-Intent must win, got %q", v)
+	}
+	if v := req2.Header.Get("User-Agent"); v != "custom/1.0" {
+		t.Errorf("client-provided User-Agent must win, got %q", v)
+	}
+}
+
+// 鉴权类头绝不能被下游客户端覆盖，否则会串号或泄权。
+func TestClientCannotOverrideCredentialHeaders(t *testing.T) {
+	sa := &StoredAuth{
+		Auth:    StoredTokens{AccessToken: "tok", RefreshToken: "ref", Domain: "www.workbuddy.ai"},
+		Account: StoredAccount{UID: "u", EnterpriseID: "ent"},
+	}
+	evil := http.Header{}
+	evil.Set("Authorization", "Bearer attacker")
+	evil.Set("X-User-Id", "attacker")
+	evil.Set("X-Domain", "evil.example")
+	evil.Set("X-Product", "evil")
+	evil.Set("X-Enterprise-Id", "evil")
+	evil.Set("X-Refresh-Token", "evil")
+
+	req, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
+	backendHeaders(req, sa, &profileINTL, evil)
+
+	for name, want := range map[string]string{
+		"Authorization":   "Bearer tok",
+		"X-User-Id":       "u",
+		"X-Domain":        "www.workbuddy.ai",
+		"X-Product":       "SaaS",
+		"X-Enterprise-Id": "ent",
+	} {
+		if got := req.Header.Get(name); got != want {
+			t.Errorf("%s = %q, want %q (must come from account pool)", name, got, want)
+		}
+	}
+	// chat 请求不携带 X-Refresh-Token（仅 auth/token/refresh 与 account/switch 链路使用）
+	if got := req.Header.Get("X-Refresh-Token"); got != "" {
+		t.Errorf("chat request must not carry X-Refresh-Token, got %q", got)
+	}
+}
+
+// /v1/models 必须返回官方客户端实际可用的模型清单（此前硬编码的 10 个模型与远端零交集）。
+func TestModelsListMatchesUpstreamCatalog(t *testing.T) {
+	rec := httptest.NewRecorder()
+	handleModels(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+
+	var resp struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Object != "list" {
+		t.Errorf("object = %q", resp.Object)
+	}
+	if len(resp.Data) != len(upstreamModelIDs) {
+		t.Fatalf("got %d models, want %d", len(resp.Data), len(upstreamModelIDs))
+	}
+	ids := make(map[string]bool, len(resp.Data))
+	for _, m := range resp.Data {
+		ids[m.ID] = true
+	}
+	for _, want := range upstreamModelIDs {
+		if !ids[want] {
+			t.Errorf("missing model %q", want)
+		}
+	}
+	// 旧硬编码模型不得回归
+	for _, stale := range []string{"hy4-preview", "hy3-preview", "minimax-m3-pay", "deepseek-v4-pro"} {
+		if ids[stale] {
+			t.Errorf("stale hardcoded model %q must not be advertised", stale)
+		}
+	}
+}
+
+// 端到端冒烟：驱动真实 handleChatCompletions → upstreamChat → 生产 transport →
+// 本地假上游，抓取实际上线请求头。覆盖单测无法触及的传输层（DisableCompression）
+// 与透传接线。
+func TestSmokeEndToEndUpstreamHeaders(t *testing.T) {
+	got := make(chan http.Header, 1)
+	gotPath := make(chan string, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath <- r.URL.Path
+		got <- r.Header.Clone()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+
+	origBase := profileINTL.Base
+	profileINTL.Base = up.URL
+	defer func() { profileINTL.Base = origBase }()
+
+	// 使用生产 transport（含 DisableCompression 等指纹相关设置），而非测试自建 client
+	origClient := cfg.HttpClient
+	initHTTPClient()
+	defer func() { cfg.HttpClient = origClient }()
+
+	// 走真实凭据加载路径
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "workbuddy-intl.json")
+	cred := map[string]any{
+		"auth": map[string]any{
+			"accessToken":  "smoke-token",
+			"refreshToken": "smoke-refresh",
+			"expiresAt":    time.Now().Add(24 * time.Hour).Unix(),
+			"domain":       "www.workbuddy.ai",
+		},
+		"account": map[string]any{"uid": "8efc9f5d-4289-445e-b503-c8a49eeb52c5", "nickname": "smoke"},
+		"edition": "intl",
+	}
+	raw, _ := json.Marshal(cred)
+	if err := os.WriteFile(credPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	accountMu.Lock()
+	prevAccounts := accounts
+	accounts = nil
+	sa, err := loadAccountFile(credPath)
+	if err != nil {
+		accounts = prevAccounts
+		accountMu.Unlock()
+		t.Fatalf("loadAccountFile: %v", err)
+	}
+	accounts = append(accounts, &Account{Path: credPath, Auth: sa, Edition: "intl"})
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = prevAccounts
+		accountMu.Unlock()
+	}()
+
+	body := `{"model":"default-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Agent-Intent", "ask") // 模拟客户端自带身份头
+	rec := httptest.NewRecorder()
+
+	handleChatCompletions(rec, req)
+
+	var h http.Header
+	select {
+	case path := <-gotPath:
+		if path != "/v2/chat/completions" {
+			t.Errorf("upstream path = %q, want /v2/chat/completions", path)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream never received request")
+	}
+	select {
+	case h = <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no headers captured")
+	}
+
+	// 客户端身份头透传生效（未被网关合成值覆盖）
+	if v := h.Get("X-Agent-Intent"); v != "ask" {
+		t.Errorf("client passthrough X-Agent-Intent = %q, want ask", v)
+	}
+	// 凭据来自账号池
+	if v := h.Get("Authorization"); v != "Bearer smoke-token" {
+		t.Errorf("Authorization = %q", v)
+	}
+	if v := h.Get("X-User-Id"); v != "8efc9f5d-4289-445e-b503-c8a49eeb52c5" {
+		t.Errorf("X-User-Id = %q", v)
+	}
+	if v := h.Get("X-Domain"); v != "www.workbuddy.ai" {
+		t.Errorf("X-Domain = %q", v)
+	}
+	// 合成指纹头存在
+	if v := h.Get("User-Agent"); v != "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1" {
+		t.Errorf("User-Agent = %q", v)
+	}
+	if v := h.Get("X-Stainless-Runtime"); v != "node" {
+		t.Errorf("X-Stainless-Runtime = %q", v)
+	}
+	if v := h.Get("x-codebuddy-request"); v != "" {
+		t.Errorf("must not synthesize x-codebuddy-request, got %q", v)
+	}
+	// 浏览器语义头不得出现
+	if v := h.Get("Origin"); v != "" {
+		t.Errorf("Origin must not be sent, got %q", v)
+	}
+	if v := h.Get("Referer"); v != "" {
+		t.Errorf("Referer must not be sent, got %q", v)
+	}
+	// 真实客户端不发 Accept-Encoding；Go transport 默认会补 gzip，故须禁用自动压缩
+	if v := h.Get("Accept-Encoding"); v != "" {
+		t.Errorf("Accept-Encoding must not be sent, got %q", v)
+	}
+	for name := range h {
+		if strings.HasPrefix(name, "X-No-") {
+			t.Errorf("authed request must not carry %s", name)
+		}
+	}
+	if !strings.Contains(rec.Body.String(), "ok") {
+		t.Errorf("client body = %q", rec.Body.String())
+	}
 }
