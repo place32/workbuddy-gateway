@@ -442,15 +442,73 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 
 **关于 HTTP/2**：实测客户端走 Node 全局 `fetch`（undici），**默认 HTTP/1.1**（抓包中带 `Host` / `Connection: keep-alive`，这两个头在 HTTP/2 中非法）。故网关**不启用** HTTP/2 —— 启用反而会引入偏差，且 h2 的 HPACK 头压缩会让键名大小写与顺序信息消失。
 
+### 会话作用域对齐（v1.8.5 新增）
+
+链路 ID 不是「每请求一套」，而是**两个作用域**。客户端源码（`chat_headers_full` 实测片段）写得很直白：
+
+```js
+ey[CONVERSATION_ID_HEADER]         = ew.id                     // 会话
+ey[CONVERSATION_REQUEST_ID_HEADER] = ew.conversationRequestId  // 会话
+ey[CONVERSATION_MESSAGE_ID_HEADER] = ew.messageId              // 每请求
+ey[REQUEST_ID_HEADER]              = ew.messageId              // 每请求
+```
+
+| 头 | 作用域 | 实测不变量（9 条会话 / 19 次请求） |
+|---|---|---|
+| `X-Conversation-ID` | 会话 | 会话内恒定，带连字符 UUID |
+| `X-Conversation-Request-ID` | 会话 | 会话内恒定，32 位 hex |
+| `X-Root-Request-ID` | 会话 | 会话内恒定，**等于** `X-Conversation-Request-ID` |
+| `X-Trace-ID` | 会话 | 会话内恒定，**等于** `X-Conversation-Request-ID` |
+| `X-B3-TraceId` | 会话 | 等于 `X-Trace-ID` |
+| `X-Request-ID` | 每请求 | 每请求变化 |
+| `X-Conversation-Message-ID` | 每请求 | 每请求变化，**等于** `X-Request-ID` |
+| `traceparent` / `b3` / `X-B3-SpanId` / `X-B3-ParentSpanId` | 每请求 | span 部分每请求变化 |
+
+网关此前把**四个会话级头也按请求新生成**，等于「同一会话的连续请求携带互不相同的会话链路 ID」—— 只要比对同一会话的两次请求即可判定，是稳定的机器特征。同时 `X-Conversation-Request-ID` 被错设为 `X-Request-ID`，单次请求内部即与客户端口径不符（前者应是会话级，后者是每请求级）。
+
+**实现**：会话级 ID 由下游会话键（`X-Conversation-ID`，缺失时回退 `X-Conversation-Request-ID`）经 `SHA-256` 派生，而非「随机生成后缓存」。
+
+| 方案 | 跨请求共享状态 | 并发 | TTL / 容量 | 重启后 |
+|---|---|---|---|---|
+| 随机生成 + map 缓存 | 需要 | 需加锁 | 需上限与过期 | 会话 ID 变化 |
+| **哈希派生（采用）** | **无** | **无竞争** | **不需要** | **稳定** |
+
+派生值取哈希前 16 字节（32 位 hex），与客户端 `X-Conversation-Request-ID` 同形态，且不泄露会话键本身（客户端传入 32 位 hex，网关发出的同样是 32 位 hex）。
+
+**下游未携带会话标识时**（如第三方 OpenAI SDK 直连，只有 `messages` 没有会话头）：不臆造会话关联，会话级 ID 退回每请求新值 —— 与旧行为一致。把无会话语义的请求错误归并到同一条链路，反而会制造出「大量不相关请求共享同一 traceId」的异常模式。
+
+**链路 ID 只有一个写入方**：这些头之间存在客户端保证的相等关系（`X-Trace-ID` == `X-Conversation-Request-ID` == `X-Root-Request-ID` == `X-B3-TraceId` == `traceparent` 的 trace 段 == `b3` 的 trace 段；span 段同理；`X-Request-ID` == `X-Conversation-Message-ID`）。
+
+因此它们**不在透传白名单**里，而是由 `resolveLinkIDs` 统一决定：**下游给出同组任一项即采用该值，并据此补齐同组其余头**。
+
+| 下游只提供 | 网关行为 |
+|---|---|
+| 仅 `traceparent` | 其 trace 段传播到 `X-Trace-ID` / `X-Conversation-Request-ID` / `X-Root-Request-ID` / `X-B3-TraceId`，span 段传播到 `b3` / `X-B3-SpanId` |
+| 仅 `b3` | 同上，并取回 `X-B3-ParentSpanId` |
+| 仅 `X-Request-ID` | 同步为 `X-Conversation-Message-ID` |
+| 仅 `X-Conversation-Request-ID` | 原样采用，并补一个形态自洽的 `X-Conversation-ID` |
+| 都不提供 | 全部新生成，组内自洽 |
+
+逐头原样透传是错的：下游只给一部分时，网关会为其余头另生成值，产出**客户端不可能产生的组合**（如 `X-B3-SpanId` 与 `traceparent` 的 span 段不等）—— 这比单纯缺失更显眼。
+
+> 补充：`X-Conversation-ID` 由客户端传入时会被原样采用，哈希派生只用于**下游缺失时**的合成，不会覆盖客户端真实会话键。
+
 ### 透传与合成的边界
 
-下游客户端自带的身份/会话头（`X-Conversation-ID`、`X-Agent-Intent`、`X-IDE-*`、`User-Agent`、`traceparent` 等）**优先透传**，网关仅在缺失时回退合成值。
+下游客户端自带的身份头（`X-Agent-Intent`、`X-IDE-*`、`User-Agent` 等）**优先透传**，网关仅在缺失时回退合成值。链路 ID 类头由 `resolveLinkIDs` 单独处理（见上一节）。
 
 鉴权类头（`Authorization`、`X-User-Id`、`X-Enterprise-Id`、`X-Domain`、`X-Product`、`X-Refresh-Token`）**一律由账号池生成，不接受下游覆盖**，以防串号或泄权。
 
 ### 回归保障
 
-`main_test.go` 中的 `TestUpstreamFingerprintMatchesRealClient` 以真实抓包基线逐项校验（不多、不少、值一致、**键名大小写逐字一致**、链路 ID 形态自洽）；`TestSmokeEndToEndUpstreamHeaders` 驱动完整请求链路（含生产 transport）抓取实际发出请求头，覆盖单测无法触及的传输层差异。
+`main_test.go` 中的 `TestUpstreamFingerprintMatchesRealClient` 以真实抓包基线逐项校验（不多、不少、值一致、**键名大小写逐字一致**、链路 ID 形态与作用域自洽）；`TestSmokeEndToEndUpstreamHeaders` 驱动完整请求链路（含生产 transport）抓取实际发出请求头，覆盖单测无法触及的传输层差异。
+
+会话作用域与链路 ID 自洽性由四个端到端用例断言（均驱动真实 `handleChatCompletions` → `upstreamChat` → 生产 transport 链路）：
+
+- `TestSessionScopedLinkIDsAreStableWithinConversation` —— 同会话连续两次请求：四个会话级头逐字恒定，`X-Request-ID` / `X-Conversation-Message-ID` / 两个 span ID 各不相同；
+- `TestSessionScopedLinkIDsDifferAcrossConversations` —— 不同会话不共享会话级 ID；
+- `TestNoConversationKeyFallsBackToPerRequestIDs` —— 无会话键时不臆造关联，退回每请求新值；
+- `TestConversationRequestIDOnlyIsAdoptedVerbatim` / `TestPartialLinkHeadersAreCompletedCoherently` —— 下游只提供部分链路头时，按不变量补齐同组伙伴（仅 `traceparent` / 仅 `b3` / 仅 `X-Request-ID` / 都不提供 四种情形）。
 
 字节级偏差由裸 TCP 监听（`captureUpstreamWire`，不经 `net/http` 解析器重新规范化）断言：
 

@@ -1188,7 +1188,7 @@ func TestUpstreamFingerprintMatchesRealClient(t *testing.T) {
 		Edition: "intl",
 	}
 	req, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
-	backendHeaders(req, sa, &profileINTL, nil)
+	backendHeaders(req, sa, &profileINTL, nil, sessionScope{})
 	h := req.Header
 
 	// 1. 基线中的每个头都必须存在（凭据类值由账号池生成，故只校验存在性）
@@ -1256,8 +1256,18 @@ func TestUpstreamFingerprintMatchesRealClient(t *testing.T) {
 	if getHeaderExact(h, "X-Request-ID") == getHeaderExact(h, "X-Trace-ID") {
 		t.Error("X-Request-ID must be decoupled from X-Trace-ID")
 	}
+	// 会话级三者同值：客户端源码 X-Trace-ID 取 OTel traceId，
+	// X-Conversation-Request-ID / X-Root-Request-ID 取 session.conversationRequestId，
+	// 9 条会话抓包实测完全相等。
+	if a, b, c := getHeaderExact(h, "X-Trace-ID"), getHeaderExact(h, "X-Conversation-Request-ID"), getHeaderExact(h, "X-Root-Request-ID"); a != b || b != c {
+		t.Errorf("session-scoped link ids must be equal: X-Trace-ID=%q X-Conversation-Request-ID=%q X-Root-Request-ID=%q", a, b, c)
+	}
 	if getHeaderExact(h, "X-Conversation-Message-ID") != getHeaderExact(h, "X-Request-ID") {
 		t.Error("X-Conversation-Message-ID must equal X-Request-ID (observed client behavior)")
+	}
+	// 每请求级与会话级必须解耦：客户端 messageId 与 conversationRequestId 是两个字段。
+	if getHeaderExact(h, "X-Request-ID") == getHeaderExact(h, "X-Conversation-Request-ID") {
+		t.Error("X-Request-ID (per-request) must be decoupled from X-Conversation-Request-ID (per-session)")
 	}
 	if cid := getHeaderExact(h, "X-Conversation-ID"); len(cid) != 36 || strings.Count(cid, "-") != 4 {
 		t.Errorf("X-Conversation-ID = %q, want dashed UUID", cid)
@@ -1283,7 +1293,7 @@ func TestAuthedRequestHasNoNoHeaders(t *testing.T) {
 		Account: StoredAccount{UID: "u"},
 	}
 	req, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
-	backendHeaders(req, sa, &profileINTL, nil)
+	backendHeaders(req, sa, &profileINTL, nil, sessionScope{})
 	for name := range req.Header {
 		if strings.HasPrefix(name, "X-No-") {
 			t.Errorf("authed request must not carry %s = %q", name, getHeaderExact(req.Header, name))
@@ -1297,7 +1307,7 @@ func TestAuthedRequestHasNoNoHeaders(t *testing.T) {
 // 未鉴权请求（登录轮询链路）应携带 X-No-Authorization: true 并回退 X-Domain。
 func TestUnauthedRequestDeclaresNoAuth(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
-	backendHeaders(req, nil, &profileINTL, nil)
+	backendHeaders(req, nil, &profileINTL, nil, sessionScope{})
 	if got := getHeaderExact(req.Header, "X-No-Authorization"); got != "true" {
 		t.Errorf("X-No-Authorization = %q, want \"true\"", got)
 	}
@@ -1319,7 +1329,7 @@ func TestClientPassthroughAndSynthesisBoundary(t *testing.T) {
 
 	// 未携带时不合成
 	req, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
-	backendHeaders(req, sa, &profileINTL, nil)
+	backendHeaders(req, sa, &profileINTL, nil, sessionScope{})
 	if v := getHeaderExact(req.Header, "x-codebuddy-request"); v != "" {
 		t.Errorf("gateway must not synthesize x-codebuddy-request, got %q", v)
 	}
@@ -1331,7 +1341,7 @@ func TestClientPassthroughAndSynthesisBoundary(t *testing.T) {
 	in.Set("X-Agent-Intent", "ask")
 	in.Set("User-Agent", "custom/1.0")
 	req2, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
-	backendHeaders(req2, sa, &profileINTL, in)
+	backendHeaders(req2, sa, &profileINTL, in, sessionScope{})
 	if v := getHeaderExact(req2.Header, "x-codebuddy-request"); v != "1" {
 		t.Errorf("client-provided x-codebuddy-request must pass through, got %q", v)
 	}
@@ -1361,7 +1371,7 @@ func TestClientCannotOverrideCredentialHeaders(t *testing.T) {
 	evil.Set("X-Refresh-Token", "evil")
 
 	req, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
-	backendHeaders(req, sa, &profileINTL, evil)
+	backendHeaders(req, sa, &profileINTL, evil, sessionScope{})
 
 	for name, want := range map[string]string{
 		"Authorization":   "Bearer tok",
@@ -1543,6 +1553,266 @@ func TestSmokeEndToEndUpstreamHeaders(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "ok") {
 		t.Errorf("client body = %q", rec.Body.String())
 	}
+}
+
+// -----------------------------------------------------------------------------
+// 会话作用域回归
+//
+// 官方客户端把链路 ID 分两个作用域（源码 + 9 条会话 / 19 次请求抓包实测）：
+//   - 会话级：X-Conversation-ID、X-Conversation-Request-ID、X-Root-Request-ID、X-Trace-ID
+//   - 每请求级：X-Request-ID、X-Conversation-Message-ID、span 部分（traceparent/b3/X-B3-*）
+//
+// 网关此前把会话级四个头也按请求新生成，导致「同一会话的连续请求携带互不相同的
+// 会话链路 ID」—— 比对同一会话的两次请求即可判定，是稳定的机器特征。
+// -----------------------------------------------------------------------------
+
+// upstreamHeadersForSession 驱动真实 handleChatCompletions 链路，返回上游收到的 Header。
+// hdrs 模拟客户端携带的会话头（如 X-Conversation-ID / X-Conversation-Request-ID）。
+func upstreamHeadersForSession(t *testing.T, hdrs map[string]string) http.Header {
+	t.Helper()
+
+	got := make(chan http.Header, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- r.Header.Clone()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+
+	origBase := profileINTL.Base
+	profileINTL.Base = up.URL
+	defer func() { profileINTL.Base = origBase }()
+
+	origClient := cfg.HttpClient
+	initHTTPClient()
+	defer func() { cfg.HttpClient = origClient }()
+
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "workbuddy-intl.json")
+	raw, _ := json.Marshal(map[string]any{
+		"auth": map[string]any{
+			"accessToken": "sess-token", "refreshToken": "r",
+			"expiresAt": time.Now().Add(24 * time.Hour).Unix(), "domain": "www.workbuddy.ai",
+		},
+		"account": map[string]any{"uid": "u1"},
+		"edition": "intl",
+	})
+	if err := os.WriteFile(credPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	accountMu.Lock()
+	prev := accounts
+	accounts = nil
+	sa, err := loadAccountFile(credPath)
+	if err != nil {
+		accounts = prev
+		accountMu.Unlock()
+		t.Fatalf("loadAccountFile: %v", err)
+	}
+	accounts = append(accounts, &Account{Path: credPath, Auth: sa, Edition: "intl"})
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = prev
+		accountMu.Unlock()
+	}()
+
+	body := `{"model":"default-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range hdrs {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+
+	select {
+	case h := <-got:
+		return h
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream never received request")
+		return nil
+	}
+}
+
+// 同一会话的连续请求必须复用会话级链路 ID，且每请求级 ID 必须各不相同。
+func TestSessionScopedLinkIDsAreStableWithinConversation(t *testing.T) {
+	const conv = "04bad56e-08d5-4647-9c3c-28e12897c1af"
+	hdrs := map[string]string{"X-Conversation-ID": conv}
+	a := upstreamHeadersForSession(t, hdrs)
+	b := upstreamHeadersForSession(t, hdrs)
+
+	// 会话级：两次请求必须逐字相同
+	for _, name := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Root-Request-ID", "X-Trace-ID"} {
+		va, vb := getHeaderExact(a, name), getHeaderExact(b, name)
+		if va != vb {
+			t.Errorf("%s must be stable within a conversation: %q vs %q", name, va, vb)
+		}
+	}
+	// 会话级三者同值（客户端源码语义 + 抓包实测）
+	if x, y, z := getHeaderExact(a, "X-Conversation-Request-ID"), getHeaderExact(a, "X-Root-Request-ID"), getHeaderExact(a, "X-Trace-ID"); x != y || y != z {
+		t.Errorf("session-scoped ids must be equal: %q %q %q", x, y, z)
+	}
+	// X-Conversation-ID 原样透传客户端会话键
+	if v := getHeaderExact(a, "X-Conversation-ID"); v != conv {
+		t.Errorf("X-Conversation-ID = %q, want client-provided %q", v, conv)
+	}
+	// 每请求级：两次请求必须不同
+	for _, name := range []string{"X-Request-ID", "X-Conversation-Message-ID", "X-B3-SpanId", "X-B3-ParentSpanId"} {
+		if va, vb := getHeaderExact(a, name), getHeaderExact(b, name); va == vb {
+			t.Errorf("%s must vary per request, got %q twice", name, va)
+		}
+	}
+	// 每请求级与会话级解耦
+	if getHeaderExact(a, "X-Request-ID") == getHeaderExact(a, "X-Trace-ID") {
+		t.Error("X-Request-ID must be decoupled from session-scoped X-Trace-ID")
+	}
+	// 形态：会话请求 ID 为 32 位小写 hex
+	if v := getHeaderExact(a, "X-Conversation-Request-ID"); len(v) != 32 || strings.Trim(v, "0123456789abcdef") != "" {
+		t.Errorf("X-Conversation-Request-ID = %q, want 32 lowercase hex", v)
+	}
+}
+
+// 不同会话必须得到不同的会话级链路 ID（不得跨会话复用）。
+func TestSessionScopedLinkIDsDifferAcrossConversations(t *testing.T) {
+	a := upstreamHeadersForSession(t, map[string]string{"X-Conversation-ID": "04bad56e-08d5-4647-9c3c-28e12897c1af"})
+	b := upstreamHeadersForSession(t, map[string]string{"X-Conversation-ID": "633ef566-21df-41b5-a796-c57fda9e29a6"})
+
+	if x, y := getHeaderExact(a, "X-Conversation-Request-ID"), getHeaderExact(b, "X-Conversation-Request-ID"); x == y {
+		t.Errorf("distinct conversations must not share X-Conversation-Request-ID: %q", x)
+	}
+	if x, y := getHeaderExact(a, "X-Conversation-ID"), getHeaderExact(b, "X-Conversation-ID"); x == y {
+		t.Errorf("distinct conversations must not share X-Conversation-ID: %q", x)
+	}
+	if x, y := getHeaderExact(a, "X-Trace-ID"), getHeaderExact(b, "X-Trace-ID"); x == y {
+		t.Errorf("distinct conversations must not share X-Trace-ID: %q", x)
+	}
+}
+
+// 下游未提供会话标识时不得臆造会话关联：会话级 ID 退回每请求新值。
+func TestNoConversationKeyFallsBackToPerRequestIDs(t *testing.T) {
+	a := upstreamHeadersForSession(t, nil)
+	b := upstreamHeadersForSession(t, nil)
+
+	for _, name := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Root-Request-ID", "X-Trace-ID"} {
+		if va, vb := getHeaderExact(a, name), getHeaderExact(b, name); va == vb {
+			t.Errorf("%s must vary per request when no conversation key is present, got %q twice", name, va)
+		}
+	}
+	// 形态仍须自洽：X-Conversation-ID 为带连字符 UUID，其余为 32 位 hex
+	if cid := getHeaderExact(a, "X-Conversation-ID"); len(cid) != 36 || strings.Count(cid, "-") != 4 {
+		t.Errorf("X-Conversation-ID = %q, want dashed UUID", cid)
+	}
+	if x, y, z := getHeaderExact(a, "X-Conversation-Request-ID"), getHeaderExact(a, "X-Root-Request-ID"), getHeaderExact(a, "X-Trace-ID"); x != y || y != z {
+		t.Errorf("session-scoped ids must still be mutually equal: %q %q %q", x, y, z)
+	}
+}
+
+// 下游只带 X-Conversation-Request-ID（无 X-Conversation-ID）时：
+// 会话级请求 ID 原样采用（保证三者同值），并补一个形态自洽的会话 ID。
+func TestConversationRequestIDOnlyIsAdoptedVerbatim(t *testing.T) {
+	const crid = "96fa0aae82d9df0aa4238fc12e42afc0"
+	hdrs := map[string]string{"X-Conversation-Request-ID": crid}
+	a := upstreamHeadersForSession(t, hdrs)
+	b := upstreamHeadersForSession(t, hdrs)
+
+	if v := getHeaderExact(a, "X-Conversation-Request-ID"); v != crid {
+		t.Errorf("X-Conversation-Request-ID = %q, want client-provided %q", v, crid)
+	}
+	// 采用客户端值后三者仍须同值
+	if x, y, z := getHeaderExact(a, "X-Conversation-Request-ID"), getHeaderExact(a, "X-Root-Request-ID"), getHeaderExact(a, "X-Trace-ID"); x != y || y != z {
+		t.Errorf("session-scoped ids must be equal: %q %q %q", x, y, z)
+	}
+	// 会话 ID 缺失时补齐，且形态为带连字符 UUID、会话内稳定、非客户端未提供的空值
+	cid := getHeaderExact(a, "X-Conversation-ID")
+	if len(cid) != 36 || strings.Count(cid, "-") != 4 {
+		t.Errorf("X-Conversation-ID = %q, want dashed UUID", cid)
+	}
+	if cid != getHeaderExact(b, "X-Conversation-ID") {
+		t.Errorf("derived X-Conversation-ID must be stable: %q vs %q", cid, getHeaderExact(b, "X-Conversation-ID"))
+	}
+	// 每请求级仍须变化
+	if getHeaderExact(a, "X-Request-ID") == getHeaderExact(b, "X-Request-ID") {
+		t.Error("X-Request-ID must vary per request")
+	}
+}
+
+// 下游只带链路 ID 的一部分时，网关必须按客户端不变量补齐同组伙伴，
+// 而不能让其余头另生成值 —— 后者会产出客户端不可能产生的组合（比缺失更显眼）。
+func TestPartialLinkHeadersAreCompletedCoherently(t *testing.T) {
+	const (
+		traceID = "a2a2a25c3094ee6e6203d9e014ba6e8c"
+		spanID  = "61cc1c019243bd0c"
+		reqID   = "8e48c9ed463d48d08dce1185ed92b200"
+	)
+
+	t.Run("only traceparent", func(t *testing.T) {
+		h := upstreamHeadersForSession(t, map[string]string{
+			"traceparent": "00-" + traceID + "-" + spanID + "-01",
+		})
+		// trace 组：下游 traceparent 的 trace 段必须传播到全部同义头
+		for _, n := range []string{"X-Trace-ID", "X-Conversation-Request-ID", "X-Root-Request-ID", "X-B3-TraceId"} {
+			if got := getHeaderExact(h, n); got != traceID {
+				t.Errorf("%s = %q, want %q (from traceparent)", n, got, traceID)
+			}
+		}
+		// span 组：traceparent 的 span 段必须与 b3 / X-B3-SpanId 一致
+		if got := getHeaderExact(h, "X-B3-SpanId"); got != spanID {
+			t.Errorf("X-B3-SpanId = %q, want %q (from traceparent)", got, spanID)
+		}
+		if b3 := getHeaderExact(h, "b3"); !strings.HasPrefix(b3, traceID+"-"+spanID+"-") {
+			t.Errorf("b3 = %q, want trace/span from traceparent (%s/%s)", b3, traceID, spanID)
+		}
+	})
+
+	t.Run("only X-Request-ID", func(t *testing.T) {
+		h := upstreamHeadersForSession(t, map[string]string{"X-Request-ID": reqID})
+		if got := getHeaderExact(h, "X-Request-ID"); got != reqID {
+			t.Errorf("X-Request-ID = %q, want %q", got, reqID)
+		}
+		// 客户端保证二者相等；只给其一时也必须一致
+		if got := getHeaderExact(h, "X-Conversation-Message-ID"); got != reqID {
+			t.Errorf("X-Conversation-Message-ID = %q, want %q (must equal X-Request-ID)", got, reqID)
+		}
+	})
+
+	t.Run("only b3", func(t *testing.T) {
+		parent := "298ea3b5a5796f21"
+		h := upstreamHeadersForSession(t, map[string]string{
+			"b3": traceID + "-" + spanID + "-1-" + parent,
+		})
+		if got := getHeaderExact(h, "X-Trace-ID"); got != traceID {
+			t.Errorf("X-Trace-ID = %q, want %q (from b3)", got, traceID)
+		}
+		if got := getHeaderExact(h, "X-B3-SpanId"); got != spanID {
+			t.Errorf("X-B3-SpanId = %q, want %q (from b3)", got, spanID)
+		}
+		if got := getHeaderExact(h, "X-B3-ParentSpanId"); got != parent {
+			t.Errorf("X-B3-ParentSpanId = %q, want %q (from b3)", got, parent)
+		}
+		if tp := getHeaderExact(h, "traceparent"); !strings.HasPrefix(tp, "00-"+traceID+"-"+spanID+"-") {
+			t.Errorf("traceparent = %q, want trace/span from b3 (%s/%s)", tp, traceID, spanID)
+		}
+	})
+
+	// 下游未提供任何链路头时，合成值内部也必须自洽
+	t.Run("none", func(t *testing.T) {
+		h := upstreamHeadersForSession(t, nil)
+		trace := getHeaderExact(h, "X-Trace-ID")
+		span := getHeaderExact(h, "X-B3-SpanId")
+		if got := getHeaderExact(h, "X-B3-TraceId"); got != trace {
+			t.Errorf("X-B3-TraceId = %q, want %q", got, trace)
+		}
+		if tp := getHeaderExact(h, "traceparent"); !strings.HasPrefix(tp, "00-"+trace+"-"+span+"-") {
+			t.Errorf("traceparent = %q, want %s/%s", tp, trace, span)
+		}
+		if b3 := getHeaderExact(h, "b3"); !strings.HasPrefix(b3, trace+"-"+span+"-") {
+			t.Errorf("b3 = %q, want %s/%s", b3, trace, span)
+		}
+	})
 }
 
 // -----------------------------------------------------------------------------

@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -32,7 +34,7 @@ import (
 )
 
 const (
-	version = "1.8.4"
+	version = "1.8.5"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -1141,7 +1143,8 @@ func refreshTokenPayload(sa *StoredAuth) (int, error) {
 	headers := func(r *http.Request) {
 		commonHeaders(r, prof)
 		// 客户端刷新链路实测同样携带 OTel/B3 传播头（traceSpan.requestHeaders）。
-		setTraceHeaders(r, newTraceID(), newTraceID())
+		// 刷新是一次独立操作、无下游会话语义，故不参与会话作用域：全部 ID 新生成。
+		setTraceHeaders(r, resolveLinkIDs(nil, sessionScope{}))
 		r.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
 		if sa.Account.EnterpriseID != "" {
 			r.Header.Set("X-Enterprise-Id", sa.Account.EnterpriseID)
@@ -2152,6 +2155,9 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstream
 
 	var lastRateErr string
 	var lastAuthErr string
+	// 会话作用域在一次下游请求内解析一次：重试换账号不应改变链路 ID，
+	// 否则同一逻辑请求会在上游留下多条互不关联的会话链路。
+	sess := newSessionScope(clientConversationIDs(r.Header))
 	for attempt := 0; attempt < poolSize; attempt++ {
 		acc, err := nextAccount()
 		if err != nil {
@@ -2192,7 +2198,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, upstream
 
 		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控
 		acc.lock.Lock()
-		backendHeaders(upstreamReq, acc.Auth, prof, r.Header)
+		backendHeaders(upstreamReq, acc.Auth, prof, r.Header, sess)
 		resp, err := cfg.HttpClient.Do(upstreamReq)
 		acc.lock.Unlock()
 		if err != nil {
@@ -2545,6 +2551,73 @@ func newSpanID() string {
 	return strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
 }
 
+// sessionScope 是「同一条下游会话」内恒定的链路标识。
+//
+// 官方客户端把链路 ID 分成两个作用域（源码 chat_headers_full 实测）：
+//
+//	ey[CONVERSATION_ID_HEADER]         = ew.id                    // 会话
+//	ey[CONVERSATION_REQUEST_ID_HEADER] = ew.conversationRequestId  // 会话
+//	ey[CONVERSATION_MESSAGE_ID_HEADER] = ew.messageId              // 每请求
+//	ey[REQUEST_ID_HEADER]              = ew.messageId              // 每请求
+//
+// 9 条会话 / 19 次请求的抓包全部满足：X-Conversation-Request-ID、X-Root-Request-ID、
+// X-Trace-ID 三者同值且会话内恒定；X-Request-ID == X-Conversation-Message-ID 且每请求变化。
+// 网关此前每次请求都新生成前一组，导致「同一会话的连续请求携带互不相同的会话链路 ID」，
+// 这是比对两次请求即可判定的机器特征。
+//
+// conversationRequestID 由会话键派生（而非随机生成后缓存），原因有三：
+//   - 无需跨请求共享可变状态，无并发问题、无 TTL、无容量上限、重启后仍稳定；
+//   - 不泄露会话键本身（客户端传 32 位 hex，网关发出的同样是 32 位 hex）；
+//   - 不同会话键必然得到不同 ID，符合「会话隔离」语义。
+type sessionScope struct {
+	conversationID        string
+	conversationRequestID string
+}
+
+// newSessionScope 解析会话级链路 ID。
+//
+// 优先级（与「客户端透传优先」一致）：
+//  1. 下游给出 X-Conversation-Request-ID 时直接采用 —— 它本身就是会话级恒定值，
+//     采用它才能保证 X-Conversation-Request-ID == X-Root-Request-ID == X-Trace-ID 恒成立；
+//  2. 仅给出 X-Conversation-ID 时，由它哈希派生出会话级请求 ID；
+//  3. 两者都缺失时返回零值，调用方回退到每请求新值 —— 不臆造会话关联，
+//     避免把无会话语义的请求错误地归并到同一条链路。
+//
+// 派生（而非随机生成后缓存）的取舍：无需跨请求共享可变状态，故无并发问题、无 TTL、
+// 无容量上限，且重启后仍稳定；不同会话键必然得到不同 ID，符合会话隔离语义。
+func newSessionScope(conversationID, conversationRequestID string) sessionScope {
+	if conversationRequestID != "" {
+		// 下游只带会话请求 ID 时，补一个形态自洽的会话 ID（带连字符 UUID）。
+		if conversationID == "" {
+			conversationID = derivedUUID(conversationRequestID)
+		}
+		return sessionScope{conversationID: conversationID, conversationRequestID: conversationRequestID}
+	}
+	if conversationID == "" {
+		return sessionScope{}
+	}
+	sum := sha256.Sum256([]byte(sessionScopeSeed + conversationID))
+	// 取前 16 字节（32 位 hex），与客户端 X-Conversation-Request-ID 同形态。
+	return sessionScope{
+		conversationID:        conversationID,
+		conversationRequestID: hex.EncodeToString(sum[:16]),
+	}
+}
+
+// sessionScopeSeed 是派生用的域分隔前缀，避免与其它哈希用途产生同值。
+const sessionScopeSeed = "workbuddy-gateway/session/"
+
+// derivedUUID 由会话键派生一个带连字符的 UUID 形态标识（不用于承载任何真实语义，
+// 仅当下游缺失 X-Conversation-ID 时保持该头的形态恒定）。
+func derivedUUID(key string) string {
+	sum := sha256.Sum256([]byte(sessionScopeSeed + "conv-id/" + key))
+	h := hex.EncodeToString(sum[:16])
+	return fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
+}
+
+// ok 表示会话键存在，会话级 ID 可用；否则调用方应回退到每请求新值。
+func (s sessionScope) ok() bool { return s.conversationRequestID != "" }
+
 // buildUserAgent 复刻客户端的 UA 组装口径：
 // `${platform}/${platformVersion} ${productName}/${productVersion} ${userAgentExtension}`。
 // 真实桌面客户端实测值为 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1`。
@@ -2582,20 +2655,180 @@ func getHeaderExact(h http.Header, name string) string {
 	return h.Get(name)
 }
 
-// setTraceHeaders 写入 OTel + B3 双份链路传播头（客户端两套同时发送）。
-// requestID 为本次请求的唯一 ID；traceID 为全链路同一值（客户端实测 X-Trace-ID == OTel traceId）。
-// 键名大小写与客户端逐字一致，见 setHeaderExact。
-func setTraceHeaders(req *http.Request, requestID, traceID string) {
-	spanID := newSpanID()
-	parentSpanID := newSpanID()
+// linkIDs 是一次上游请求要写入的全部链路 ID，已按客户端不变量两两对齐。
+//
+// 不变量（源码 + 抓包实测）：
+//
+//	traceID      : X-Trace-ID == X-Conversation-Request-ID == X-Root-Request-ID
+//	               == X-B3-TraceId == traceparent 的 trace 段 == b3 的 trace 段
+//	requestID    : X-Request-ID == X-Conversation-Message-ID
+//	spanID       : traceparent 的 span 段 == b3 的 span 段 == X-B3-SpanId
+//	parentSpanID : b3 的 parent 段 == X-B3-ParentSpanId
+type linkIDs struct {
+	conversationID string
+	requestID      string
+	traceID        string
+	spanID         string
+	parentSpanID   string
+}
 
-	setHeaderExact(req.Header, "X-Request-ID", requestID)
-	setHeaderExact(req.Header, "X-Trace-ID", traceID)
-	setHeaderExact(req.Header, "traceparent", fmt.Sprintf("00-%s-%s-01", traceID, spanID))
-	setHeaderExact(req.Header, "b3", fmt.Sprintf("%s-%s-1-%s", traceID, spanID, parentSpanID))
-	setHeaderExact(req.Header, "X-B3-TraceId", traceID)
-	setHeaderExact(req.Header, "X-B3-ParentSpanId", parentSpanID)
-	setHeaderExact(req.Header, "X-B3-SpanId", spanID)
+// resolveLinkIDs 决定本次请求的链路 ID，优先级：下游提供的值 > 会话派生值 > 新生成。
+//
+// 关键点：同一组内**任一项**由下游提供，则该组整体采用该值。客户端保证组内相等，
+// 若只透传其中一项、其余另生成，网关反而会制造出客户端不可能产生的组合
+// （例如 X-Request-ID 与 X-Conversation-Message-ID 不等、X-B3-SpanId 与 traceparent 的
+// span 段不等）。
+func resolveLinkIDs(in http.Header, sess sessionScope) linkIDs {
+	tp := getHeaderExact(in, "traceparent")
+	b3 := getHeaderExact(in, "b3")
+
+	// 会话组：下游显式给出的任一项即可确定整组（客户端保证这六项相等）。
+	traceID := firstNonEmpty(
+		getHeaderExact(in, "X-Trace-ID"),
+		getHeaderExact(in, "X-Conversation-Request-ID"),
+		getHeaderExact(in, "X-Root-Request-ID"),
+		getHeaderExact(in, "X-B3-TraceId"),
+		traceIDFromTraceparent(tp),
+		traceIDFromB3(b3),
+		sess.conversationRequestID,
+	)
+	if traceID == "" {
+		traceID = newTraceID()
+	}
+
+	// 每请求组。
+	requestID := firstNonEmpty(
+		getHeaderExact(in, "X-Request-ID"),
+		getHeaderExact(in, "X-Conversation-Message-ID"),
+	)
+	if requestID == "" {
+		requestID = newTraceID()
+	}
+
+	// span 组（每请求级）：traceparent 的 span 段 == b3 的 span 段 == X-B3-SpanId。
+	spanID := firstNonEmpty(
+		spanIDFromTraceparent(tp),
+		spanIDFromB3(b3),
+		getHeaderExact(in, "X-B3-SpanId"),
+	)
+	if spanID == "" {
+		spanID = newSpanID()
+	}
+
+	// parent span 组（每请求级）：b3 的 parent 段 == X-B3-ParentSpanId。
+	parentSpanID := firstNonEmpty(
+		parentSpanIDFromB3(b3),
+		getHeaderExact(in, "X-B3-ParentSpanId"),
+	)
+	if parentSpanID == "" {
+		parentSpanID = newSpanID()
+	}
+
+	conversationID := firstNonEmpty(getHeaderExact(in, "X-Conversation-ID"), sess.conversationID)
+	if conversationID == "" {
+		conversationID = uuid.New().String()
+	}
+
+	return linkIDs{
+		conversationID: conversationID,
+		requestID:      requestID,
+		traceID:        traceID,
+		spanID:         spanID,
+		parentSpanID:   parentSpanID,
+	}
+}
+
+// firstNonEmpty 返回首个非空值；全为空时返回空串。
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// isHexLen 判断 s 是否为 n 位小写十六进制。
+func isHexLen(s string, n int) bool {
+	return len(s) == n && strings.Trim(s, "0123456789abcdef") == ""
+}
+
+// traceIDFromTraceparent 从 W3C traceparent 头中取出 trace id。
+//
+// 格式 `00-<32hex traceId>-<16hex spanId>-<2hex flags>`。客户端实测 X-Trace-ID 与
+// traceparent 的 trace 段相等，故下游只带 traceparent 时也应据此对齐，
+// 否则网关会生成一个与 traceparent 不一致的 X-Trace-ID —— 客户端不会产生该组合。
+func traceIDFromTraceparent(tp string) string {
+	parts := strings.Split(tp, "-")
+	if len(parts) != 4 || !isHexLen(parts[1], 32) {
+		return ""
+	}
+	return parts[1]
+}
+
+// spanIDFromTraceparent 从 traceparent 中取出 span id。
+func spanIDFromTraceparent(tp string) string {
+	parts := strings.Split(tp, "-")
+	if len(parts) != 4 || !isHexLen(parts[2], 16) {
+		return ""
+	}
+	return parts[2]
+}
+
+// traceIDFromB3 从 B3 单头（`<traceId>-<spanId>-<sampled>-<parentSpanId>`）取出 trace id。
+func traceIDFromB3(b3 string) string {
+	parts := strings.Split(b3, "-")
+	if len(parts) < 3 || !isHexLen(parts[0], 32) {
+		return ""
+	}
+	return parts[0]
+}
+
+// spanIDFromB3 从 B3 单头取出 span id。
+func spanIDFromB3(b3 string) string {
+	parts := strings.Split(b3, "-")
+	if len(parts) < 3 || !isHexLen(parts[1], 16) {
+		return ""
+	}
+	return parts[1]
+}
+
+// parentSpanIDFromB3 从 B3 单头取出 parent span id（第 4 段，可选）。
+func parentSpanIDFromB3(b3 string) string {
+	parts := strings.Split(b3, "-")
+	if len(parts) < 4 || !isHexLen(parts[3], 16) {
+		return ""
+	}
+	return parts[3]
+}
+
+// clientConversationIDs 从下游入站 Header 中取出会话标识（会话 ID、会话请求 ID）。
+//
+// 官方客户端两者都发；非官方客户端可能只带其一，故分别返回，由 newSessionScope 决定键。
+//
+// 经 getHeaderExact 读取：下游入站键名已被 net/http 规范化为 X-Conversation-Id，
+// 而精确键名不存在时 getHeaderExact 会回退到 Header.Get。
+func clientConversationIDs(in http.Header) (string, string) {
+	if in == nil {
+		return "", ""
+	}
+	return getHeaderExact(in, "X-Conversation-ID"), getHeaderExact(in, "X-Conversation-Request-ID")
+}
+
+// setTraceHeaders 写入 OTel + B3 双份链路传播头（客户端两套同时发送）。
+//
+// 两套传播头必须与 ids 保持一致：客户端实测 X-Trace-ID == traceparent 的 trace 段 ==
+// b3 的 trace 段 == X-B3-TraceId，span 段同理。若下游已提供其中任一项（透传路径），
+// ids 会带回该值，此处只是把同一组值铺到全部同义头上。
+// 键名大小写与客户端逐字一致，见 setHeaderExact。
+func setTraceHeaders(req *http.Request, ids linkIDs) {
+	setHeaderExact(req.Header, "X-Request-ID", ids.requestID)
+	setHeaderExact(req.Header, "X-Trace-ID", ids.traceID)
+	setHeaderExact(req.Header, "traceparent", fmt.Sprintf("00-%s-%s-01", ids.traceID, ids.spanID))
+	setHeaderExact(req.Header, "b3", fmt.Sprintf("%s-%s-1-%s", ids.traceID, ids.spanID, ids.parentSpanID))
+	setHeaderExact(req.Header, "X-B3-TraceId", ids.traceID)
+	setHeaderExact(req.Header, "X-B3-ParentSpanId", ids.parentSpanID)
+	setHeaderExact(req.Header, "X-B3-SpanId", ids.spanID)
 	setHeaderExact(req.Header, "X-B3-Sampled", "1")
 }
 
@@ -2607,15 +2840,18 @@ func setTraceHeaders(req *http.Request, requestID, traceID string) {
 //
 // 语义：客户端真实携带时原样转发（避免网关臆造值造成特征偏差）；未携带时由
 // backendHeaders 回退到合成值。
+//
+// 注意：链路 ID 类头（X-Conversation-*、X-Root-Request-ID、X-Trace-ID、X-Request-ID、
+// traceparent、b3、X-B3-*）**不在此列**，它们由 resolveLinkIDs 统一决定。原因是这些头
+// 之间存在客户端保证的相等关系（如 traceparent 的 span 段 == b3 的 span 段 == X-B3-SpanId）。
+// 逐头原样透传时，若下游只提供了其中一部分，网关会为其余头另生成值，从而产出客户端
+// 不可能产生的组合 —— 比缺失更显眼。resolveLinkIDs 采用下游值并按不变量补齐同组伙伴，
+// 既保留了下游语义，又保证输出自洽，故这些头必须只有一个写入方。
+//
 // 键名大小写与官方客户端实测逐字一致（客户端 SDK 混用大写驼峰与全小写，
 // 网关必须复现该大小写，见 setHeaderExact）。查找时经 getHeaderExact 兼容
 // net/http 服务端已规范化过的输入键名。
 var clientPassthroughHeaders = []string{
-	// 会话链路
-	"X-Conversation-ID",
-	"X-Conversation-Request-ID",
-	"X-Conversation-Message-ID",
-	"X-Root-Request-ID",
 	// Agent 语义
 	"X-Agent-Type",
 	"X-Agent-Intent",
@@ -2627,15 +2863,8 @@ var clientPassthroughHeaders = []string{
 	// 隐私通道与本地安全头
 	"X-Private-Data",
 	"x-codebuddy-request",
-	// 链路追踪（OTel + B3）
-	"traceparent",
-	"b3",
-	"X-B3-TraceId",
-	"X-B3-ParentSpanId",
-	"X-B3-SpanId",
+	// B3 采样标志（链路 ID 本身由 resolveLinkIDs 决定，见上）
 	"X-B3-Sampled",
-	"X-Trace-ID",
-	"X-Request-ID",
 	"x-requested-with",
 	"User-Agent",
 	"Accept",
@@ -2686,17 +2915,19 @@ var stainlessFingerprint = map[string]string{
 //     与 X-Trace-ID 解耦：后者是 OTel traceId，全链路同一值。
 //   - 补齐会话/Agent/IDE 骨架、OTel + B3 双份传播头与 stainless 指纹族，缺失同样是可识别特征。
 //   - 下游客户端自带身份头时优先透传（applyClientPassthrough），仅在缺失时合成。
-func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, in http.Header) {
+//
+// 链路 ID 分两个作用域（见 sessionScope）：会话级由 sess 提供，每请求级在此新生成。
+// 下游若已提供其中任一项，则采用下游值，并按客户端的不变量补齐其同组伙伴。
+func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, in http.Header, sess sessionScope) {
 	commonHeaders(req, prof)
 
-	// 会话链路标识：requestId 每次请求唯一，traceId 在单次网关请求内固定。
-	requestID := newTraceID()
-	setTraceHeaders(req, requestID, newTraceID())
+	ids := resolveLinkIDs(in, sess)
+	setTraceHeaders(req, ids)
 
-	setHeaderExact(req.Header, "X-Conversation-Message-ID", requestID)
-	setHeaderExact(req.Header, "X-Conversation-Request-ID", requestID)
-	setHeaderExact(req.Header, "X-Root-Request-ID", requestID)
-	setHeaderExact(req.Header, "X-Conversation-ID", uuid.New().String())
+	setHeaderExact(req.Header, "X-Conversation-Message-ID", ids.requestID)
+	setHeaderExact(req.Header, "X-Conversation-Request-ID", ids.traceID)
+	setHeaderExact(req.Header, "X-Root-Request-ID", ids.traceID)
+	setHeaderExact(req.Header, "X-Conversation-ID", ids.conversationID)
 
 	// Agent 语义头
 	setHeaderExact(req.Header, "X-Agent-Type", agentType)
