@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	version = "1.8.3"
+	version = "1.8.4"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -2270,27 +2270,31 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	var reqObj map[string]any
-	if err := json.Unmarshal(bodyBytes, &reqObj); err != nil {
+	// 用保序解析替代 map[string]any：客户端以 JSON.stringify 发送，键序即属性插入顺序，
+	// 经 map 中转后重编码会按键名字典序输出（messages 跑到 model 之前），构成机器特征。
+	reqObj, err := decodeOrderedJSON(bodyBytes)
+	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_json", "无效的 JSON 请求体")
 		return
 	}
 
 	// 核心特性：完全透传 model 字段
 	// 客户端传什么 model，我们就透传什么 model 给上游，不做任何硬编码限制！
-	modelName, _ := reqObj["model"].(string)
-	if modelName == "" {
-		modelName = "default-model" // 保底取官方客户端默认模型（product config isDefault）
-		reqObj["model"] = modelName
+	modelName, _ := reqObj.Get("model")
+	modelStr, _ := modelName.(string)
+	if modelStr == "" {
+		modelStr = "default-model" // 保底取官方客户端默认模型（product config isDefault）
+		reqObj.Set("model", modelStr)
 	}
 
-	isStream, _ := reqObj["stream"].(bool)
+	isStream, _ := reqObj.Get("stream")
+	isStreamBool, _ := isStream.(bool)
 
 	// 腾讯上游强制要求 stream 必须为 true，非流式会被拦截 (code 11101)
-	reqObj["stream"] = true
+	reqObj.Set("stream", true)
 
 	// 深度思考 (Thinking) 自动适配：混元系列如果未关闭思考，自动赋予 high 档位保证深度思考输出
-	applyThinkingRules(reqObj, modelName)
+	applyThinkingRules(reqObj, modelStr)
 
 	// 消息归一化：developer 角色（OpenAI 新版 system 别名）在上游会被拒，统一转 system
 	sanitizeMessages(reqObj)
@@ -2299,26 +2303,27 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	//（以 assistant / tool 续写或回传工具结果）触发的上游 11128 错误
 	ensureLeadingSystemMessage(reqObj)
 
-	upstreamBytes, err := json.Marshal(reqObj)
+	// 以客户端口径序列化：不转义 < > &，无尾随换行
+	upstreamBytes, err := marshalJSON(reqObj)
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "encode_error", "序列化请求失败")
 		return
 	}
 
 	if cfg.Verbose {
-		log.Printf("[#%d][Req] Model: %s | Stream: %v | BodyLen: %d", reqID, modelName, isStream, len(upstreamBytes))
+		log.Printf("[#%d][Req] Model: %s | Stream: %v | BodyLen: %d", reqID, modelStr, isStreamBool, len(upstreamBytes))
 	} else {
-		log.Printf("[#%d] POST /v1/chat/completions -> Upstream [Model: %s, Stream: %v]", reqID, modelName, isStream)
+		log.Printf("[#%d] POST /v1/chat/completions -> Upstream [Model: %s, Stream: %v]", reqID, modelStr, isStreamBool)
 	}
 
 	resp, acc, prof, ok := upstreamChat(w, r, reqID, upstreamBytes, startTime)
 	if !ok {
 		return
 	}
-	if isStream {
+	if isStreamBool {
 		streamChatResponse(w, resp, reqID, acc, prof, startTime)
 	} else {
-		writeChatAggregate(w, resp, modelName, reqID, acc, prof, startTime)
+		writeChatAggregate(w, resp, modelStr, reqID, acc, prof, startTime)
 	}
 }
 
@@ -2427,26 +2432,31 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 // 请求转译与净化工具函数
 // -----------------------------------------------------------------------------
 
-func applyThinkingRules(obj map[string]any, modelName string) {
+func applyThinkingRules(obj *jsonObject, modelName string) {
 	// 遵循 CodeBuddy 规范：仅当客户端显式设置了 reasoning_effort 时才传递与规范化
 	// 绝不可强行对普通请求注入 reasoning_effort，否则极易触发腾讯内容与安全策略拦截 (code 11128)
-	currEff, exists := obj["reasoning_effort"].(string)
-	if !exists || currEff == "" || currEff == "off" || currEff == "none" {
-		delete(obj, "reasoning_effort")
-		delete(obj, "reasoning_summary")
+	currEff, _ := obj.Get("reasoning_effort")
+	eff, _ := currEff.(string)
+	if eff == "" || eff == "off" || eff == "none" {
+		obj.Delete("reasoning_effort")
+		obj.Delete("reasoning_summary")
 		return
 	}
 	// 客户端显式请求思考时，设置 auto
-	obj["reasoning_summary"] = "auto"
+	obj.Set("reasoning_summary", "auto")
 }
 
-func sanitizeMessages(obj map[string]any) {
-	messages, ok := obj["messages"].([]any)
+func sanitizeMessages(obj *jsonObject) {
+	messages, ok := obj.Get("messages")
 	if !ok {
 		return
 	}
-	for _, m := range messages {
-		msg, ok := m.(map[string]any)
+	arr, ok := messages.([]any)
+	if !ok {
+		return
+	}
+	for _, m := range arr {
+		msg, ok := m.(*jsonObject)
 		if !ok {
 			continue
 		}
@@ -2454,7 +2464,7 @@ func sanitizeMessages(obj map[string]any) {
 		// 会返回 11128 "Illegal API invocation from an unapproved channel"，
 		// 统一归一化为 system（语义等价）。
 		if roleOfMessage(msg) == "developer" {
-			msg["role"] = "system"
+			msg.Set("role", "system")
 		}
 	}
 }
@@ -2469,10 +2479,15 @@ func sanitizeMessages(obj map[string]any) {
 //  2. 首条是 developer（OpenAI 新版 system 别名）：重命名为 system；
 //  3. 后续存在 system/developer：提升到首位（developer 归一化为 system），其余保持原序；
 //  4. 其余情况（user / assistant / tool 开头且无 system）：在最前注入一条保底 system。
-func ensureLeadingSystemMessage(obj map[string]any) {
-	messages, ok := obj["messages"].([]any)
+func ensureLeadingSystemMessage(obj *jsonObject) {
+	raw, ok := obj.Get("messages")
+	if !ok {
+		obj.Set("messages", []any{newObject("role", "system", "content", defaultSystemPrompt)})
+		return
+	}
+	messages, ok := raw.([]any)
 	if !ok || len(messages) == 0 {
-		obj["messages"] = []any{map[string]any{"role": "system", "content": defaultSystemPrompt}}
+		obj.Set("messages", []any{newObject("role", "system", "content", defaultSystemPrompt)})
 		return
 	}
 
@@ -2480,8 +2495,8 @@ func ensureLeadingSystemMessage(obj map[string]any) {
 	case "system":
 		return
 	case "developer":
-		if msg, ok := messages[0].(map[string]any); ok {
-			msg["role"] = "system"
+		if msg, ok := messages[0].(*jsonObject); ok {
+			msg.Set("role", "system")
 		}
 		return
 	}
@@ -2490,33 +2505,34 @@ func ensureLeadingSystemMessage(obj map[string]any) {
 	for i := 1; i < len(messages); i++ {
 		switch roleOfMessage(messages[i]) {
 		case "system", "developer":
-			if msg, ok := messages[i].(map[string]any); ok {
-				msg["role"] = "system"
+			if msg, ok := messages[i].(*jsonObject); ok {
+				msg.Set("role", "system")
 			}
 			reordered := make([]any, 0, len(messages))
 			reordered = append(reordered, messages[i])
 			reordered = append(reordered, messages[:i]...)
 			reordered = append(reordered, messages[i+1:]...)
-			obj["messages"] = reordered
+			obj.Set("messages", reordered)
 			return
 		}
 	}
 
 	// 无任何 system：在最前注入保底 system（兼容国内站/国际站）
 	injected := make([]any, 0, len(messages)+1)
-	injected = append(injected, map[string]any{"role": "system", "content": defaultSystemPrompt})
+	injected = append(injected, newObject("role", "system", "content", defaultSystemPrompt))
 	injected = append(injected, messages...)
-	obj["messages"] = injected
+	obj.Set("messages", injected)
 }
 
 // roleOfMessage 读取消息的 role 字段并归一化为小写去空格；非法结构返回空串。
 func roleOfMessage(m any) string {
-	msg, ok := m.(map[string]any)
+	msg, ok := m.(*jsonObject)
 	if !ok {
 		return ""
 	}
-	role, _ := msg["role"].(string)
-	return strings.ToLower(strings.TrimSpace(role))
+	role, _ := msg.Get("role")
+	s, _ := role.(string)
+	return strings.ToLower(strings.TrimSpace(s))
 }
 
 // newTraceID 生成 32 位小写十六进制 trace id（OTel traceId 形态，无连字符）。
@@ -2539,21 +2555,48 @@ func buildUserAgent(prof *upstreamProfile) string {
 		prof.CliVersion)
 }
 
+// setHeaderExact 以调用方给定的大小写逐字写入 Header，绕过 net/http 的 MIME 规范化。
+//
+// http.Header.Set 会经 textproto.CanonicalMIMEHeaderKey 归一化键名，把 `ID` 变成 `Id`、
+// `IDE` 变成 `Ide`、`TraceId` 变成 `Traceid`。HTTP/1.1 在线上按 map 中存储的键名逐字发送
+// （Header.Write 不重新规范化），因此规范化后的键名会与官方客户端产生可静态识别的偏差：
+//
+//	客户端           网关（规范化后）
+//	X-Request-ID  →  X-Request-Id
+//	X-Trace-ID    →  X-Trace-Id
+//	X-IDE-Type    →  X-Ide-Type
+//	X-B3-TraceId  →  X-B3-Traceid
+//	x-requested-with → X-Requested-With
+//
+// 直接写入 map 可保留客户端原始大小写。
+func setHeaderExact(h http.Header, name, value string) {
+	h[name] = []string{value}
+}
+
+// getHeaderExact 读取 setHeaderExact 写入的 Header：先按原始键名精确命中，
+// 再回退到规范化查找（兼容由 net/http 服务端解析器规范化过的输入）。
+func getHeaderExact(h http.Header, name string) string {
+	if v, ok := h[name]; ok && len(v) > 0 {
+		return v[0]
+	}
+	return h.Get(name)
+}
+
 // setTraceHeaders 写入 OTel + B3 双份链路传播头（客户端两套同时发送）。
 // requestID 为本次请求的唯一 ID；traceID 为全链路同一值（客户端实测 X-Trace-ID == OTel traceId）。
-// 返回 traceID 供调用方复用。
+// 键名大小写与客户端逐字一致，见 setHeaderExact。
 func setTraceHeaders(req *http.Request, requestID, traceID string) {
 	spanID := newSpanID()
 	parentSpanID := newSpanID()
 
-	req.Header.Set("X-Request-ID", requestID)
-	req.Header.Set("X-Trace-ID", traceID)
-	req.Header.Set("traceparent", fmt.Sprintf("00-%s-%s-01", traceID, spanID))
-	req.Header.Set("b3", fmt.Sprintf("%s-%s-1-%s", traceID, spanID, parentSpanID))
-	req.Header.Set("X-B3-TraceId", traceID)
-	req.Header.Set("X-B3-ParentSpanId", parentSpanID)
-	req.Header.Set("X-B3-SpanId", spanID)
-	req.Header.Set("X-B3-Sampled", "1")
+	setHeaderExact(req.Header, "X-Request-ID", requestID)
+	setHeaderExact(req.Header, "X-Trace-ID", traceID)
+	setHeaderExact(req.Header, "traceparent", fmt.Sprintf("00-%s-%s-01", traceID, spanID))
+	setHeaderExact(req.Header, "b3", fmt.Sprintf("%s-%s-1-%s", traceID, spanID, parentSpanID))
+	setHeaderExact(req.Header, "X-B3-TraceId", traceID)
+	setHeaderExact(req.Header, "X-B3-ParentSpanId", parentSpanID)
+	setHeaderExact(req.Header, "X-B3-SpanId", spanID)
+	setHeaderExact(req.Header, "X-B3-Sampled", "1")
 }
 
 // clientPassthroughHeaders 是允许从下游客户端原样透传到上游的 Header 白名单。
@@ -2564,6 +2607,9 @@ func setTraceHeaders(req *http.Request, requestID, traceID string) {
 //
 // 语义：客户端真实携带时原样转发（避免网关臆造值造成特征偏差）；未携带时由
 // backendHeaders 回退到合成值。
+// 键名大小写与官方客户端实测逐字一致（客户端 SDK 混用大写驼峰与全小写，
+// 网关必须复现该大小写，见 setHeaderExact）。查找时经 getHeaderExact 兼容
+// net/http 服务端已规范化过的输入键名。
 var clientPassthroughHeaders = []string{
 	// 会话链路
 	"X-Conversation-ID",
@@ -2590,7 +2636,7 @@ var clientPassthroughHeaders = []string{
 	"X-B3-Sampled",
 	"X-Trace-ID",
 	"X-Request-ID",
-	"X-Requested-With",
+	"x-requested-with",
 	"User-Agent",
 	"Accept",
 }
@@ -2602,16 +2648,18 @@ func applyClientPassthrough(dst *http.Request, in http.Header) {
 		return
 	}
 	for _, name := range clientPassthroughHeaders {
-		if v := in.Get(name); v != "" {
-			dst.Header.Set(name, v)
+		if v := getHeaderExact(in, name); v != "" {
+			setHeaderExact(dst.Header, name, v)
 		}
 	}
-	// OpenAI SDK（stainless）指纹族按前缀整体透传
+	// OpenAI SDK（stainless）指纹族按前缀整体透传。客户端发出的键名为全小写，
+	// 故透传时同样写全小写（Go 服务端已把入站键名规范化为 X-Stainless-*，
+	// 这里统一还原为客户端实际发送的小写形态）。
 	for name, vals := range in {
 		if len(vals) == 0 || !strings.HasPrefix(strings.ToLower(name), "x-stainless-") {
 			continue
 		}
-		dst.Header.Set(name, vals[0])
+		setHeaderExact(dst.Header, strings.ToLower(name), vals[0])
 	}
 }
 
@@ -2619,14 +2667,15 @@ func applyClientPassthrough(dst *http.Request, in http.Header) {
 // 客户端 chat 请求由 bundled openai SDK 发出，因此上游始终能看到这一组头；
 // 网关自身用 Go net/http 发起请求，若不合成即为可识别的缺失特征。
 // 取值来自真实抓包（WorkBuddyAI desktop 5.5.2 / Node v22.22.2）。
+// 键名为全小写：openai SDK 以全小写发出这一族头，上游按原样可见。
 var stainlessFingerprint = map[string]string{
-	"X-Stainless-Arch":            "x64",
-	"X-Stainless-Lang":            "js",
-	"X-Stainless-Os":              "Windows",
-	"X-Stainless-Package-Version": "6.25.0",
-	"X-Stainless-Retry-Count":     "0",
-	"X-Stainless-Runtime":         "node",
-	"X-Stainless-Runtime-Version": "v22.22.2",
+	"x-stainless-arch":            "x64",
+	"x-stainless-lang":            "js",
+	"x-stainless-os":              "Windows",
+	"x-stainless-package-version": "6.25.0",
+	"x-stainless-retry-count":     "0",
+	"x-stainless-runtime":         "node",
+	"x-stainless-runtime-version": "v22.22.2",
 }
 
 // backendHeaders 设置上游专用鉴权 Header 与链路追踪 Header（按站点 Profile 生成）。
@@ -2644,23 +2693,23 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, in
 	requestID := newTraceID()
 	setTraceHeaders(req, requestID, newTraceID())
 
-	req.Header.Set("X-Conversation-Message-ID", requestID)
-	req.Header.Set("X-Conversation-Request-ID", requestID)
-	req.Header.Set("X-Root-Request-ID", requestID)
-	req.Header.Set("X-Conversation-ID", uuid.New().String())
+	setHeaderExact(req.Header, "X-Conversation-Message-ID", requestID)
+	setHeaderExact(req.Header, "X-Conversation-Request-ID", requestID)
+	setHeaderExact(req.Header, "X-Root-Request-ID", requestID)
+	setHeaderExact(req.Header, "X-Conversation-ID", uuid.New().String())
 
 	// Agent 语义头
-	req.Header.Set("X-Agent-Type", agentType)
-	req.Header.Set("X-Agent-Intent", agentIntent)
-	req.Header.Set("X-Agent-Purpose", agentPurpose)
+	setHeaderExact(req.Header, "X-Agent-Type", agentType)
+	setHeaderExact(req.Header, "X-Agent-Intent", agentIntent)
+	setHeaderExact(req.Header, "X-Agent-Purpose", agentPurpose)
 
 	// 隐私通道标记：客户端 enableModelOptimization 未启用时为 "true"
 	// （国际站 product.json 的 DisableYuanbaoChannel=true ⇒ 恒为 true）。
-	req.Header.Set("X-Private-Data", "true")
+	setHeaderExact(req.Header, "X-Private-Data", "true")
 
 	// OpenAI SDK 指纹族
 	for k, v := range stainlessFingerprint {
-		req.Header.Set(k, v)
+		setHeaderExact(req.Header, k, v)
 	}
 
 	// 客户端自带身份/链路头优先（覆盖上面的合成值）
@@ -2672,22 +2721,22 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, in
 	// 因此 X-No-* 只在缺少对应凭据时成组出现，不与已鉴权字段混发。
 	authed := sa != nil && sa.Auth.AccessToken != ""
 	if authed {
-		req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
+		setHeaderExact(req.Header, "Authorization", "Bearer "+sa.Auth.AccessToken)
 	} else {
-		req.Header.Set("X-No-Authorization", "true")
+		setHeaderExact(req.Header, "X-No-Authorization", "true")
 	}
 
 	if sa != nil && sa.Account.UID != "" {
-		req.Header.Set("X-User-Id", sa.Account.UID)
+		setHeaderExact(req.Header, "X-User-Id", sa.Account.UID)
 	} else {
-		req.Header.Set("X-No-User-Id", "true")
+		setHeaderExact(req.Header, "X-No-User-Id", "true")
 	}
 
 	if sa != nil && sa.Account.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", sa.Account.EnterpriseID)
+		setHeaderExact(req.Header, "X-Enterprise-Id", sa.Account.EnterpriseID)
 	} else if !authed {
-		req.Header.Set("X-No-Enterprise-Id", "true")
-		req.Header.Set("X-No-Department-Info", "true")
+		setHeaderExact(req.Header, "X-No-Enterprise-Id", "true")
+		setHeaderExact(req.Header, "X-No-Department-Info", "true")
 	}
 
 	// 注意：X-Refresh-Token 只出现在 auth/token/refresh 与 account/switch 链路
@@ -2695,12 +2744,12 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, in
 
 	// X-Domain 是 chat 请求的常驻头（客户端实测始终携带），无凭据时回退站点默认域名。
 	if sa != nil && sa.Auth.Domain != "" {
-		req.Header.Set("X-Domain", sa.Auth.Domain)
+		setHeaderExact(req.Header, "X-Domain", sa.Auth.Domain)
 	} else {
-		req.Header.Set("X-Domain", clientDomain)
+		setHeaderExact(req.Header, "X-Domain", clientDomain)
 	}
 
-	req.Header.Set("X-Product", prof.Product)
+	setHeaderExact(req.Header, "X-Product", prof.Product)
 }
 
 // commonHeaders 按站点 Profile 设置通用 Header。
@@ -2709,13 +2758,14 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, in
 // 客户端实测亦不发送；发送它们反而构成与官方客户端不一致的特征。
 // Accept 客户端实测为单一 application/json（非浏览器默认的 */* 列表）。
 func commonHeaders(req *http.Request, prof *upstreamProfile) {
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("User-Agent", buildUserAgent(prof))
-	req.Header.Set("X-IDE-Type", prof.PlatformName)
-	req.Header.Set("X-IDE-Name", prof.PlatformName)
-	req.Header.Set("X-IDE-Version", prof.PlatformVersion)
+	setHeaderExact(req.Header, "Content-Type", "application/json")
+	setHeaderExact(req.Header, "Accept", "application/json")
+	// 客户端实测为全小写 `x-requested-with`（axios 默认头，未经规范化）
+	setHeaderExact(req.Header, "x-requested-with", "XMLHttpRequest")
+	setHeaderExact(req.Header, "User-Agent", buildUserAgent(prof))
+	setHeaderExact(req.Header, "X-IDE-Type", prof.PlatformName)
+	setHeaderExact(req.Header, "X-IDE-Name", prof.PlatformName)
+	setHeaderExact(req.Header, "X-IDE-Version", prof.PlatformVersion)
 }
 
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {

@@ -42,30 +42,33 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	var respReq map[string]any
-	if err := json.Unmarshal(bodyBytes, &respReq); err != nil {
+	respReq, err := decodeOrderedJSON(bodyBytes)
+	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_json", "无效的 JSON 请求体")
 		return
 	}
 
-	modelName, _ := respReq["model"].(string)
+	modelRaw, _ := respReq.Get("model")
+	modelName, _ := modelRaw.(string)
 	if modelName == "" {
 		modelName = "hy4-preview"
 	}
-	isStream, _ := respReq["stream"].(bool)
+	streamRaw, _ := respReq.Get("stream")
+	isStream, _ := streamRaw.(bool)
 
 	chatReq, err := responsesToChatRequest(respReq, modelName)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	chatReq["stream"] = true // 上游强制流式，非流式由网关本地聚合
+	chatReq.Set("stream", true) // 上游强制流式，非流式由网关本地聚合
 
 	applyThinkingRules(chatReq, modelName)
 	sanitizeMessages(chatReq)
 	ensureLeadingSystemMessage(chatReq)
 
-	upstreamBytes, err := json.Marshal(chatReq)
+	// 以客户端口径序列化：不转义 < > &，无尾随换行
+	upstreamBytes, err := marshalJSON(chatReq)
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "encode_error", "序列化请求失败")
 		return
@@ -85,25 +88,31 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 }
 
 // responsesToChatRequest 将 Responses 请求体转换为上游 Chat Completions 请求体。
-func responsesToChatRequest(respReq map[string]any, modelName string) (map[string]any, error) {
-	chat := map[string]any{"model": modelName}
+//
+// 键序对齐客户端 JSON.stringify 输出：model 在首位，随后 messages，再是可选参数。
+func responsesToChatRequest(respReq *jsonObject, modelName string) (*jsonObject, error) {
+	chat := newJSONObject()
+	chat.Set("model", modelName)
 
 	messages := []any{}
-	if instructions, ok := respReq["instructions"].(string); ok && strings.TrimSpace(instructions) != "" {
-		messages = append(messages, map[string]any{"role": "system", "content": instructions})
+	if instructionsRaw, _ := respReq.Get("instructions"); instructionsRaw != nil {
+		if instructions, ok := instructionsRaw.(string); ok && strings.TrimSpace(instructions) != "" {
+			messages = append(messages, newObject("role", "system", "content", instructions))
+		}
 	}
 
-	switch input := respReq["input"].(type) {
+	inputRaw, _ := respReq.Get("input")
+	switch input := inputRaw.(type) {
 	case string:
 		if strings.TrimSpace(input) != "" {
-			messages = append(messages, map[string]any{"role": "user", "content": input})
+			messages = append(messages, newObject("role", "user", "content", input))
 		}
 	case []any:
 		for _, itemAny := range input {
 			switch item := itemAny.(type) {
 			case string:
-				messages = append(messages, map[string]any{"role": "user", "content": item})
-			case map[string]any:
+				messages = append(messages, newObject("role", "user", "content", item))
+			case *jsonObject:
 				messages = append(messages, convertResponsesInputItem(item)...)
 			}
 		}
@@ -112,67 +121,84 @@ func responsesToChatRequest(respReq map[string]any, modelName string) (map[strin
 	if len(messages) == 0 {
 		return nil, fmt.Errorf("input 为空：Responses 请求必须提供 input 或 instructions")
 	}
-	chat["messages"] = messages
+	chat.Set("messages", messages)
 
-	if v, ok := respReq["temperature"]; ok && v != nil {
-		chat["temperature"] = v
+	if v, ok := respReq.Get("temperature"); ok && v != nil {
+		chat.Set("temperature", v)
 	}
-	if v, ok := respReq["top_p"]; ok && v != nil {
-		chat["top_p"] = v
+	if v, ok := respReq.Get("top_p"); ok && v != nil {
+		chat.Set("top_p", v)
 	}
-	if v, ok := respReq["max_output_tokens"]; ok && v != nil {
-		chat["max_tokens"] = v
+	if v, ok := respReq.Get("max_output_tokens"); ok && v != nil {
+		chat.Set("max_tokens", v)
 	}
-	if tools := convertResponsesTools(respReq["tools"]); len(tools) > 0 {
-		chat["tools"] = tools
+	if toolsRaw, _ := respReq.Get("tools"); toolsRaw != nil {
+		if tools := convertResponsesTools(toolsRaw); len(tools) > 0 {
+			chat.Set("tools", tools)
+		}
 	}
-	if tc := convertResponsesToolChoice(respReq["tool_choice"]); tc != nil {
-		chat["tool_choice"] = tc
+	if tcRaw, _ := respReq.Get("tool_choice"); tcRaw != nil {
+		if tc := convertResponsesToolChoice(tcRaw); tc != nil {
+			chat.Set("tool_choice", tc)
+		}
 	}
-	if reasoning, ok := respReq["reasoning"].(map[string]any); ok {
-		if effort, ok := reasoning["effort"].(string); ok && effort != "" && effort != "none" {
-			chat["reasoning_effort"] = effort
+	if reasoningRaw, _ := respReq.Get("reasoning"); reasoningRaw != nil {
+		if reasoning, ok := reasoningRaw.(*jsonObject); ok {
+			effortRaw, _ := reasoning.Get("effort")
+			if effort, ok := effortRaw.(string); ok && effort != "" && effort != "none" {
+				chat.Set("reasoning_effort", effort)
+			}
 		}
 	}
 	return chat, nil
 }
 
 // convertResponsesInputItem 将单个 Responses input item 转换为 0..1 条 chat 消息。
-func convertResponsesInputItem(item map[string]any) []any {
-	switch typ, _ := item["type"].(string); typ {
+func convertResponsesInputItem(item *jsonObject) []any {
+	typRaw, _ := item.Get("type")
+	typ, _ := typRaw.(string)
+	switch typ {
 	case "function_call":
-		callID, _ := item["call_id"].(string)
+		callIDRaw, _ := item.Get("call_id")
+		callID, _ := callIDRaw.(string)
 		if callID == "" {
-			callID, _ = item["id"].(string)
+			idRaw, _ := item.Get("id")
+			callID, _ = idRaw.(string)
 		}
-		name, _ := item["name"].(string)
-		args, _ := item["arguments"].(string)
-		return []any{map[string]any{
-			"role":    "assistant",
-			"content": nil,
-			"tool_calls": []any{map[string]any{
-				"id":       ifEmpty(callID, "call_"+compactUUID()),
-				"type":     "function",
-				"function": map[string]any{"name": name, "arguments": args},
-			}},
-		}}
+		nameRaw, _ := item.Get("name")
+		name, _ := nameRaw.(string)
+		argsRaw, _ := item.Get("arguments")
+		args, _ := argsRaw.(string)
+		return []any{newObject(
+			"role", "assistant",
+			"content", nil,
+			"tool_calls", []any{newObject(
+				"id", ifEmpty(callID, "call_"+compactUUID()),
+				"type", "function",
+				"function", newObject("name", name, "arguments", args),
+			)},
+		)}
 	case "function_call_output":
-		callID, _ := item["call_id"].(string)
-		return []any{map[string]any{
-			"role":         "tool",
-			"tool_call_id": callID,
-			"content":      stringifyToolOutput(item["output"]),
-		}}
+		callIDRaw, _ := item.Get("call_id")
+		callID, _ := callIDRaw.(string)
+		outRaw, _ := item.Get("output")
+		return []any{newObject(
+			"role", "tool",
+			"tool_call_id", callID,
+			"content", stringifyToolOutput(outRaw),
+		)}
 	case "reasoning":
 		// 上游无法接收 reasoning item，忽略（历史上下文不影响后续对话）
 		return nil
 	}
 
-	role, _ := item["role"].(string)
+	roleRaw, _ := item.Get("role")
+	role, _ := roleRaw.(string)
 	if role == "" {
 		role = "user"
 	}
-	return []any{map[string]any{"role": role, "content": convertResponsesContent(item["content"])}}
+	contentRaw, _ := item.Get("content")
+	return []any{newObject("role", role, "content", convertResponsesContent(contentRaw))}
 }
 
 // convertResponsesContent 将 Responses content（string 或 parts 数组）转换为 chat content。
@@ -185,26 +211,32 @@ func convertResponsesContent(content any) any {
 	case []any:
 		parts := make([]any, 0, len(c))
 		for _, pAny := range c {
-			p, ok := pAny.(map[string]any)
+			p, ok := pAny.(*jsonObject)
 			if !ok {
 				if s, ok := pAny.(string); ok {
-					parts = append(parts, map[string]any{"type": "text", "text": s})
+					parts = append(parts, newObject("type", "text", "text", s))
 				}
 				continue
 			}
-			switch typ, _ := p["type"].(string); typ {
+			typRaw, _ := p.Get("type")
+			switch typ, _ := typRaw.(string); typ {
 			case "input_text", "output_text", "text":
-				if t, ok := p["text"].(string); ok {
-					parts = append(parts, map[string]any{"type": "text", "text": t})
+				if t, ok := p.Get("text"); ok {
+					if ts, ok := t.(string); ok {
+						parts = append(parts, newObject("type", "text", "text", ts))
+					}
 				}
 			case "refusal":
-				if t, ok := p["refusal"].(string); ok {
-					parts = append(parts, map[string]any{"type": "text", "text": t})
+				if t, ok := p.Get("refusal"); ok {
+					if ts, ok := t.(string); ok {
+						parts = append(parts, newObject("type", "text", "text", ts))
+					}
 				}
 			case "input_image":
-				url, _ := p["image_url"].(string)
+				urlRaw, _ := p.Get("image_url")
+				url, _ := urlRaw.(string)
 				if url != "" {
-					parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
+					parts = append(parts, newObject("type", "image_url", "image_url", newObject("url", url)))
 				}
 			}
 		}
@@ -225,7 +257,7 @@ func stringifyToolOutput(output any) string {
 	case string:
 		return o
 	default:
-		if b, err := json.Marshal(o); err == nil {
+		if b, err := marshalJSON(o); err == nil {
 			return string(b)
 		}
 		return fmt.Sprintf("%v", o)
@@ -240,36 +272,44 @@ func convertResponsesTools(toolsAny any) []any {
 	}
 	out := make([]any, 0, len(arr))
 	for _, tAny := range arr {
-		t, ok := tAny.(map[string]any)
+		t, ok := tAny.(*jsonObject)
 		if !ok {
 			continue
 		}
-		typ, _ := t["type"].(string)
+		typRaw, _ := t.Get("type")
+		typ, _ := typRaw.(string)
 		if typ != "" && typ != "function" {
 			continue // 仅支持 function 工具
 		}
-		name, _ := t["name"].(string)
-		desc, _ := t["description"].(string)
-		params := t["parameters"]
+		nameRaw, _ := t.Get("name")
+		name, _ := nameRaw.(string)
+		descRaw, _ := t.Get("description")
+		desc, _ := descRaw.(string)
+		params, _ := t.Get("parameters")
 		if name == "" {
 			// 兼容旧式嵌套 {type:"function", function:{...}}
-			if fn, ok := t["function"].(map[string]any); ok {
-				name, _ = fn["name"].(string)
-				desc, _ = fn["description"].(string)
-				params = fn["parameters"]
+			if fnRaw, ok := t.Get("function"); ok {
+				if fn, ok := fnRaw.(*jsonObject); ok {
+					fnName, _ := fn.Get("name")
+					name, _ = fnName.(string)
+					fnDesc, _ := fn.Get("description")
+					desc, _ = fnDesc.(string)
+					params, _ = fn.Get("parameters")
+				}
 			}
 		}
 		if name == "" {
 			continue
 		}
-		fn := map[string]any{"name": name}
+		fn := newJSONObject()
+		fn.Set("name", name)
 		if desc != "" {
-			fn["description"] = desc
+			fn.Set("description", desc)
 		}
 		if params != nil {
-			fn["parameters"] = params
+			fn.Set("parameters", params)
 		}
-		out = append(out, map[string]any{"type": "function", "function": fn})
+		out = append(out, newObject("type", "function", "function", fn))
 	}
 	return out
 }
@@ -281,16 +321,21 @@ func convertResponsesToolChoice(tc any) any {
 		if v == "auto" || v == "none" || v == "required" {
 			return v
 		}
-	case map[string]any:
-		if typ, _ := v["type"].(string); typ == "function" {
-			name, _ := v["name"].(string)
+	case *jsonObject:
+		typRaw, _ := v.Get("type")
+		if typ, _ := typRaw.(string); typ == "function" {
+			nameRaw, _ := v.Get("name")
+			name, _ := nameRaw.(string)
 			if name == "" {
-				if fn, ok := v["function"].(map[string]any); ok {
-					name, _ = fn["name"].(string)
+				if fnRaw, ok := v.Get("function"); ok {
+					if fn, ok := fnRaw.(*jsonObject); ok {
+						fnName, _ := fn.Get("name")
+						name, _ = fnName.(string)
+					}
 				}
 			}
 			if name != "" {
-				return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+				return newObject("type", "function", "function", newObject("name", name))
 			}
 		}
 	}

@@ -422,11 +422,25 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 | `X-Trace-ID` | 与 `X-Request-ID` **解耦**，为 OTel traceId（全链路同值） | 实测 `X-Trace-ID` == `traceparent` 的 traceId，且同一 session 内稳定 |
 | `traceparent` / `b3` / `X-B3-*` | 补齐（OTel + B3 双份） | 客户端同时发送两套传播头 |
 | `X-Conversation-*` / `X-Root-Request-ID` / `X-Agent-*` | 补齐 | 客户端会话与 Agent 语义骨架，缺失即特征 |
-| `X-Stainless-*` | 合成（7 项） | 客户端 chat 请求由 bundled OpenAI Node SDK 发出，上游始终可见该指纹族；网关用 Go `net/http` 发起，不合成即为缺失 |
+| `x-stainless-*` | 合成（7 项，**全小写键名**） | 客户端 chat 请求由 bundled OpenAI Node SDK 发出，上游始终可见该指纹族；网关用 Go `net/http` 发起，不合成即为缺失。SDK 以全小写发出该族头 |
 | `Accept-Encoding` | **不发送** | 客户端实测不发送；Go transport 默认自动补 `gzip`，故设 `DisableCompression: true` |
 | `X-No-*` | 仅未鉴权时成组发送，值 `"true"` | 实测两种形态：已鉴权（`Authorization`+`X-User-Id`+`X-Domain`+`X-Product`，无任何 `X-No-*`）；未鉴权仅 `X-No-*` |
 | `X-Refresh-Token` | 仅刷新链路发送，chat 不发送 | 客户端源码中该头只出现在 `auth/token/refresh` 与 `account/switch` 调用 |
 | `x-codebuddy-request` | **不合成**，仅在客户端自带时透传 | 它是客户端**本地网关**安全头（源码 `GatewayLocalServer` 模块 `withSecurityHeader` 注入），语义上非上游必需 |
+
+### 字节级对齐（v1.8.4 新增）
+
+「头集合一致」不等于「字节一致」。以下三项偏差只在比对**线上原始字节**时可见，仅靠 `http.Header` 层面的比对无法发现。
+
+| 偏差 | 现象 | 处理方式 |
+|---|---|---|
+| **键名大小写被规范化** | Go `http.Header.Set` 经 `textproto.CanonicalMIMEHeaderKey` 改写键名：`X-Request-ID`→`X-Request-Id`、`X-IDE-Type`→`X-Ide-Type`、`X-B3-TraceId`→`X-B3-Traceid`、`x-requested-with`→`X-Requested-With` | 新增 `setHeaderExact`/`getHeaderExact` 直接读写 map 键，复刻客户端原始大小写 |
+| **请求体键序被字典序化** | 经 `map[string]any` 中转再 `json.Marshal` 会按键名排序输出，`messages` 跑到 `model` 之前；客户端 `JSON.stringify` 按属性插入顺序输出，`model` 恒在首位 | 新增保序 JSON 层（`jsonorder.go`），解析/修改/序列化全程保持键序 |
+| **`<` `>` `&` 被 HTML 转义** | `json.Marshal` 默认把 `<` 转成 `\u003c`；客户端正文含 `<user_query>` / `<content_policy>` 等标签，`JSON.stringify` 原样输出 | 自实现转义（仅处理 `"` `\` 与控制字符），与 `JSON.stringify` 口径一致 |
+
+**为什么必须保序保真**：这三项都无需解析语义、仅比对字节即可判定，是极强的机器特征。此外保序层用 `json.Number` 保留原始数字字面量，避免超出 2^53 的整数经 `float64` 中转被静默改写。
+
+**关于 HTTP/2**：实测客户端走 Node 全局 `fetch`（undici），**默认 HTTP/1.1**（抓包中带 `Host` / `Connection: keep-alive`，这两个头在 HTTP/2 中非法）。故网关**不启用** HTTP/2 —— 启用反而会引入偏差，且 h2 的 HPACK 头压缩会让键名大小写与顺序信息消失。
 
 ### 透传与合成的边界
 
@@ -436,7 +450,13 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 
 ### 回归保障
 
-`main_test.go` 中的 `TestUpstreamFingerprintMatchesRealClient` 以真实抓包基线逐项校验（不多、不少、值一致、链路 ID 形态自洽）；`TestSmokeEndToEndUpstreamHeaders` 驱动完整请求链路（含生产 transport）抓取实际发出请求头，覆盖单测无法触及的传输层差异。
+`main_test.go` 中的 `TestUpstreamFingerprintMatchesRealClient` 以真实抓包基线逐项校验（不多、不少、值一致、**键名大小写逐字一致**、链路 ID 形态自洽）；`TestSmokeEndToEndUpstreamHeaders` 驱动完整请求链路（含生产 transport）抓取实际发出请求头，覆盖单测无法触及的传输层差异。
+
+字节级偏差由裸 TCP 监听（`captureUpstreamWire`，不经 `net/http` 解析器重新规范化）断言：
+
+- `TestUpstreamWireHeaderCasingMatchesClient` —— 线上键名大小写逐字匹配客户端基线，且规范化形态绝不出现在线上；
+- `TestUpstreamWireBodyMatchesClientEncoding` —— 线上请求体以 `model` 开头、`messages` 在其后、`<` `>` `&` 未转义、无尾随换行；
+- `TestOrderedJSONContract` / `TestResponsesBodyKeyOrder` —— 保序层的键序、转义、数字精度与非法输入边界。
 
 ## 安全提示
 

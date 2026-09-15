@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -778,13 +781,24 @@ func TestRenderAccountTableRowsHaveEqualDisplayWidth(t *testing.T) {
 }
 
 // 构造 messages 便于表驱动测试
-func msg(role, content string) map[string]any {
-	return map[string]any{"role": role, "content": content}
+func msg(role, content string) *jsonObject {
+	return newObject("role", role, "content", content)
+}
+
+// mustOrdered 把 JSON 字面量解析为保序对象，用于构造贴近真实入参的测试输入。
+func mustOrdered(t *testing.T, s string) *jsonObject {
+	t.Helper()
+	obj, err := decodeOrderedJSON([]byte(s))
+	if err != nil {
+		t.Fatalf("decodeOrderedJSON(%s): %v", s, err)
+	}
+	return obj
 }
 
 // 提取 messages 各条 role，便于断言
-func rolesOf(obj map[string]any) []string {
-	messages, _ := obj["messages"].([]any)
+func rolesOf(obj *jsonObject) []string {
+	raw, _ := obj.Get("messages")
+	messages, _ := raw.([]any)
 	roles := make([]string, 0, len(messages))
 	for _, m := range messages {
 		roles = append(roles, roleOfMessage(m))
@@ -843,7 +857,8 @@ func TestEnsureLeadingSystemMessage(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			obj := map[string]any{"messages": c.messages}
+			obj := newJSONObject()
+			obj.Set("messages", c.messages)
 			ensureLeadingSystemMessage(obj)
 			got := rolesOf(obj)
 			if len(got) != len(c.wantRoles) {
@@ -854,11 +869,13 @@ func TestEnsureLeadingSystemMessage(t *testing.T) {
 					t.Fatalf("roles = %v, want %v", got, c.wantRoles)
 				}
 			}
-			messages, _ := obj["messages"].([]any)
-			first, _ := messages[0].(map[string]any)
+			raw, _ := obj.Get("messages")
+			messages, _ := raw.([]any)
+			first, _ := messages[0].(*jsonObject)
 			if c.wantInject {
-				if content, _ := first["content"].(string); content != defaultSystemPrompt {
-					t.Fatalf("injected system content = %q, want %q", content, defaultSystemPrompt)
+				content, _ := first.Get("content")
+				if s, _ := content.(string); s != defaultSystemPrompt {
+					t.Fatalf("injected system content = %q, want %q", s, defaultSystemPrompt)
 				}
 			}
 			t.Logf("roles -> %v", got)
@@ -868,11 +885,12 @@ func TestEnsureLeadingSystemMessage(t *testing.T) {
 
 // 验证缺失 / 非法 messages 字段时也能安全注入（不得 panic）
 func TestEnsureLeadingSystemMessageMissingField(t *testing.T) {
-	obj := map[string]any{}
+	obj := newJSONObject()
 	ensureLeadingSystemMessage(obj)
-	messages, ok := obj["messages"].([]any)
-	if !ok || len(messages) != 1 {
-		t.Fatalf("expected 1 injected message, got %#v", obj["messages"])
+	raw, ok := obj.Get("messages")
+	messages, ok2 := raw.([]any)
+	if !ok || !ok2 || len(messages) != 1 {
+		t.Fatalf("expected 1 injected message, got %#v", raw)
 	}
 	if roleOfMessage(messages[0]) != "system" {
 		t.Fatalf("expected system first, got %v", roleOfMessage(messages[0]))
@@ -883,11 +901,12 @@ func TestEnsureLeadingSystemMessageMissingField(t *testing.T) {
 // 验证 developer 角色（GPT-5/Codex）被归一化为 system，避免上游 11128
 // "Illegal API invocation from an unapproved channel"
 func TestSanitizeMessagesNormalizesDeveloperRole(t *testing.T) {
-	obj := map[string]any{"messages": []any{
+	obj := newJSONObject()
+	obj.Set("messages", []any{
 		msg("system", "You are helpful."),
 		msg("developer", "Be terse."),
 		msg("user", "hi"),
-	}}
+	})
 	sanitizeMessages(obj)
 	roles := rolesOf(obj)
 	for _, r := range roles {
@@ -961,73 +980,84 @@ func TestAggregateCompletionToolCalls(t *testing.T) {
 
 // 验证 Responses -> Chat Completions 请求转换（instructions/input/tools/tool_choice/参数）
 func TestResponsesToChatRequest(t *testing.T) {
-	respReq := map[string]any{
-		"model":             "hy3-preview",
-		"instructions":      "You are helpful.",
-		"max_output_tokens": float64(128),
-		"temperature":       float64(0.3),
-		"input": []any{
-			map[string]any{"role": "user", "content": []any{
-				map[string]any{"type": "input_text", "text": "weather?"},
-			}},
-			map[string]any{"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": `{"city":"BJ"}`},
-			map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "sunny"},
-		},
-		"tools": []any{map[string]any{
-			"type": "function", "name": "get_weather", "description": "Get weather",
-			"parameters": map[string]any{"type": "object"},
-		}},
+	respReq := mustOrdered(t, `{
+		"model": "hy3-preview",
+		"instructions": "You are helpful.",
+		"max_output_tokens": 128,
+		"temperature": 0.3,
+		"input": [
+			{"role": "user", "content": [{"type": "input_text", "text": "weather?"}]},
+			{"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"BJ\"}"},
+			{"type": "function_call_output", "call_id": "call_1", "output": "sunny"}
+		],
+		"tools": [{"type": "function", "name": "get_weather", "description": "Get weather", "parameters": {"type": "object"}}],
 		"tool_choice": "auto",
-		"reasoning":   map[string]any{"effort": "high"},
-	}
+		"reasoning": {"effort": "high"}
+	}`)
 
 	chat, err := responsesToChatRequest(respReq, "hy3-preview")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if chat["model"] != "hy3-preview" || chat["max_tokens"] != float64(128) || chat["temperature"] != float64(0.3) {
-		t.Fatalf("bad top-level fields: %#v", chat)
+	if v, _ := chat.Get("model"); v != "hy3-preview" {
+		t.Fatalf("model = %v", v)
 	}
-	if chat["reasoning_effort"] != "high" {
-		t.Fatalf("reasoning_effort = %v", chat["reasoning_effort"])
+	if v, _ := chat.Get("max_tokens"); v != json.Number("128") {
+		t.Fatalf("max_tokens = %#v, want json.Number(128)", v)
 	}
-	messages := chat["messages"].([]any)
+	if v, _ := chat.Get("temperature"); v != json.Number("0.3") {
+		t.Fatalf("temperature = %#v, want json.Number(0.3)", v)
+	}
+	if v, _ := chat.Get("reasoning_effort"); v != "high" {
+		t.Fatalf("reasoning_effort = %v", v)
+	}
+	raw, _ := chat.Get("messages")
+	messages, _ := raw.([]any)
 	if len(messages) != 4 {
 		t.Fatalf("expected 4 messages (system+user+assistant+tool), got %d: %#v", len(messages), messages)
 	}
-	if rolesOf(map[string]any{"messages": messages})[0] != "system" {
+	if rolesOf(chat)[0] != "system" {
 		t.Fatalf("first message should be system")
 	}
-	assistant := messages[2].(map[string]any)
-	if assistant["role"] != "assistant" {
-		t.Fatalf("3rd message role = %v", assistant["role"])
+	assistant, _ := messages[2].(*jsonObject)
+	if v, _ := assistant.Get("role"); v != "assistant" {
+		t.Fatalf("3rd message role = %v", v)
 	}
-	toolMsg := messages[3].(map[string]any)
-	if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "call_1" || toolMsg["content"] != "sunny" {
+	toolMsg, _ := messages[3].(*jsonObject)
+	role, _ := toolMsg.Get("role")
+	callID, _ := toolMsg.Get("tool_call_id")
+	content, _ := toolMsg.Get("content")
+	if role != "tool" || callID != "call_1" || content != "sunny" {
 		t.Fatalf("tool message = %#v", toolMsg)
 	}
-	tools := chat["tools"].([]any)
-	fn := tools[0].(map[string]any)["function"].(map[string]any)
-	if fn["name"] != "get_weather" {
+	toolsRaw, _ := chat.Get("tools")
+	tools, _ := toolsRaw.([]any)
+	firstTool, _ := tools[0].(*jsonObject)
+	fnRaw, _ := firstTool.Get("function")
+	fn, _ := fnRaw.(*jsonObject)
+	if name, _ := fn.Get("name"); name != "get_weather" {
 		t.Fatalf("tools not flattened: %#v", tools)
 	}
-	if chat["tool_choice"] != "auto" {
-		t.Fatalf("tool_choice = %v", chat["tool_choice"])
+	if v, _ := chat.Get("tool_choice"); v != "auto" {
+		t.Fatalf("tool_choice = %v", v)
 	}
 	t.Log("responses request converted OK")
 }
 
 // 验证 responsesToChatRequest 对纯字符串 input 的处理与空 input 报错
 func TestResponsesToChatRequestStringInput(t *testing.T) {
-	chat, err := responsesToChatRequest(map[string]any{"model": "x", "input": "hello"}, "x")
+	chat, err := responsesToChatRequest(mustOrdered(t, `{"model":"x","input":"hello"}`), "x")
 	if err != nil {
 		t.Fatal(err)
 	}
-	messages := chat["messages"].([]any)
-	if len(messages) != 1 || messages[0].(map[string]any)["content"] != "hello" {
+	raw, _ := chat.Get("messages")
+	messages, _ := raw.([]any)
+	first, _ := messages[0].(*jsonObject)
+	content, _ := first.Get("content")
+	if len(messages) != 1 || content != "hello" {
 		t.Fatalf("bad messages: %#v", messages)
 	}
-	if _, err := responsesToChatRequest(map[string]any{"model": "x"}, "x"); err == nil {
+	if _, err := responsesToChatRequest(mustOrdered(t, `{"model":"x"}`), "x"); err == nil {
 		t.Fatal("empty input should error")
 	}
 }
@@ -1146,9 +1176,10 @@ var nonApplicationHeaders = map[string]bool{
 
 // 上游请求头指纹必须与真实客户端逐项一致：不多、不少、关键字段形态正确。
 func TestUpstreamFingerprintMatchesRealClient(t *testing.T) {
+	// 逐字写入（不经 Header.Set 规范化），否则基线自身会被改写、大小写偏差无法被发现。
 	real := http.Header{}
 	for _, kv := range realClientChatHeaders {
-		real.Set(kv[0], kv[1])
+		real[kv[0]] = []string{kv[1]}
 	}
 
 	sa := &StoredAuth{
@@ -1165,8 +1196,8 @@ func TestUpstreamFingerprintMatchesRealClient(t *testing.T) {
 		if nonApplicationHeaders[http.CanonicalHeaderKey(name)] {
 			continue
 		}
-		if h.Get(name) == "" {
-			t.Errorf("MISSING header present in real client: %s = %q", name, real.Get(name))
+		if getHeaderExact(h, name) == "" {
+			t.Errorf("MISSING header present in real client: %s = %q", name, getHeaderExact(real, name))
 		}
 	}
 	// 2. 不得出现真实客户端没有的头（多余头同样是可识别特征）
@@ -1174,8 +1205,34 @@ func TestUpstreamFingerprintMatchesRealClient(t *testing.T) {
 		if nonApplicationHeaders[http.CanonicalHeaderKey(name)] {
 			continue
 		}
-		if real.Get(name) == "" {
-			t.Errorf("EXTRA header absent in real client: %s = %q", name, h.Get(name))
+		if getHeaderExact(real, name) == "" {
+			t.Errorf("EXTRA header absent in real client: %s = %q", name, getHeaderExact(h, name))
+		}
+	}
+
+	// 2b. 键名大小写必须逐字一致。
+	//
+	// HTTP/1.1 按 map 中存储的键名逐字发送（Header.Write 不做规范化），故 `X-Request-Id`
+	// 与客户端的 `X-Request-ID` 是可静态区分的机器特征。http.Header.Set 会经
+	// textproto.CanonicalMIMEHeaderKey 改写键名，因此这里必须绕过 Get/Set 直接比对 map 键。
+	for _, kv := range realClientChatHeaders {
+		name := kv[0]
+		if nonApplicationHeaders[http.CanonicalHeaderKey(name)] {
+			continue
+		}
+		if _, ok := h[name]; !ok {
+			// 大小写不同 → 找出实际使用的键名，便于定位
+			actual := ""
+			for got := range h {
+				if strings.EqualFold(got, name) {
+					actual = got
+					break
+				}
+			}
+			if actual == "" {
+				continue // 缺失已由第 1 项报告
+			}
+			t.Errorf("HEADER CASING mismatch: real client sends %q, gateway sends %q", name, actual)
 		}
 	}
 
@@ -1184,38 +1241,38 @@ func TestUpstreamFingerprintMatchesRealClient(t *testing.T) {
 		"User-Agent", "Accept", "X-IDE-Type", "X-IDE-Name", "X-IDE-Version",
 		"X-Agent-Intent", "X-Agent-Purpose", "X-Agent-Type", "X-Private-Data", "X-Product",
 	} {
-		if got, want := h.Get(name), real.Get(name); got != want {
+		if got, want := getHeaderExact(h, name), getHeaderExact(real, name); got != want {
 			t.Errorf("%s = %q, want %q", name, got, want)
 		}
 	}
 
 	// 4. 链路 ID 形态：32 位小写 hex，且 requestId 与 traceId 解耦
 	for _, n := range []string{"X-Request-ID", "X-Trace-ID", "X-Conversation-Request-ID", "X-Root-Request-ID", "X-Conversation-Message-ID"} {
-		v := h.Get(n)
+		v := getHeaderExact(h, n)
 		if len(v) != 32 || strings.Trim(v, "0123456789abcdef") != "" {
 			t.Errorf("%s = %q, want 32 lowercase hex chars", n, v)
 		}
 	}
-	if h.Get("X-Request-ID") == h.Get("X-Trace-ID") {
+	if getHeaderExact(h, "X-Request-ID") == getHeaderExact(h, "X-Trace-ID") {
 		t.Error("X-Request-ID must be decoupled from X-Trace-ID")
 	}
-	if h.Get("X-Conversation-Message-ID") != h.Get("X-Request-ID") {
+	if getHeaderExact(h, "X-Conversation-Message-ID") != getHeaderExact(h, "X-Request-ID") {
 		t.Error("X-Conversation-Message-ID must equal X-Request-ID (observed client behavior)")
 	}
-	if cid := h.Get("X-Conversation-ID"); len(cid) != 36 || strings.Count(cid, "-") != 4 {
+	if cid := getHeaderExact(h, "X-Conversation-ID"); len(cid) != 36 || strings.Count(cid, "-") != 4 {
 		t.Errorf("X-Conversation-ID = %q, want dashed UUID", cid)
 	}
 
 	// 5. 链路传播头必须互相自洽
-	traceID := h.Get("X-Trace-ID")
-	if tp := h.Get("traceparent"); !strings.HasPrefix(tp, "00-"+traceID+"-") || !strings.HasSuffix(tp, "-01") {
+	traceID := getHeaderExact(h, "X-Trace-ID")
+	if tp := getHeaderExact(h, "traceparent"); !strings.HasPrefix(tp, "00-"+traceID+"-") || !strings.HasSuffix(tp, "-01") {
 		t.Errorf("traceparent %q not linked to X-Trace-ID %q", tp, traceID)
 	}
-	if b3 := h.Get("b3"); !strings.HasPrefix(b3, traceID+"-"+h.Get("X-B3-SpanId")+"-1-") {
-		t.Errorf("b3 %q not linked to trace/span ids (%s/%s)", b3, traceID, h.Get("X-B3-SpanId"))
+	if b3 := getHeaderExact(h, "b3"); !strings.HasPrefix(b3, traceID+"-"+getHeaderExact(h, "X-B3-SpanId")+"-1-") {
+		t.Errorf("b3 %q not linked to trace/span ids (%s/%s)", b3, traceID, getHeaderExact(h, "X-B3-SpanId"))
 	}
-	if h.Get("X-B3-TraceId") != traceID {
-		t.Errorf("X-B3-TraceId %q != X-Trace-ID %q", h.Get("X-B3-TraceId"), traceID)
+	if getHeaderExact(h, "X-B3-TraceId") != traceID {
+		t.Errorf("X-B3-TraceId %q != X-Trace-ID %q", getHeaderExact(h, "X-B3-TraceId"), traceID)
 	}
 }
 
@@ -1229,10 +1286,10 @@ func TestAuthedRequestHasNoNoHeaders(t *testing.T) {
 	backendHeaders(req, sa, &profileINTL, nil)
 	for name := range req.Header {
 		if strings.HasPrefix(name, "X-No-") {
-			t.Errorf("authed request must not carry %s = %q", name, req.Header.Get(name))
+			t.Errorf("authed request must not carry %s = %q", name, getHeaderExact(req.Header, name))
 		}
 	}
-	if got := req.Header.Get("Authorization"); got != "Bearer tok" {
+	if got := getHeaderExact(req.Header, "Authorization"); got != "Bearer tok" {
 		t.Errorf("Authorization = %q", got)
 	}
 }
@@ -1241,13 +1298,13 @@ func TestAuthedRequestHasNoNoHeaders(t *testing.T) {
 func TestUnauthedRequestDeclaresNoAuth(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
 	backendHeaders(req, nil, &profileINTL, nil)
-	if got := req.Header.Get("X-No-Authorization"); got != "true" {
+	if got := getHeaderExact(req.Header, "X-No-Authorization"); got != "true" {
 		t.Errorf("X-No-Authorization = %q, want \"true\"", got)
 	}
-	if got := req.Header.Get("X-No-User-Id"); got != "true" {
+	if got := getHeaderExact(req.Header, "X-No-User-Id"); got != "true" {
 		t.Errorf("X-No-User-Id = %q, want \"true\"", got)
 	}
-	if got := req.Header.Get("X-Domain"); got != clientDomain {
+	if got := getHeaderExact(req.Header, "X-Domain"); got != clientDomain {
 		t.Errorf("X-Domain = %q, want fallback %q", got, clientDomain)
 	}
 }
@@ -1263,7 +1320,7 @@ func TestClientPassthroughAndSynthesisBoundary(t *testing.T) {
 	// 未携带时不合成
 	req, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
 	backendHeaders(req, sa, &profileINTL, nil)
-	if v := req.Header.Get("x-codebuddy-request"); v != "" {
+	if v := getHeaderExact(req.Header, "x-codebuddy-request"); v != "" {
 		t.Errorf("gateway must not synthesize x-codebuddy-request, got %q", v)
 	}
 
@@ -1275,16 +1332,16 @@ func TestClientPassthroughAndSynthesisBoundary(t *testing.T) {
 	in.Set("User-Agent", "custom/1.0")
 	req2, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
 	backendHeaders(req2, sa, &profileINTL, in)
-	if v := req2.Header.Get("x-codebuddy-request"); v != "1" {
+	if v := getHeaderExact(req2.Header, "x-codebuddy-request"); v != "1" {
 		t.Errorf("client-provided x-codebuddy-request must pass through, got %q", v)
 	}
-	if v := req2.Header.Get("X-Conversation-ID"); v != "11111111-2222-3333-4444-555555555555" {
+	if v := getHeaderExact(req2.Header, "X-Conversation-ID"); v != "11111111-2222-3333-4444-555555555555" {
 		t.Errorf("client-provided X-Conversation-ID must win, got %q", v)
 	}
-	if v := req2.Header.Get("X-Agent-Intent"); v != "ask" {
+	if v := getHeaderExact(req2.Header, "X-Agent-Intent"); v != "ask" {
 		t.Errorf("client-provided X-Agent-Intent must win, got %q", v)
 	}
-	if v := req2.Header.Get("User-Agent"); v != "custom/1.0" {
+	if v := getHeaderExact(req2.Header, "User-Agent"); v != "custom/1.0" {
 		t.Errorf("client-provided User-Agent must win, got %q", v)
 	}
 }
@@ -1313,12 +1370,12 @@ func TestClientCannotOverrideCredentialHeaders(t *testing.T) {
 		"X-Product":       "SaaS",
 		"X-Enterprise-Id": "ent",
 	} {
-		if got := req.Header.Get(name); got != want {
+		if got := getHeaderExact(req.Header, name); got != want {
 			t.Errorf("%s = %q, want %q (must come from account pool)", name, got, want)
 		}
 	}
 	// chat 请求不携带 X-Refresh-Token（仅 auth/token/refresh 与 account/switch 链路使用）
-	if got := req.Header.Get("X-Refresh-Token"); got != "" {
+	if got := getHeaderExact(req.Header, "X-Refresh-Token"); got != "" {
 		t.Errorf("chat request must not carry X-Refresh-Token, got %q", got)
 	}
 }
@@ -1444,27 +1501,27 @@ func TestSmokeEndToEndUpstreamHeaders(t *testing.T) {
 	}
 
 	// 客户端身份头透传生效（未被网关合成值覆盖）
-	if v := h.Get("X-Agent-Intent"); v != "ask" {
+	if v := getHeaderExact(h, "X-Agent-Intent"); v != "ask" {
 		t.Errorf("client passthrough X-Agent-Intent = %q, want ask", v)
 	}
 	// 凭据来自账号池
-	if v := h.Get("Authorization"); v != "Bearer smoke-token" {
+	if v := getHeaderExact(h, "Authorization"); v != "Bearer smoke-token" {
 		t.Errorf("Authorization = %q", v)
 	}
-	if v := h.Get("X-User-Id"); v != "8efc9f5d-4289-445e-b503-c8a49eeb52c5" {
+	if v := getHeaderExact(h, "X-User-Id"); v != "8efc9f5d-4289-445e-b503-c8a49eeb52c5" {
 		t.Errorf("X-User-Id = %q", v)
 	}
-	if v := h.Get("X-Domain"); v != "www.workbuddy.ai" {
+	if v := getHeaderExact(h, "X-Domain"); v != "www.workbuddy.ai" {
 		t.Errorf("X-Domain = %q", v)
 	}
 	// 合成指纹头存在
-	if v := h.Get("User-Agent"); v != "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1" {
+	if v := getHeaderExact(h, "User-Agent"); v != "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1" {
 		t.Errorf("User-Agent = %q", v)
 	}
-	if v := h.Get("X-Stainless-Runtime"); v != "node" {
+	if v := getHeaderExact(h, "x-stainless-runtime"); v != "node" {
 		t.Errorf("X-Stainless-Runtime = %q", v)
 	}
-	if v := h.Get("x-codebuddy-request"); v != "" {
+	if v := getHeaderExact(h, "x-codebuddy-request"); v != "" {
 		t.Errorf("must not synthesize x-codebuddy-request, got %q", v)
 	}
 	// 浏览器语义头不得出现
@@ -1486,4 +1543,235 @@ func TestSmokeEndToEndUpstreamHeaders(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "ok") {
 		t.Errorf("client body = %q", rec.Body.String())
 	}
+}
+
+// -----------------------------------------------------------------------------
+// 上游请求「线级」指纹回归
+//
+// 前两组测试断言的是 http.Header 内容；本组测试断言的是真正写到 TCP 上的字节。
+// 两者不等价：HTTP/1.1 的 Header.Write 按 map 中存储的键名逐字输出，不重新规范化，
+// 因此 `X-Request-Id`（Header.Set 的产物）与客户端的 `X-Request-ID` 在线上可被静态区分。
+// -----------------------------------------------------------------------------
+
+// 捕获上游真实收到的原始请求字节（请求行 + Header + 空行 + body）。
+//
+// 用裸 TCP 监听而非 httptest.Server：后者会用 net/http 的解析器重新规范化键名，
+// 无法反映真正写到线上的字节。
+func captureUpstreamWire(t *testing.T, body string) string {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	rawCh := make(chan string, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// 读到 Header 结束标记后再按 Content-Length 读满 body
+		var buf []byte
+		tmp := make([]byte, 4096)
+		for {
+			n, err := conn.Read(tmp)
+			if n > 0 {
+				buf = append(buf, tmp[:n]...)
+				if idx := bytes.Index(buf, []byte("\r\n\r\n")); idx >= 0 {
+					head := string(buf[:idx])
+					cl := 0
+					for _, line := range strings.Split(head, "\r\n") {
+						if v, ok := strings.CutPrefix(strings.ToLower(line), "content-length:"); ok {
+							cl, _ = strconv.Atoi(strings.TrimSpace(v))
+						}
+					}
+					if len(buf) >= idx+4+cl {
+						break
+					}
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		rawCh <- string(buf)
+		resp := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n" +
+			"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+			"data: [DONE]\n\n"
+		_, _ = conn.Write([]byte(resp))
+	}()
+
+	origBase := profileINTL.Base
+	profileINTL.Base = "http://" + ln.Addr().String()
+	defer func() { profileINTL.Base = origBase }()
+
+	origClient := cfg.HttpClient
+	initHTTPClient()
+	defer func() { cfg.HttpClient = origClient }()
+
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "workbuddy-intl.json")
+	raw, _ := json.Marshal(map[string]any{
+		"auth": map[string]any{
+			"accessToken": "wire-token", "refreshToken": "r",
+			"expiresAt": time.Now().Add(24 * time.Hour).Unix(), "domain": "www.workbuddy.ai",
+		},
+		"account": map[string]any{"uid": "u1"},
+		"edition": "intl",
+	})
+	if err := os.WriteFile(credPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	accountMu.Lock()
+	prev := accounts
+	accounts = nil
+	sa, err := loadAccountFile(credPath)
+	if err != nil {
+		accounts = prev
+		accountMu.Unlock()
+		t.Fatalf("loadAccountFile: %v", err)
+	}
+	accounts = append(accounts, &Account{Path: credPath, Auth: sa, Edition: "intl"})
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = prev
+		accountMu.Unlock()
+	}()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+
+	select {
+	case raw := <-rawCh:
+		return raw
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream never received request")
+		return ""
+	}
+}
+
+// wireBody 从原始请求字节中取出 body 部分。
+func wireBody(t *testing.T, raw string) string {
+	t.Helper()
+	idx := strings.Index(raw, "\r\n\r\n")
+	if idx < 0 {
+		t.Fatalf("malformed wire request: %q", raw)
+	}
+	return raw[idx+4:]
+}
+
+// 上游线上收到的 Header 键名大小写必须与官方客户端逐字一致。
+//
+// 这是 HTTP/1.1 特有的可识别特征：Go 的 http.Header.Set 会把 `X-Request-ID` 规范化成
+// `X-Request-Id`、`X-IDE-Type` 成 `X-Ide-Type`、`X-B3-TraceId` 成 `X-B3-Traceid`，
+// 而客户端（Node/undici）按原样发送。此类偏差仅比对线上字节可见。
+func TestUpstreamWireHeaderCasingMatchesClient(t *testing.T) {
+	raw := captureUpstreamWire(t, `{"model":"default-model","messages":[{"role":"user","content":"hi"}]}`)
+
+	// 客户端实测逐字大小写（抓包 capture2.jsonl）。
+	// 注意：Go 服务端会把入站头规范化，故「客户端 → 网关」这一跳的键名无法用于断言，
+	// 这里断言的是网关 → 上游这一跳。
+	wantExact := []string{
+		"X-Request-ID",
+		"X-Trace-ID",
+		"X-Conversation-ID",
+		"X-Conversation-Request-ID",
+		"X-Conversation-Message-ID",
+		"X-Root-Request-ID",
+		"X-B3-TraceId",
+		"X-B3-ParentSpanId",
+		"X-B3-SpanId",
+		"X-B3-Sampled",
+		"X-Agent-Type",
+		"X-Agent-Intent",
+		"X-Agent-Purpose",
+		"X-IDE-Type",
+		"X-IDE-Name",
+		"X-IDE-Version",
+		"X-Private-Data",
+		"X-User-Id",
+		"X-Domain",
+		"X-Product",
+		"x-requested-with",
+		"x-stainless-arch",
+		"x-stainless-lang",
+		"x-stainless-os",
+		"x-stainless-package-version",
+		"x-stainless-retry-count",
+		"x-stainless-runtime",
+		"x-stainless-runtime-version",
+		"traceparent",
+		"b3",
+	}
+	for _, name := range wantExact {
+		if !strings.Contains(raw, "\r\n"+name+": ") {
+			t.Errorf("wire is missing header with exact casing %q", name)
+		}
+	}
+
+	// 规范化形态绝不得出现在线上（否则即被 Header.Set 改写）
+	for _, bad := range []string{
+		"X-Request-Id", "X-Trace-Id", "X-Ide-Type", "X-Ide-Name", "X-Ide-Version",
+		"X-B3-Traceid", "X-B3-Parentspanid", "X-B3-Spanid", "X-Conversation-Id",
+		"X-Requested-With", "X-Stainless-Runtime", "X-Stainless-Arch",
+	} {
+		if strings.Contains(raw, "\r\n"+bad+": ") {
+			t.Errorf("wire carries canonicalized header %q; client sends a different casing", bad)
+		}
+	}
+	t.Logf("wire request line: %s", strings.SplitN(raw, "\r\n", 2)[0])
+}
+
+// 上游收到的请求体必须复刻客户端 JSON.stringify 的输出口径：
+// 键序保持（model 在首位）且 < > & 不被转义。
+//
+// 网关此前用 map[string]any 中转再 json.Marshal，导致：键序变字典序（messages 跑到
+// model 之前）、`<` 被转义成 `\u003c`。两者都是无需解析语义、比对字节即可判定的机器特征。
+func TestUpstreamWireBodyMatchesClientEncoding(t *testing.T) {
+	// 含 HTML 敏感字符的 system prompt，贴近客户端真实 harness 正文
+	body := `{"model":"deepseek-v3-2-volc","messages":[{"role":"system","content":"a <user_query> b & c > d"},{"role":"user","content":"hi"}]}`
+	raw := captureUpstreamWire(t, body)
+	got := wireBody(t, raw)
+
+	// 1. model 必须在首位（客户端 JSON.stringify 的插入顺序）
+	if !strings.HasPrefix(got, `{"model":"deepseek-v3-2-volc"`) {
+		t.Errorf("body must start with model key (client key order), got: %s", truncateForLog(got))
+	}
+	// 2. messages 必须排在 model 之后
+	mi, si := strings.Index(got, `"messages"`), strings.Index(got, `"model"`)
+	if mi < si {
+		t.Errorf("messages key precedes model; client emits model first: %s", truncateForLog(got))
+	}
+	// 3. HTML 敏感字符原样输出，不得转义
+	for _, bad := range []string{`\u003c`, `\u003e`, `\u0026`} {
+		if strings.Contains(got, bad) {
+			t.Errorf("body contains escaped %s; JSON.stringify emits the raw character: %s", bad, truncateForLog(got))
+		}
+	}
+	if !strings.Contains(got, "a <user_query> b & c > d") {
+		t.Errorf("body lost raw HTML-sensitive characters: %s", truncateForLog(got))
+	}
+	// 4. 网关注入的 stream=true 也必须存在（上游强制流式）
+	if !strings.Contains(got, `"stream":true`) {
+		t.Errorf("body must force stream=true: %s", truncateForLog(got))
+	}
+	// 5. 不得有尾随换行（json.Encoder.Encode 会追加）
+	if strings.HasSuffix(got, "\n") {
+		t.Errorf("body must not carry a trailing newline")
+	}
+	t.Logf("wire body: %s", truncateForLog(got))
+}
+
+func truncateForLog(s string) string {
+	if len(s) > 400 {
+		return s[:400] + "..."
+	}
+	return s
 }
