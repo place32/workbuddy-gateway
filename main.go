@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	version = "1.8.7"
+	version = "1.9.1"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -133,6 +133,10 @@ func (p *upstreamProfile) quotaSummaryURL() string {
 	return p.PortalOrigin + "/billing/meter/get-user-resource-summary"
 }
 
+func (p *upstreamProfile) dailyCheckinURL() string {
+	return p.PortalOrigin + "/v2/billing/meter/daily-checkin"
+}
+
 // -----------------------------------------------------------------------------
 // 数据结构定义
 // -----------------------------------------------------------------------------
@@ -211,6 +215,7 @@ type Config struct {
 	LogFile         string // monitor 附加展示的日志文件路径
 	JournalService  string // monitor 附加展示的 systemd 服务名（journalctl -u）
 	LogLines        int    // monitor 展示的最近日志行数
+	ModelsRefresh   int    // 官方模型目录刷新间隔（分钟），0 关闭
 	HttpClient      *http.Client
 }
 
@@ -269,6 +274,8 @@ var (
 	rrIndex   int        // 轮询游标
 
 	quotaScanTrigger = make(chan struct{}, 1)
+	checkinTrigger   = make(chan struct{}, 1)
+	dailyCheckinMu   sync.Mutex
 )
 
 // -----------------------------------------------------------------------------
@@ -308,7 +315,8 @@ func main() {
 	fs.IntVar(&cfg.ReloadInterval, "reload-interval", 5, "账号池热加载扫描间隔（秒），0 关闭：运行期自动发现新增/更新/删除的凭据文件，免重启")
 	fs.StringVar(&cfg.LogFile, "logfile", "", "monitor 附加跟随的日志文件路径（如 -logfile /var/log/workbuddy-gateway.log）")
 	fs.StringVar(&cfg.JournalService, "journal", "", "monitor 附加跟随的 systemd 服务名（Linux 下用 journalctl -u <服务> -f 跟随）")
-	fs.IntVar(&cfg.LogLines, "lines", 5, "monitor 每次刷新展示的最近日志行数")
+	fs.IntVar(&cfg.LogLines, "lines", 15, "monitor 每次刷新展示的最近日志行数")
+	fs.IntVar(&cfg.ModelsRefresh, "models-refresh", 60, "官方模型目录刷新间隔（分钟），0 关闭")
 	_ = fs.Parse(args)
 
 	// 检测 -auth 是否被显式指定：
@@ -390,6 +398,8 @@ func printHelp() {
   -reload-interval <sec>
                     账号池热加载扫描间隔（默认 5 秒，0 关闭）：运行期自动发现
                     新增/更新/删除的凭据文件，免重启生效
+  -models-refresh <min>
+                    官方模型目录刷新间隔（默认 60 分钟，0 关闭）
   -api-key <key>    设置后，调用网关必须携带 Bearer <key> 鉴权
   -proxy <url>      设置上游转发代理 (例如 http://127.0.0.1:7890 或 socks5://...)
   -verbose          输出详细调试日志 (请求/响应体)
@@ -398,7 +408,7 @@ monitor 选项:
   -interval <sec>   状态刷新间隔秒数 (默认: 3)
   -journal <svc>    同时展示 systemd 服务最近日志 (Linux, 如 -journal workbuddy-gateway)
   -logfile <path>   同时展示指定日志文件最近内容 (如 -logfile /var/log/wb.log)
-  -lines <n>        每次刷新展示的最近日志行数 (默认: 5)
+  -lines <n>        每次刷新展示的最近日志行数 (默认: 15)
 
 多账号说明:
   # 登录第二个账号（保存到不同文件）
@@ -750,6 +760,7 @@ func accountReloaderLoop() {
 		if reloadAccounts() {
 			writeStatusSnapshot() // 立即刷新 monitor 状态文件
 			requestQuotaScan()
+			requestCheckin()
 		}
 	}
 }
@@ -786,7 +797,7 @@ func nextAccount() (*Account, error) {
 		return acc, nil
 	}
 	if exhaustedCount > 0 && exhaustedCount+disabledCount+cooldownCount == len(accounts) {
-		return nil, fmt.Errorf("所有可调度账号额度均已耗尽，等待下一次额度扫描（最多 1 分钟）")
+		return nil, fmt.Errorf("所有可调度账号额度均已耗尽，等待下一次额度扫描（最多 5 分钟）")
 	}
 	// 全部不可用：优先报告失效账号
 	for _, a := range accounts {
@@ -1219,7 +1230,9 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	if acc == nil {
 		return nil
 	}
-	acc.lock.Lock()
+	if !lockAccountWithContext(ctx, &acc.lock) {
+		return ctx.Err()
+	}
 	defer acc.lock.Unlock()
 
 	accountMu.Lock()
@@ -1271,6 +1284,21 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	return nil
 }
 
+func lockAccountWithContext(ctx context.Context, mu *sync.Mutex) bool {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if mu.TryLock() {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
 func refreshAllAccountQuotas(ctx context.Context, done chan<- struct{}) {
 	defer close(done)
 	accountMu.Lock()
@@ -1282,7 +1310,10 @@ func refreshAllAccountQuotas(ctx context.Context, done chan<- struct{}) {
 			log.Printf("[Quota] 本轮额度更新被取消，尚未扫描的账号将等待下一轮: %v", err)
 			break
 		}
-		if err := refreshAccountQuota(ctx, acc); err != nil {
+		accountCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := refreshAccountQuota(accountCtx, acc)
+		cancel()
+		if err != nil {
 			log.Printf("[Quota] 账号 %s 本轮额度更新未完成: %v", acc.Path, err)
 		}
 	}
@@ -1291,7 +1322,7 @@ func refreshAllAccountQuotas(ctx context.Context, done chan<- struct{}) {
 }
 
 func backgroundQuotaRefresher() {
-	const interval = time.Minute
+	const interval = 300 * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var cancel context.CancelFunc
@@ -1326,6 +1357,141 @@ func requestQuotaScan() {
 	select {
 	case quotaScanTrigger <- struct{}{}:
 	default:
+	}
+}
+
+func isAlreadyCheckedIn(status int, message string) bool {
+	if status == 0 && message == "" {
+		return false
+	}
+	low := strings.ToLower(message)
+	return strings.Contains(message, `"code":10001`) || strings.Contains(message, `"code":14001`) ||
+		strings.Contains(message, "已签到") || strings.Contains(low, "already checked in")
+}
+
+// checkinAccount 执行国内站每日签到。国际站没有已确认可用的签到体系，明确跳过。
+func checkinAccount(ctx context.Context, acc *Account) (string, error) {
+	if acc == nil {
+		return "skipped", nil
+	}
+	acc.lock.Lock()
+	defer acc.lock.Unlock()
+
+	accountMu.Lock()
+	if acc.Disabled || acc.Auth == nil || acc.Auth.Auth.AccessToken == "" {
+		accountMu.Unlock()
+		return "skipped", nil
+	}
+	if acc.Profile().Key != profileCN.Key {
+		accountMu.Unlock()
+		return "global_skipped", nil
+	}
+	auth := *acc.Auth
+	path := acc.Path
+	prof := acc.Profile()
+	accountMu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	log.Printf("[Checkin] 账号 %s 开始每日签到，站点=%s，接口=%s", path, prof.Label, prof.dailyCheckinURL())
+	headers := func(r *http.Request) {
+		commonHeaders(r, prof)
+		r.Header.Set("Authorization", "Bearer "+auth.Auth.AccessToken)
+		r.Header.Set("X-Client-Platform", "web")
+		if auth.Account.UID != "" {
+			r.Header.Set("X-User-Id", auth.Account.UID)
+		}
+		if auth.Account.EnterpriseID != "" {
+			r.Header.Set("X-Enterprise-Id", auth.Account.EnterpriseID)
+			r.Header.Set("X-Tenant-Id", auth.Account.EnterpriseID)
+		}
+		if auth.Auth.Domain != "" {
+			r.Header.Set("X-Domain", auth.Auth.Domain)
+		}
+	}
+	_, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.dailyCheckinURL(), headers, strings.NewReader("{}"))
+	if err == nil {
+		log.Printf("[Checkin] 账号 %s 每日签到成功", path)
+		return "ok", nil
+	}
+	if isAlreadyCheckedIn(status, err.Error()) {
+		log.Printf("[Checkin] 账号 %s 今天已经签到，本次按幂等成功处理", path)
+		return "already", nil
+	}
+	log.Printf("[Checkin] 账号 %s 每日签到失败，HTTP=%d，原因=%v；不改变账号调度状态", path, status, err)
+	return "failed", err
+}
+
+func checkinAllAccounts(ctx context.Context) {
+	if !dailyCheckinMu.TryLock() {
+		log.Printf("[Checkin] 已有一轮签到正在执行，本次重复触发已跳过")
+		return
+	}
+	defer dailyCheckinMu.Unlock()
+
+	accountMu.Lock()
+	accs := append([]*Account(nil), accounts...)
+	accountMu.Unlock()
+	log.Printf("[Checkin] 开始每日签到，账号总数=%d，国际站账号将跳过", len(accs))
+	ok, already, failed, skipped := 0, 0, 0, 0
+	for _, acc := range accs {
+		if err := ctx.Err(); err != nil {
+			log.Printf("[Checkin] 本轮签到被取消，未处理账号等待下一次触发: %v", err)
+			break
+		}
+		result, err := checkinAccount(ctx, acc)
+		switch result {
+		case "ok":
+			ok++
+		case "already":
+			already++
+		case "failed":
+			failed++
+			_ = err
+		default:
+			skipped++
+		}
+	}
+	log.Printf("[Checkin] 本轮签到完成，总数=%d，成功=%d，今日已签=%d，失败=%d，跳过=%d", len(accs), ok, already, failed, skipped)
+	requestQuotaScan()
+}
+
+func nextDailyCheckin(now time.Time) time.Time {
+	loc := time.FixedZone("UTC+8", 8*60*60)
+	localNow := now.In(loc)
+	next := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 9, 0, 0, 0, loc)
+	if !next.After(localNow) {
+		next = next.Add(24 * time.Hour)
+	}
+	return next
+}
+
+func requestCheckin() {
+	select {
+	case checkinTrigger <- struct{}{}:
+	default:
+	}
+}
+
+func backgroundDailyCheckin() {
+	go checkinAllAccounts(context.Background())
+	for {
+		next := nextDailyCheckin(time.Now())
+		log.Printf("[Checkin] 下一次定时签到时间=%s", next.Format("2006-01-02 15:04:05 MST"))
+		timer := time.NewTimer(time.Until(next))
+		select {
+		case <-timer.C:
+			go checkinAllAccounts(context.Background())
+		case <-checkinTrigger:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			log.Printf("[Checkin] 凭据池发生变化，立即触发一轮签到")
+			go checkinAllAccounts(context.Background())
+		}
 	}
 }
 
@@ -1732,7 +1898,7 @@ func runMonitor() {
 	}
 	logN := cfg.LogLines
 	if logN <= 0 {
-		logN = 5
+		logN = 15
 	}
 
 	// 判断 stdout 是否为终端（是则用 ANSI 清屏重绘，否则滚动输出）
@@ -1922,6 +2088,8 @@ func runLogin() {
 // -----------------------------------------------------------------------------
 
 func runServe() {
+	loadModelsCache()
+	initModelsHTTPClient()
 	if err := loadAccounts(); err != nil {
 		fmt.Printf("警告: 未检测到有效凭据 (%v)。\n请先执行: workbuddy-gateway login 扫码登录，或确保凭据文件存在。\n\n", err)
 	} else {
@@ -1939,6 +2107,10 @@ func runServe() {
 	// 启动后台自动刷新协程
 	go backgroundTokenRefresher()
 	go backgroundQuotaRefresher()
+	go backgroundDailyCheckin()
+	if cfg.ModelsRefresh > 0 {
+		go modelsRefreshLoop(time.Duration(cfg.ModelsRefresh) * time.Minute)
+	}
 
 	// 启动状态快照协程（monitor 命令实时读取展示）
 	go statusSnapshotLoop()
@@ -1973,6 +2145,8 @@ func runServe() {
 	fmt.Printf("   Chat 接口地址: http://%s/v1/chat/completions\n", listenAddr)
 	fmt.Printf("   Models 接口:   http://%s/v1/models\n", listenAddr)
 	fmt.Printf("   模型转发策略:  【完全透传】客户端请求的任意 model 原样中继至上游\n")
+	_, modelSource := mergedModelIDs()
+	fmt.Printf("   模型列表来源:  %s\n", modelSourceLabel(modelSource))
 	if cfg.ReloadInterval > 0 {
 		fmt.Printf("   凭据热加载:    每 %ds 自动扫描，新增/更新/删除凭据免重启生效\n", cfg.ReloadInterval)
 	} else {
@@ -2391,27 +2565,13 @@ func writeChatAggregate(w http.ResponseWriter, resp *http.Response, modelName st
 }
 
 // -----------------------------------------------------------------------------
-// 路由处理: /v1/models (列出常见模型供客户端自动补全)
+// 路由处理: /v1/models (模型清单由 models.go 动态同步 + 静态兜底合并)
 // -----------------------------------------------------------------------------
 
-// upstreamModelIDs 是官方客户端从远端 product config 实际获取到的模型清单
-// （acc-product-config-v3.json，26 项，国际站）。网关此前硬编码的 10 个模型与该清单
-// 零交集，会使 /v1/models 返回上游根本不存在的模型，构成可识别特征。
-// 传入未列出的 model 仍会原样透传到上游。
-var upstreamModelIDs = []string{
-	"default-model", "default-model-lite",
-	"gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gpt-5.1-codex", "gpt-5.1-codex-mini",
-	"gemini-3.1-pro", "gemini-3.0-flash", "gemini-3.5-flash", "gemini-2.5-flash",
-	"gemini-3.1-flash-lite", "gemini-2.5-pro",
-	"deepseek-v3-2-volc", "glm-5.0", "kimi-k2.5",
-	"gemini-3.0-pro-image", "gemini-3.1-flash-image", "gemini-2.5-flash-image",
-	"hunyuan-image-v3.0", "hunyuan-image-v2.0-general-edit", "hunyuan-video-art",
-	"fast-model", "balanced-model", "primary-model", "deep-model",
-}
-
 func handleModels(w http.ResponseWriter, r *http.Request) {
-	modelsList := make([]map[string]any, 0, len(upstreamModelIDs))
-	for _, id := range upstreamModelIDs {
+	modelIDs, source := mergedModelIDs()
+	modelsList := make([]map[string]any, 0, len(modelIDs))
+	for _, id := range modelIDs {
 		modelsList = append(modelsList, map[string]any{
 			"id": id, "object": "model", "owned_by": "workbuddy", "permission": []any{},
 		})
@@ -2421,15 +2581,19 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 		"data":   modelsList,
 	}
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Model-Source", modelSourceLabel(source))
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
+	modelIDs, source := mergedModelIDs()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":    "healthy",
-		"timestamp": time.Now().Unix(),
-		"version":   version,
+		"status":       "healthy",
+		"timestamp":    time.Now().Unix(),
+		"version":      version,
+		"model_count":  len(modelIDs),
+		"model_source": modelSourceLabel(source),
 	})
 }
 

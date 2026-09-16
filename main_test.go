@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -102,6 +104,9 @@ func TestUpstreamProfileURLs(t *testing.T) {
 	}
 	if got := cn.quotaSummaryURL(); got != "https://www.codebuddy.cn/billing/meter/get-user-resource-summary" {
 		t.Errorf("cn quotaSummaryURL = %s", got)
+	}
+	if got := cn.dailyCheckinURL(); got != "https://www.codebuddy.cn/v2/billing/meter/daily-checkin" {
+		t.Errorf("cn dailyCheckinURL = %s", got)
 	}
 
 	itl := profileForEdition("intl")
@@ -283,6 +288,81 @@ func TestIsQuotaExhausted(t *testing.T) {
 		if got := isQuotaExhausted(tc.status, tc.body); got != tc.want {
 			t.Errorf("isQuotaExhausted(%d, %q)=%v want %v", tc.status, tc.body, got, tc.want)
 		}
+	}
+}
+
+func TestIsAlreadyCheckedIn(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{409, `{"code":10001,"msg":"今天已签到"}`, true},
+		{400, `{"code":14001,"msg":"今日已签到"}`, true},
+		{409, `{"msg":"Already checked in today"}`, true},
+		{500, "connection reset", false},
+		{400, `{"code":10002,"msg":"积分不足"}`, false},
+	}
+	for _, tc := range cases {
+		if got := isAlreadyCheckedIn(tc.status, tc.body); got != tc.want {
+			t.Errorf("isAlreadyCheckedIn(%d, %q)=%v want %v", tc.status, tc.body, got, tc.want)
+		}
+	}
+}
+
+func TestNextDailyCheckinUTC8(t *testing.T) {
+	loc := time.FixedZone("test", 8*60*60)
+	before := time.Date(2026, 9, 15, 8, 59, 0, 0, loc)
+	if got := nextDailyCheckin(before); !got.Equal(time.Date(2026, 9, 15, 9, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))) {
+		t.Fatalf("before 09:00 got %v", got)
+	}
+	after := time.Date(2026, 9, 15, 9, 1, 0, 0, loc)
+	if got := nextDailyCheckin(after); !got.Equal(time.Date(2026, 9, 16, 9, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))) {
+		t.Fatalf("after 09:00 got %v", got)
+	}
+}
+
+func TestCheckinAccountCNAndSkipIntl(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/v2/billing/meter/daily-checkin" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer test-access" || r.Header.Get("X-User-Id") != "user-1" {
+			t.Errorf("missing checkin auth headers")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{}}`))
+	}))
+	defer server.Close()
+
+	oldOrigin := profileCN.PortalOrigin
+	oldClient := cfg.HttpClient
+	profileCN.PortalOrigin = server.URL
+	cfg.HttpClient = server.Client()
+	defer func() {
+		profileCN.PortalOrigin = oldOrigin
+		cfg.HttpClient = oldClient
+	}()
+
+	cn := &Account{Path: "cn.json", Auth: &StoredAuth{
+		Edition: "cn",
+		Auth:    StoredTokens{AccessToken: "test-access"},
+		Account: StoredAccount{UID: "user-1"},
+	}}
+	result, err := checkinAccount(context.Background(), cn)
+	if err != nil || result != "ok" || calls != 1 {
+		t.Fatalf("cn checkin result=%q calls=%d err=%v", result, calls, err)
+	}
+
+	intl := &Account{Path: "intl.json", Auth: &StoredAuth{
+		Edition: "intl",
+		Auth:    StoredTokens{AccessToken: "test-access"},
+	}}
+	result, err = checkinAccount(context.Background(), intl)
+	if err != nil || result != "global_skipped" || calls != 1 {
+		t.Fatalf("intl should be skipped: result=%q calls=%d err=%v", result, calls, err)
 	}
 }
 
@@ -752,6 +832,21 @@ func TestParseQuotaSummary(t *testing.T) {
 	}
 }
 
+func TestLockAccountWithContextTimeout(t *testing.T) {
+	var mu sync.Mutex
+	mu.Lock()
+	defer mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if lockAccountWithContext(ctx, &mu) {
+		t.Fatal("lock should time out while mutex is held")
+	}
+	if elapsed := time.Since(start); elapsed < 15*time.Millisecond || elapsed > 200*time.Millisecond {
+		t.Fatalf("unexpected timeout duration: %v", elapsed)
+	}
+}
+
 func TestFormatQuotaRoundsToTwoDecimals(t *testing.T) {
 	cases := map[float64]string{
 		4566:               "4566",
@@ -768,8 +863,8 @@ func TestFormatQuotaRoundsToTwoDecimals(t *testing.T) {
 
 func TestRenderAccountTableRowsHaveEqualDisplayWidth(t *testing.T) {
 	table := renderAccountTable([]accountSnapshot{
-		{Path: "workbuddy1.json", Nickname: "Abandon", Edition: "cn", State: "quota_exhausted", QuotaKnown: true, QuotaTotal: 2000, QuotaUsed: 2000},
-		{Path: "workbuddy2.json", Nickname: "啊水", Edition: "cn", State: "active", QuotaKnown: true, QuotaTotal: 2000, QuotaUsed: 69.98999993, QuotaRemaining: 1930.01000007},
+		{Path: "workbuddy1.json", Nickname: "user-a", Edition: "cn", State: "quota_exhausted", QuotaKnown: true, QuotaTotal: 2000, QuotaUsed: 2000},
+		{Path: "workbuddy2.json", Nickname: "user-b", Edition: "cn", State: "active", QuotaKnown: true, QuotaTotal: 2000, QuotaUsed: 69.98999993, QuotaRemaining: 1930.01000007},
 	})
 	lines := strings.Split(table, "\n")
 	want := displayWidth(lines[0])
@@ -1528,40 +1623,61 @@ func TestClientCannotOverrideCredentialHeaders(t *testing.T) {
 	}
 }
 
-// /v1/models 必须返回官方客户端实际可用的模型清单（此前硬编码的 10 个模型与远端零交集）。
-func TestModelsListMatchesUpstreamCatalog(t *testing.T) {
+// /v1/models 必须反映动态同步 + 静态兜底合并后的真实清单，并暴露数据来源。
+// 覆盖 handleModels 的 HTTP 契约（此前该测试钉住已废弃的静态清单变量）。
+func TestModelsListReflectsMergedCatalog(t *testing.T) {
+	resetModelsState(t)
+	defer resetModelsState(t)
+	modelsMu.Lock()
+	dynamicModels = []catalogModel{{ID: "official-dynamic-1"}, {ID: "glm-5.2"}}
+	dynamicSource = "9.9.9"
+	modelsMu.Unlock()
+
 	rec := httptest.NewRecorder()
 	handleModels(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
 
 	var resp struct {
 		Object string `json:"object"`
 		Data   []struct {
-			ID string `json:"id"`
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			OwnedBy string `json:"owned_by"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if resp.Object != "list" {
-		t.Errorf("object = %q", resp.Object)
+		t.Errorf("object = %q, want list", resp.Object)
 	}
-	if len(resp.Data) != len(upstreamModelIDs) {
-		t.Fatalf("got %d models, want %d", len(resp.Data), len(upstreamModelIDs))
+	if got := rec.Header().Get("X-Model-Source"); got != "official-cli@9.9.9" {
+		t.Errorf("X-Model-Source = %q, want official-cli@9.9.9", got)
 	}
-	ids := make(map[string]bool, len(resp.Data))
-	for _, m := range resp.Data {
-		ids[m.ID] = true
+
+	want, _ := mergedModelIDs()
+	if len(resp.Data) != len(want) {
+		t.Fatalf("got %d models, want %d (merged catalog)", len(resp.Data), len(want))
 	}
-	for _, want := range upstreamModelIDs {
-		if !ids[want] {
-			t.Errorf("missing model %q", want)
+	seen := make(map[string]bool, len(resp.Data))
+	for i, m := range resp.Data {
+		if m.ID != want[i] {
+			t.Fatalf("data[%d].id = %q, want %q (merged order)", i, m.ID, want[i])
 		}
-	}
-	// 旧硬编码模型不得回归
-	for _, stale := range []string{"hy4-preview", "hy3-preview", "minimax-m3-pay", "deepseek-v4-pro"} {
-		if ids[stale] {
-			t.Errorf("stale hardcoded model %q must not be advertised", stale)
+		if m.Object != "model" || m.OwnedBy != "workbuddy" {
+			t.Errorf("model %q malformed: object=%q owned_by=%q", m.ID, m.Object, m.OwnedBy)
 		}
+		if seen[m.ID] {
+			t.Errorf("duplicate model %q in response", m.ID)
+		}
+		seen[m.ID] = true
+	}
+	// 动态同步结果必须出现在响应里（证明接线到动态目录而非仅静态兜底）
+	if !seen["official-dynamic-1"] {
+		t.Errorf("dynamic catalog model missing from response: %v", want)
+	}
+	// 已知非法模型 ID 不得对外宣称
+	if seen["deepseek-v4.1"] {
+		t.Error("invalid model deepseek-v4.1 must not be advertised")
 	}
 }
 
