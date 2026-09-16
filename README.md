@@ -23,7 +23,7 @@
 - **授权失效自动禁用**：账号授权过期、被撤销或令牌刷新失败（HTTP 401/403 / invalid token / 登录已过期）时，自动将该账号**禁止调度并删除凭据文件**，同时写入持久化失效标记；`status` / 启动日志会明确提示该账号失效原因与重新登录命令，重新 `login` 后自动恢复调度。
 - **后台自动续期**：运行期间每 5 分钟检查所有账号 Token，距过期不足 15 分钟自动刷新并持久化回各自凭据文件。
 - **OpenAI 兼容协议**：`POST /v1/chat/completions`（SSE 流式 + 非流式聚合）、`POST /v1/responses`（OpenAI Responses API，支持流式语义事件、非流式与 function tools）、`GET /v1/models`、`GET /health`。
-- **深度思考透传规则**：仅当客户端显式请求 `reasoning_effort` 时转发；绝不强制注入，避免触发上游内容安全策略。
+- **深度思考等级遵循 OpenAI 兼容规范**：对外接受 Chat Completions 的顶层 `reasoning_effort`、Responses 的 `reasoning.effort` / `reasoning.summary` / `text.verbosity`（含 `none` 关闭语义），归一化为上游认识的扁平字段。**仅当客户端显式传参时转发，绝不强制注入**，避免触发上游内容安全策略（详见[思考等级传参](#思考等级传参)）。
 - **上游指纹对齐**：请求头逐项对齐官方客户端（详见[客户端指纹对齐](#客户端指纹对齐)），消除自造头与缺失头构成的可识别特征。
 - **会话结构自动归一化**：自动保证首条消息为 `system`，修复部分非 harness 客户端（以 `assistant` 续写或以 `tool` 回传工具结果开头）触发的上游 `first message is not system prompt` (code 11128) 报错；同时兼容 OpenAI 新版 `developer` 角色。
 - **单账号串行化**：同一账号请求自动排队，避免并发双发触发上游风控；不同账号之间可并行。
@@ -270,6 +270,41 @@ llm-pi-ai:
           contextWindow: 1000000
           maxTokens: 128000
 ```
+
+## 思考等级传参
+
+网关对外暴露的是 **OpenAI 兼容**的思考等级参数，无论下游客户端来自哪个 agent 生态，都按 OpenAI 规范传参即可；网关负责翻译成上游认识的扁平字段。
+
+| 入口 | 客户端可传（OpenAI 兼容） | 上游实际收到 |
+|---|---|---|
+| `POST /v1/chat/completions` | 顶层 `reasoning_effort` | 扁平 `reasoning_effort` |
+| `POST /v1/chat/completions` | 嵌套 `reasoning.effort` / `reasoning.summary`、`text.verbosity` | 扁平 `reasoning_effort` / `reasoning_summary` / `verbosity` |
+| `POST /v1/responses` | `reasoning.effort` / `reasoning.summary`、`text.verbosity` | 同上（由网关摊平） |
+
+归一化规则：
+
+| 输入 | 处理 | 说明 |
+|---|---|---|
+| `none` / `off` / `disabled` / `""` / `null` | 删除字段 | 语义为关闭推理 |
+| `auto` / `default` | 删除字段 | 交由上游按模型默认档位决定 |
+| 其他非空字符串 | 转小写、去空白后原样转发 | 如 `HIGH` → `high`、`" high "` → `high` |
+| 未传 | 不发送 | **绝不注入** |
+
+档位取值本身不做白名单校验——各模型支持的档位由上游裁决（不支持时返回 `11150 not supported by the current model`）。常见取值：`minimal` / `low` / `medium` / `high` / `xhigh` / `max`。
+
+> **为什么不注入**：官方客户端发往同一上游（`www.workbuddy.ai`）的报文不含 `reasoning_summary`，且强行注入思考字段会触发上游内容安全拦截（`code 11102` / `11128`）。网关因此只做「客户端显式传参 → 归一化转发」，不凭空补字段。
+
+### 上游字段语义（实测）
+
+以下为对 `https://www.workbuddy.ai/v2/chat/completions` 的实测结论（`stream` 必须为 `true`，非流式一律 `code 11101`）：
+
+| 字段 | 上游行为 |
+|---|---|
+| `reasoning_effort`（扁平） | 唯一生效的思考开关。取值大小写/空白敏感，`HIGH`、`" high "` 均 `400 11150`；`off` / `disabled` / `auto` 同样 `11150`。`none` 被接受但**仍开启推理**（prompt_tokens 18→43），与 OpenAI「不推理」语义相反，故网关将其归一化为删除字段。 |
+| `reasoning.effort`（嵌套） | **被完全忽略**（推理根本不开启），因此网关必须摊平。 |
+| `reasoning_summary`（扁平） | 上游不校验取值（`auto` / `concise` / `detailed` / `bogus` / `none` / `null` 均 `200`），原样透传，网关不改写其取值。 |
+| `verbosity`（扁平） | 上游不校验取值，与推理开关正交（无 `reasoning_effort` 时也接受）。 |
+| `max_thinking_tokens` | 上游接受（`MAX_THINKING_TOKENS` 环境变量经客户端设置），网关透传。 |
 
 ## 各平台使用方法
 

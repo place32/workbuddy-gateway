@@ -19,7 +19,9 @@ import (
 //
 // 网关只与上游 /v2/chat/completions 通信，此处负责双向协议转换：
 //   - 请求：input / instructions / tools(扁平) / tool_choice / max_output_tokens /
-//     reasoning.effort  ->  chat messages / tools(嵌套 function) / max_tokens / reasoning_effort
+//     reasoning.effort / reasoning.summary / text.verbosity
+//     ->  chat messages / tools(嵌套 function) / max_tokens /
+//     reasoning_effort / reasoning_summary / verbosity
 //   - 非流式响应：chat.completion -> response{object:"response", output:[...]}
 //   - 流式响应：上游 SSE 增量 -> Responses 语义事件（response.output_text.delta、
 //     response.function_call_arguments.delta、response.completed ...）
@@ -63,7 +65,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	chatReq.Set("stream", true) // 上游强制流式，非流式由网关本地聚合
 
-	applyThinkingRules(chatReq, modelName)
+	applyThinkingRules(chatReq)
 	sanitizeMessages(chatReq)
 	ensureLeadingSystemMessage(chatReq)
 
@@ -144,9 +146,23 @@ func responsesToChatRequest(respReq *jsonObject, modelName string) (*jsonObject,
 	}
 	if reasoningRaw, _ := respReq.Get("reasoning"); reasoningRaw != nil {
 		if reasoning, ok := reasoningRaw.(*jsonObject); ok {
-			effortRaw, _ := reasoning.Get("effort")
-			if effort, ok := effortRaw.(string); ok && effort != "" && effort != "none" {
-				chat.Set("reasoning_effort", effort)
+			// effort 原样交给 applyThinkingRules 归一化（大小写 / none 关闭语义），
+			// 此处只负责把嵌套写法摊平为上游认识的扁平字段。
+			if effortRaw, ok := reasoning.Get("effort"); ok {
+				if effort, ok := effortRaw.(string); ok && strings.TrimSpace(effort) != "" {
+					chat.Set("reasoning_effort", effort)
+				}
+			}
+			if summaryRaw, ok := reasoning.Get("summary"); ok && summaryRaw != nil {
+				chat.Set("reasoning_summary", summaryRaw)
+			}
+		}
+	}
+	// Responses 的文本详尽度位于 text.verbosity，上游只认顶层扁平 verbosity。
+	if textRaw, _ := respReq.Get("text"); textRaw != nil {
+		if text, ok := textRaw.(*jsonObject); ok {
+			if v, ok := text.Get("verbosity"); ok && v != nil {
+				chat.Set("verbosity", v)
 			}
 		}
 	}

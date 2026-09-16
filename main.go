@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	version = "1.8.6"
+	version = "1.8.7"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -2299,8 +2299,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 腾讯上游强制要求 stream 必须为 true，非流式会被拦截 (code 11101)
 	reqObj.Set("stream", true)
 
-	// 深度思考 (Thinking) 自动适配：混元系列如果未关闭思考，自动赋予 high 档位保证深度思考输出
-	applyThinkingRules(reqObj, modelStr)
+	// 思考等级归一化：把 OpenAI 兼容写法（顶层 reasoning_effort / 嵌套 reasoning.effort、
+	// 以及 Responses 风格的 text.verbosity）落到上游认识的扁平字段上，并做大小写与
+	// 关闭语义（none/off）归一化。绝不注入，客户端未传则不发送。
+	applyThinkingRules(reqObj)
 
 	// 消息归一化：developer 角色（OpenAI 新版 system 别名）在上游会被拒，统一转 system
 	sanitizeMessages(reqObj)
@@ -2444,18 +2446,95 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 // 请求转译与净化工具函数
 // -----------------------------------------------------------------------------
 
-func applyThinkingRules(obj *jsonObject, modelName string) {
-	// 遵循 CodeBuddy 规范：仅当客户端显式设置了 reasoning_effort 时才传递与规范化
-	// 绝不可强行对普通请求注入 reasoning_effort，否则极易触发腾讯内容与安全策略拦截 (code 11128)
-	currEff, _ := obj.Get("reasoning_effort")
-	eff, _ := currEff.(string)
-	if eff == "" || eff == "off" || eff == "none" {
+// reasoningEffortDisable 是语义等价于「关闭推理」的输入取值，归一化后一律删除该字段。
+//
+// none 是 OpenAI 规范值。实测上游收到 none 时仍会注入推理脚手架
+// （prompt_tokens 18 -> 43，与 minimal/low/high 完全一致），与 OpenAI「不推理」语义相反，
+// 故必须删除字段而非原样转发。off / disabled 为兼容别名。
+var reasoningEffortDisable = map[string]bool{
+	"none": true, "off": true, "disabled": true,
+}
+
+// reasoningEffortModelDefault 表示「交由上游按模型默认档位决定」，同样删除字段。
+// auto / default 并非 OpenAI 规范值，但被部分兼容客户端使用；上游收到会直接 400 (11150)。
+var reasoningEffortModelDefault = map[string]bool{
+	"auto": true, "default": true,
+}
+
+// normalizeReasoningEffort 归一化客户端传入的思考等级。
+// 返回空串表示不发送该字段（关闭推理，或交由上游默认档位决定）。
+//
+// 上游对取值大小写与空白敏感（HIGH / " high " 一律 HTTP 400 code 11150），
+// 故统一小写去空白；取值本身不做白名单校验，模型维度的支持度由上游裁决
+// （上游 11150 报文为 "not supported by the current model"）。
+func normalizeReasoningEffort(raw any) string {
+	eff, ok := raw.(string)
+	if !ok {
+		// null / 非字符串（数字、布尔）上游一律 400 (11101)，此处按缺省处理。
+		return ""
+	}
+	eff = strings.ToLower(strings.TrimSpace(eff))
+	if eff == "" || reasoningEffortDisable[eff] || reasoningEffortModelDefault[eff] {
+		return ""
+	}
+	return eff
+}
+
+// hoistNestedReasoningFields 把嵌套 reasoning.{effort,summary} 与 text.verbosity
+// 提升为上游认识的扁平字段 reasoning_effort / reasoning_summary / verbosity。
+//
+// 上游只解析扁平字段：实测嵌套 reasoning.effort 被完全忽略（prompt_tokens 保持 18，
+// 即推理根本没开启）。若不提升，客户端以为设置了思考等级、实际静默失效。
+// 顶层已有同名扁平字段时以顶层为准（Chat Completions 的顶层写法优先）。
+func hoistNestedReasoningFields(obj *jsonObject) {
+	if nested, ok := obj.Get("reasoning"); ok {
+		if reasoning, ok := nested.(*jsonObject); ok {
+			hoistFlatField(obj, reasoning, "effort", "reasoning_effort")
+			hoistFlatField(obj, reasoning, "summary", "reasoning_summary")
+		}
+	}
+	if nested, ok := obj.Get("text"); ok {
+		if text, ok := nested.(*jsonObject); ok {
+			hoistFlatField(obj, text, "verbosity", "verbosity")
+		}
+	}
+}
+
+// hoistFlatField 在顶层目标键缺失时，用嵌套对象中的同义键补齐。
+func hoistFlatField(dst, src *jsonObject, srcKey, dstKey string) {
+	if _, exists := dst.Get(dstKey); exists {
+		return
+	}
+	if v, ok := src.Get(srcKey); ok && v != nil {
+		dst.Set(dstKey, v)
+	}
+}
+
+// applyThinkingRules 归一化思考等级相关字段，使对外暴露的 OpenAI 兼容写法
+// 正确落到上游 /v2/chat/completions 认识的扁平字段上。
+//
+// 对外契约（OpenAI 兼容）：
+//   - Chat Completions：顶层 reasoning_effort
+//   - Responses：reasoning.effort / reasoning.summary、text.verbosity
+//
+// 上游契约：只识别扁平 reasoning_effort / reasoning_summary / verbosity。
+//
+// 绝不主动注入：客户端未显式传思考参数时，网关不会凭空造 reasoning_effort，
+// 也不会追加 reasoning_summary——强行注入会触发上游内容安全拦截
+// （code 11102/11128），且与官方客户端发往同一上游的报文不一致（见 README「思考等级传参」）。
+func applyThinkingRules(obj *jsonObject) {
+	hoistNestedReasoningFields(obj)
+
+	effRaw, _ := obj.Get("reasoning_effort")
+	eff := normalizeReasoningEffort(effRaw)
+	if eff == "" {
+		// 关闭推理：清掉思考等级与摘要，避免留下「已关闭却仍索要摘要」的矛盾组合。
+		// verbosity 与推理开关正交（上游在无 effort 时也接受），不在此处处理。
 		obj.Delete("reasoning_effort")
 		obj.Delete("reasoning_summary")
 		return
 	}
-	// 客户端显式请求思考时，设置 auto
-	obj.Set("reasoning_summary", "auto")
+	obj.Set("reasoning_effort", eff)
 }
 
 func sanitizeMessages(obj *jsonObject) {

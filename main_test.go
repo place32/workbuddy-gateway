@@ -920,6 +920,88 @@ func TestSanitizeMessagesNormalizesDeveloperRole(t *testing.T) {
 	t.Logf("roles normalized: %v", roles)
 }
 
+// 验证思考等级归一化：OpenAI 兼容写法（顶层 / 嵌套）落到上游扁平字段，
+// 关闭语义与大小写归一，且未显式请求时绝不注入。
+//
+// 上游实测：取值大小写/空白敏感（HIGH、" high " 均 400 code 11150）；
+// none 语义等价于关闭；auto/default 为客户端习惯值但上游 400，按缺省处理。
+func TestApplyThinkingRulesNormalizesEffort(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string // 期望上游收到的 reasoning_effort；"" 表示该字段必须不存在
+	}{
+		{"未请求时不注入", `{"model":"m","messages":[]}`, ""},
+		{"null 按缺省处理", `{"model":"m","reasoning_effort":null}`, ""},
+		{"非字符串按缺省处理", `{"model":"m","reasoning_effort":3}`, ""},
+		{"空串关闭", `{"model":"m","reasoning_effort":""}`, ""},
+		{"none 关闭", `{"model":"m","reasoning_effort":"none"}`, ""},
+		{"off 关闭", `{"model":"m","reasoning_effort":"off"}`, ""},
+		{"disabled 关闭", `{"model":"m","reasoning_effort":"disabled"}`, ""},
+		{"auto 交由上游默认", `{"model":"m","reasoning_effort":"auto"}`, ""},
+		{"default 交由上游默认", `{"model":"m","reasoning_effort":"default"}`, ""},
+		{"high 原样", `{"model":"m","reasoning_effort":"high"}`, "high"},
+		{"low 原样", `{"model":"m","reasoning_effort":"low"}`, "low"},
+		{"minimal 原样", `{"model":"m","reasoning_effort":"minimal"}`, "minimal"},
+		{"xhigh 原样", `{"model":"m","reasoning_effort":"xhigh"}`, "xhigh"},
+		{"大写归一", `{"model":"m","reasoning_effort":"HIGH"}`, "high"},
+		{"混合大小写归一", `{"model":"m","reasoning_effort":"Medium"}`, "medium"},
+		{"空白归一", `{"model":"m","reasoning_effort":" high "}`, "high"},
+		{"嵌套 reasoning.effort 提升", `{"model":"m","reasoning":{"effort":"low"}}`, "low"},
+		{"顶层优先于嵌套", `{"model":"m","reasoning_effort":"high","reasoning":{"effort":"low"}}`, "high"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			obj := mustOrdered(t, tc.body)
+			applyThinkingRules(obj)
+			got, exists := obj.Get("reasoning_effort")
+			if tc.want == "" {
+				if exists {
+					t.Fatalf("reasoning_effort should be absent, got %#v", got)
+				}
+				return
+			}
+			if !exists || got != tc.want {
+				t.Fatalf("reasoning_effort = %#v (exists=%v), want %q", got, exists, tc.want)
+			}
+		})
+	}
+}
+
+// 验证网关不凭空注入 reasoning_summary：客户端未传时上游收到的报文里不得出现该字段。
+//
+// 官方客户端发往同一上游的报文不含 reasoning_summary（命中 externalDomain 时
+// SdkFieldCleanupRule 会删除该字段）；网关自行追加会构成可识别的报文差异。
+func TestApplyThinkingRulesNeverInjectsReasoningSummary(t *testing.T) {
+	for _, body := range []string{
+		`{"model":"m","messages":[]}`,
+		`{"model":"m","reasoning_effort":"high"}`,
+		`{"model":"m","reasoning":{"effort":"high"}}`,
+		`{"model":"m","reasoning_effort":"none"}`,
+	} {
+		obj := mustOrdered(t, body)
+		applyThinkingRules(obj)
+		if v, exists := obj.Get("reasoning_summary"); exists {
+			t.Fatalf("body %s: reasoning_summary injected as %#v", body, v)
+		}
+	}
+}
+
+// 验证关闭推理时清掉客户端自带的 reasoning_summary，避免「已关闭却索要摘要」的矛盾组合。
+func TestApplyThinkingRulesDropsSummaryWhenReasoningDisabled(t *testing.T) {
+	obj := mustOrdered(t, `{"model":"m","reasoning_effort":"none","reasoning_summary":"auto"}`)
+	applyThinkingRules(obj)
+	if v, exists := obj.Get("reasoning_summary"); exists {
+		t.Fatalf("reasoning_summary should be dropped, got %#v", v)
+	}
+	// 显式请求思考时，客户端自带的 summary 必须原样保留（网关不改写其取值）。
+	obj = mustOrdered(t, `{"model":"m","reasoning_effort":"high","reasoning_summary":"concise"}`)
+	applyThinkingRules(obj)
+	if v, _ := obj.Get("reasoning_summary"); v != "concise" {
+		t.Fatalf("reasoning_summary = %#v, want concise", v)
+	}
+}
+
 // 验证上游 tool_calls 增量按 index 正确归并为一个完整工具调用
 func TestApplyToolCallDeltaMerge(t *testing.T) {
 	merged := map[int]*mergedToolCall{}
@@ -1059,6 +1141,62 @@ func TestResponsesToChatRequestStringInput(t *testing.T) {
 	}
 	if _, err := responsesToChatRequest(mustOrdered(t, `{"model":"x"}`), "x"); err == nil {
 		t.Fatal("empty input should error")
+	}
+}
+
+// 验证 Responses 的 reasoning.effort / reasoning.summary / text.verbosity
+// 全部摊平为上游认识的扁平字段。
+//
+// 上游实测只解析扁平字段：嵌套 reasoning.effort 被完全忽略（推理根本不开启）。
+// summary 取值上游不校验（bogus/none/null 均 200），故原样透传、不改写。
+func TestResponsesToChatRequestFlattensReasoningFields(t *testing.T) {
+	chat, err := responsesToChatRequest(mustOrdered(t, `{
+		"model": "x",
+		"input": "hi",
+		"reasoning": {"effort": "medium", "summary": "concise"},
+		"text": {"verbosity": "low"}
+	}`), "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyThinkingRules(chat)
+
+	if v, _ := chat.Get("reasoning_effort"); v != "medium" {
+		t.Fatalf("reasoning_effort = %#v, want medium", v)
+	}
+	if v, _ := chat.Get("reasoning_summary"); v != "concise" {
+		t.Fatalf("reasoning_summary = %#v, want concise", v)
+	}
+	if v, _ := chat.Get("verbosity"); v != "low" {
+		t.Fatalf("verbosity = %#v, want low", v)
+	}
+
+	// 非字符串 / null 的 summary 不得透传成上游无法解析的值
+	chat, err = responsesToChatRequest(mustOrdered(t, `{
+		"model": "x", "input": "hi",
+		"reasoning": {"effort": "high", "summary": null}
+	}`), "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyThinkingRules(chat)
+	if v, exists := chat.Get("reasoning_summary"); exists {
+		t.Fatalf("null summary should not be forwarded, got %#v", v)
+	}
+	t.Log("responses reasoning fields flattened OK")
+}
+
+// 验证 Responses 请求关闭推理时不向上游发送 reasoning_effort（none 语义等价于关闭）。
+func TestResponsesToChatRequestDisablesReasoning(t *testing.T) {
+	chat, err := responsesToChatRequest(mustOrdered(t, `{
+		"model": "x", "input": "hi", "reasoning": {"effort": "none"}
+	}`), "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyThinkingRules(chat)
+	if v, exists := chat.Get("reasoning_effort"); exists {
+		t.Fatalf("reasoning_effort should be absent for none, got %#v", v)
 	}
 }
 
