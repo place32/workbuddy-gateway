@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	version = "1.8.5"
+	version = "1.8.6"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -2354,6 +2354,12 @@ func streamChatResponse(w http.ResponseWriter, resp *http.Response, reqID uint64
 		if cleanData == "" {
 			continue
 		}
+		// 心跳是 SSE 注释，不能包装成 JSON data，否则客户端会解析失败。
+		if strings.HasPrefix(cleanData, ":") {
+			_, _ = fmt.Fprintf(w, "%s\n\n", cleanData)
+			flusher.Flush()
+			continue
+		}
 		if cleanData == "[DONE]" {
 			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
@@ -3179,7 +3185,8 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 func cleanChunkJSON(s string) string {
 	var obj map[string]any
 	if json.Unmarshal([]byte(s), &obj) != nil {
-		return s
+		// SSE 元数据及非 JSON 行不能作为 Chat Completions 数据事件发出。
+		return ""
 	}
 	if choices, ok := obj["choices"].([]any); ok {
 		for _, c := range choices {
