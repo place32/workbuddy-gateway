@@ -1905,14 +1905,16 @@ func TestClientCannotOverrideCredentialHeaders(t *testing.T) {
 	}
 }
 
-// /v1/models 必须反映动态同步 + 静态兜底合并后的真实清单，并暴露数据来源。
-// 覆盖 handleModels 的 HTTP 契约（此前该测试钉住已废弃的静态清单变量）。
+// /v1/models 必须反映「实时接口 + npm 静态目录」按站点合并后的真实清单，
+// 并暴露目录来源；跨站点同名模型只出现一次。
 func TestModelsListReflectsMergedCatalog(t *testing.T) {
-	resetModelsState(t)
-	defer resetModelsState(t)
+	resetModelsStateT(t)
 	modelsMu.Lock()
-	dynamicModels = []catalogModel{{ID: "official-dynamic-1"}, {ID: "glm-5.2"}}
-	dynamicSource = "9.9.9"
+	catalogModels = map[string][]catalogModel{
+		"cn":   {{ID: "hy3", FromLive: true}, {ID: "glm-5.2", FromLive: true}},
+		"intl": {{ID: "hy3", FromLive: true}, {ID: "official-dynamic-1", FromLive: true}},
+	}
+	dynamicSource = "2026-09-18 10:00"
 	modelsMu.Unlock()
 
 	rec := httptest.NewRecorder()
@@ -1932,13 +1934,14 @@ func TestModelsListReflectsMergedCatalog(t *testing.T) {
 	if resp.Object != "list" {
 		t.Errorf("object = %q, want list", resp.Object)
 	}
-	if got := rec.Header().Get("X-Model-Source"); got != "official-cli@9.9.9" {
-		t.Errorf("X-Model-Source = %q, want official-cli@9.9.9", got)
+	if got := rec.Header().Get("X-Model-Source"); got != "live-api@2026-09-18 10:00" {
+		t.Errorf("X-Model-Source = %q, want live-api@2026-09-18 10:00", got)
 	}
 
+	// 契约：与 mergedModelIDs() 的顺序/长度一致（catalogSites 顺序 + 站点内目录顺序），且无重复。
 	want, _ := mergedModelIDs()
 	if len(resp.Data) != len(want) {
-		t.Fatalf("got %d models, want %d (merged catalog)", len(resp.Data), len(want))
+		t.Fatalf("got %d models, want %d (merged catalog): %v", len(resp.Data), len(want), resp.Data)
 	}
 	seen := make(map[string]bool, len(resp.Data))
 	for i, m := range resp.Data {
@@ -1953,13 +1956,11 @@ func TestModelsListReflectsMergedCatalog(t *testing.T) {
 		}
 		seen[m.ID] = true
 	}
-	// 动态同步结果必须出现在响应里（证明接线到动态目录而非仅静态兜底）
-	if !seen["official-dynamic-1"] {
-		t.Errorf("dynamic catalog model missing from response: %v", want)
-	}
-	// 已知非法模型 ID 不得对外宣称
-	if seen["deepseek-v4.1"] {
-		t.Error("invalid model deepseek-v4.1 must not be advertised")
+	// 两个站点各自的目录都必须出现在响应里（证明按站点合并而非只取其一）
+	for _, id := range []string{"glm-5.2", "official-dynamic-1"} {
+		if !seen[id] {
+			t.Errorf("model %q missing from response: %v", id, want)
+		}
 	}
 }
 
