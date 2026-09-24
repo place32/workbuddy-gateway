@@ -359,11 +359,102 @@ func TestMarkModelQuotaBlockedDoesNotOverwriteAccountBalance(t *testing.T) {
 	remaining := acc.QuotaRemaining
 	exhausted := acc.QuotaExhausted
 	accountMu.Unlock()
-	if state == nil || !state.QuotaBlocked || state.CostClass != modelCostPaid {
+	if state == nil || !state.QuotaBlocked {
 		t.Fatalf("model block missing: %+v", state)
 	}
 	if remaining != 123 || exhausted {
 		t.Fatalf("model 14018 must not overwrite account balance: remaining=%v exhausted=%v", remaining, exhausted)
+	}
+}
+
+// 14018 只表示账号额度耗尽，与模型收费属性无关。
+// 已知免费模型遇到 14018 时，必须保持 free 分类，不能被错误改写成 paid。
+func TestQuotaBlockedMustNotRewriteFreeModelAsPaid(t *testing.T) {
+	chdirTemp(t)
+	acc := &Account{Path: "free.json", Auth: &StoredAuth{Edition: "intl"}, QuotaExhausted: true,
+		ModelStates: map[string]*modelRuntimeState{
+			"deepseek-v4.1-flash": {CostClass: modelCostFree},
+		}}
+	accountMu.Lock()
+	oldAccounts := accounts
+	accounts = []*Account{acc}
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+
+	markModelQuotaBlocked(acc, "deepseek-v4.1-flash", "14018 Credits exhausted")
+
+	accountMu.Lock()
+	state := acc.ModelStates["deepseek-v4.1-flash"]
+	accountMu.Unlock()
+	if state.CostClass != modelCostFree {
+		t.Fatalf("14018 must not overwrite a free model's cost class, got %q", state.CostClass)
+	}
+	if !state.QuotaBlocked {
+		t.Fatal("14018 should still block this account for the model until quota recovers")
+	}
+	// 未知模型遇到 14018 也应保持 unknown，不得被当成 paid。
+	acc2 := &Account{Path: "unknown.json", Auth: &StoredAuth{Edition: "intl"}, QuotaExhausted: true,
+		ModelStates: map[string]*modelRuntimeState{"mystery": {CostClass: modelCostUnknown}}}
+	markModelQuotaBlocked(acc2, "mystery", "14018")
+	accountMu.Lock()
+	got := acc2.ModelStates["mystery"].CostClass
+	accountMu.Unlock()
+	if got != modelCostUnknown {
+		t.Fatalf("14018 must not turn an unknown model into paid, got %q", got)
+	}
+}
+
+// 旧版本快照里可能残留「14018 被误写成 paid」的脏数据；恢复时必须降回 unknown。
+func TestSanitizeRestoredModelStateFixesLegacyPaidFromQuotaBlock(t *testing.T) {
+	legacy := &modelRuntimeState{
+		CostClass:    modelCostPaid,
+		QuotaBlocked: true,
+		LastReason:   `{"error":{"data":{"code":14018,"msg":"Credits exhausted."}}}`,
+	}
+	sanitizeRestoredModelState(legacy)
+	if legacy.CostClass != modelCostUnknown {
+		t.Fatalf("legacy 14018-derived paid should be reset to unknown, got %q", legacy.CostClass)
+	}
+	if !legacy.QuotaBlocked {
+		t.Fatal("quota block should be preserved")
+	}
+
+	// 真正由 credit 证据学到的收费模型（非额度耗尽导致）必须保持 paid。
+	genuinePaid := &modelRuntimeState{CostClass: modelCostPaid}
+	sanitizeRestoredModelState(genuinePaid)
+	if genuinePaid.CostClass != modelCostPaid {
+		t.Fatalf("genuine paid model must stay paid, got %q", genuinePaid.CostClass)
+	}
+
+	// 免费模型不受影响。
+	free := &modelRuntimeState{CostClass: modelCostFree, QuotaBlocked: true}
+	sanitizeRestoredModelState(free)
+	if free.CostClass != modelCostFree {
+		t.Fatalf("free model must stay free, got %q", free.CostClass)
+	}
+}
+
+// QuotaBlocked 必须短路调度，避免额度耗尽账号被反复选中探测。
+func TestQuotaBlockedShortCircuitsScheduling(t *testing.T) {
+	acc := &Account{Path: "exhausted.json", Auth: &StoredAuth{}, QuotaExhausted: true,
+		ModelStates: map[string]*modelRuntimeState{
+			"m": {CostClass: modelCostUnknown, QuotaBlocked: true},
+		}}
+	accountMu.Lock()
+	oldAccounts := accounts
+	accounts = []*Account{acc}
+	accountMu.Unlock()
+	defer func() {
+		accountMu.Lock()
+		accounts = oldAccounts
+		accountMu.Unlock()
+	}()
+	if _, _, err := nextAccountForModel("m", nil); err == nil {
+		t.Fatal("quota-blocked account must not be selected for the model")
 	}
 }
 
@@ -931,7 +1022,7 @@ func TestRenderAccountTableUsesFullYearAndNoEmoji(t *testing.T) {
 		FreeModels:     1,
 		ModelCooldowns: 2,
 	}})
-	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "付费耗尽", "2027-09-05 01:36:55", "总额度", "已用", "剩余", "付费用户", "免费模型", "模型冷却", "1100", "否"} {
+	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "付费耗尽", "2027-09-05 01:36:55", "总额度", "已用", "剩余", "套餐", "免费模型", "模型冷却", "1100", "免费"} {
 		if !strings.Contains(table, want) {
 			t.Fatalf("table missing %q:\n%s", want, table)
 		}
@@ -1105,12 +1196,63 @@ func TestUnknownModelQuotaProbeStopsAfterOneExhaustedAccount(t *testing.T) {
 
 func TestParseQuotaSummary(t *testing.T) {
 	data := []byte(`{"Packages":[{"CycleTotalCapacity":"1500","CycleUsedCapacity":"69.98999993","CycleRemainCapacity":"1430.01000007"},{"CycleTotalCapacity":"500","CycleUsedCapacity":"500","CycleRemainCapacity":"0"}],"IsPaidUser":true}`)
-	total, used, remaining, paid, err := parseQuotaSummary(data)
+	total, used, remaining, paid, plan, err := parseQuotaSummary(data)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if total != 2000 || used != 569.98999993 || remaining != 1430.01000007 || !paid {
 		t.Fatalf("unexpected quota summary: total=%v used=%v remaining=%v paid=%v", total, used, remaining, paid)
+	}
+	if plan != "pro" {
+		t.Fatalf("IsPaidUser=true should show pro, got %q", plan)
+	}
+}
+
+// 套餐展示规则：ProTrialStatus=1 → Pro试用；IsPaidUser=true → pro；
+// 其余（含字段缺失、类型异常、识别不出）→ 免费。
+func TestPlanLabelFromSummary(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want string
+	}{
+		{"Pro试用（数字1）", `{"ProTrialStatus":1,"IsPaidUser":false}`, "Pro试用"},
+		{"Pro试用（字符串1）", `{"ProTrialStatus":"1","IsPaidUser":false}`, "Pro试用"},
+		{"Pro试用优先于付费标记", `{"ProTrialStatus":1,"IsPaidUser":true}`, "Pro试用"},
+		{"正式付费pro", `{"ProTrialStatus":0,"IsPaidUser":true}`, "pro"},
+		{"试用已结束且非付费→免费", `{"ProTrialStatus":0,"IsPaidUser":false}`, "免费"},
+		{"字段缺失→免费", `{"Packages":[]}`, "免费"},
+		{"类型异常→免费", `{"ProTrialStatus":{"unexpected":true},"IsPaidUser":false}`, "免费"},
+		{"国内站无ProTrialStatus→免费", `{"IsPaidUser":false,"SubscriptionPackageCode":""}`, "免费"},
+		{"有订阅包但非试用非付费→免费", `{"IsPaidUser":false,"SubscriptionPackageCode":"pkg-code-000"}`, "免费"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var summary quotaSummaryData
+			if err := json.Unmarshal([]byte(tc.json), &summary); err != nil {
+				t.Fatal(err)
+			}
+			if got := planLabelFromSummary(summary); got != tc.want {
+				t.Fatalf("plan=%q want=%q", got, tc.want)
+			}
+		})
+	}
+}
+
+// 套餐列必须展示 Pro试用/pro/免费，且不再出现 1 和 0。
+func TestRenderAccountTableShowsPlanLabel(t *testing.T) {
+	table := renderAccountTable([]accountSnapshot{
+		{Path: "intl-trial.json", Edition: "intl", Nickname: "trial@example.com", State: "active", QuotaTotal: 500, QuotaRemaining: 500, QuotaKnown: true, PlanLabel: "Pro试用"},
+		{Path: "cn-paid.json", Edition: "cn", Nickname: "paid@example.com", State: "active", QuotaTotal: 2200, QuotaRemaining: 400, QuotaKnown: true, PlanLabel: "pro"},
+		{Path: "cn-free.json", Edition: "cn", Nickname: "free@example.com", State: "active", QuotaTotal: 2200, QuotaRemaining: 400, QuotaKnown: true, PlanLabel: "免费"},
+	})
+	for _, want := range []string{"套餐", "Pro试用", "pro", "免费"} {
+		if !strings.Contains(table, want) {
+			t.Fatalf("table missing %q:\n%s", want, table)
+		}
+	}
+	if strings.Contains(table, "付费用户") {
+		t.Fatalf("table should no longer contain 付费用户 column:\n%s", table)
 	}
 }
 
@@ -1172,10 +1314,9 @@ func mustOrdered(t *testing.T, s string) *jsonObject {
 	return obj
 }
 
-// 提取 messages 各条 role，便于断言
-func rolesOf(obj *jsonObject) []string {
-	raw, _ := obj.Get("messages")
-	messages, _ := raw.([]any)
+// 提取 messages 各条 role，便于断言。保序对象与 map 都支持。
+func rolesOf(obj any) []string {
+	messages := messagesOf(obj)
 	roles := make([]string, 0, len(messages))
 	for _, m := range messages {
 		roles = append(roles, roleOfMessage(m))
@@ -2105,7 +2246,8 @@ func TestSmokeEndToEndUpstreamHeaders(t *testing.T) {
 
 // upstreamHeadersForSession 驱动真实 handleChatCompletions 链路，返回上游收到的 Header。
 // hdrs 模拟客户端携带的会话头（如 X-Conversation-ID / X-Conversation-Request-ID）。
-func upstreamHeadersForSession(t *testing.T, hdrs map[string]string) http.Header {
+// audit 为真时包一层 requestAuditMiddleware，复现调试开关下的出站头覆盖路径。
+func upstreamHeadersForSession(t *testing.T, hdrs map[string]string, audit bool) http.Header {
 	t.Helper()
 
 	got := make(chan http.Header, 1)
@@ -2164,7 +2306,11 @@ func upstreamHeadersForSession(t *testing.T, hdrs map[string]string) http.Header
 		req.Header.Set(k, v)
 	}
 	rec := httptest.NewRecorder()
-	handleChatCompletions(rec, req)
+	var handler http.Handler = http.HandlerFunc(handleChatCompletions)
+	if audit {
+		handler = requestAuditMiddleware(handler)
+	}
+	handler.ServeHTTP(rec, req)
 
 	select {
 	case h := <-got:
@@ -2179,8 +2325,8 @@ func upstreamHeadersForSession(t *testing.T, hdrs map[string]string) http.Header
 func TestSessionScopedLinkIDsAreStableWithinConversation(t *testing.T) {
 	const conv = "04bad56e-08d5-4647-9c3c-28e12897c1af"
 	hdrs := map[string]string{"X-Conversation-ID": conv}
-	a := upstreamHeadersForSession(t, hdrs)
-	b := upstreamHeadersForSession(t, hdrs)
+	a := upstreamHeadersForSession(t, hdrs, false)
+	b := upstreamHeadersForSession(t, hdrs, false)
 
 	// 会话级：两次请求必须逐字相同
 	for _, name := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Root-Request-ID", "X-Trace-ID"} {
@@ -2215,8 +2361,8 @@ func TestSessionScopedLinkIDsAreStableWithinConversation(t *testing.T) {
 
 // 不同会话必须得到不同的会话级链路 ID（不得跨会话复用）。
 func TestSessionScopedLinkIDsDifferAcrossConversations(t *testing.T) {
-	a := upstreamHeadersForSession(t, map[string]string{"X-Conversation-ID": "04bad56e-08d5-4647-9c3c-28e12897c1af"})
-	b := upstreamHeadersForSession(t, map[string]string{"X-Conversation-ID": "633ef566-21df-41b5-a796-c57fda9e29a6"})
+	a := upstreamHeadersForSession(t, map[string]string{"X-Conversation-ID": "04bad56e-08d5-4647-9c3c-28e12897c1af"}, false)
+	b := upstreamHeadersForSession(t, map[string]string{"X-Conversation-ID": "633ef566-21df-41b5-a796-c57fda9e29a6"}, false)
 
 	if x, y := getHeaderExact(a, "X-Conversation-Request-ID"), getHeaderExact(b, "X-Conversation-Request-ID"); x == y {
 		t.Errorf("distinct conversations must not share X-Conversation-Request-ID: %q", x)
@@ -2231,8 +2377,8 @@ func TestSessionScopedLinkIDsDifferAcrossConversations(t *testing.T) {
 
 // 下游未提供会话标识时不得臆造会话关联：会话级 ID 退回每请求新值。
 func TestNoConversationKeyFallsBackToPerRequestIDs(t *testing.T) {
-	a := upstreamHeadersForSession(t, nil)
-	b := upstreamHeadersForSession(t, nil)
+	a := upstreamHeadersForSession(t, nil, false)
+	b := upstreamHeadersForSession(t, nil, false)
 
 	for _, name := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Root-Request-ID", "X-Trace-ID"} {
 		if va, vb := getHeaderExact(a, name), getHeaderExact(b, name); va == vb {
@@ -2253,8 +2399,8 @@ func TestNoConversationKeyFallsBackToPerRequestIDs(t *testing.T) {
 func TestConversationRequestIDOnlyIsAdoptedVerbatim(t *testing.T) {
 	const crid = "96fa0aae82d9df0aa4238fc12e42afc0"
 	hdrs := map[string]string{"X-Conversation-Request-ID": crid}
-	a := upstreamHeadersForSession(t, hdrs)
-	b := upstreamHeadersForSession(t, hdrs)
+	a := upstreamHeadersForSession(t, hdrs, false)
+	b := upstreamHeadersForSession(t, hdrs, false)
 
 	if v := getHeaderExact(a, "X-Conversation-Request-ID"); v != crid {
 		t.Errorf("X-Conversation-Request-ID = %q, want client-provided %q", v, crid)
@@ -2277,6 +2423,53 @@ func TestConversationRequestIDOnlyIsAdoptedVerbatim(t *testing.T) {
 	}
 }
 
+// 调试开关打开且请求经过审计中间件时，出站链路头的值仍只由会话作用域对齐写入。
+// 中间件在没有客户端 X-Trace-ID 时会生成带连字符的 UUID，并把它记进调试上下文；
+// 旧逻辑再用这个值覆盖上游头，于是 X-Trace-ID 不再等于由会话键派生的 32 位 hex。
+// X-Parent-Request-ID 不是客户端指纹，同样不得因为调试打开而出现在上游请求上。
+// 键名大小写不在此断言：httptest 的入站解析会把所有头规范化，线上字节由
+// captureUpstreamWire 的指纹回归单独核对。
+func TestDebugLoggingDoesNotRewriteUpstreamTraceHeaders(t *testing.T) {
+	old := cfg.DebugEnabled
+	cfg.DebugEnabled = true
+	sink := &debugJSONSink{writer: io.Discard}
+	debugSinkMu.Lock()
+	oldSink := debugSink
+	debugSink = sink
+	debugSinkMu.Unlock()
+	t.Cleanup(func() {
+		cfg.DebugEnabled = old
+		debugSinkMu.Lock()
+		debugSink = oldSink
+		debugSinkMu.Unlock()
+	})
+
+	const conv = "04bad56e-08d5-4647-9c3c-28e12897c1af"
+	h := upstreamHeadersForSession(t, map[string]string{
+		"X-Conversation-ID": conv,
+	}, true)
+
+	traceID := getHeaderExact(h, "X-Trace-ID")
+	if len(traceID) != 32 || strings.Trim(traceID, "0123456789abcdef") != "" {
+		t.Errorf("X-Trace-ID = %q, want 32 lowercase hex derived from the conversation", traceID)
+	}
+	if strings.Contains(traceID, "-") {
+		t.Errorf("X-Trace-ID = %q, debug middleware UUID leaked onto the upstream request", traceID)
+	}
+
+	if x, y := getHeaderExact(h, "X-Conversation-Request-ID"), getHeaderExact(h, "X-Root-Request-ID"); x != traceID || y != traceID {
+		t.Errorf("session-scoped ids diverged under debug: request=%q root=%q trace=%q", x, y, traceID)
+	}
+	if got := getHeaderExact(h, "X-Parent-Request-ID"); got != "" {
+		t.Errorf("X-Parent-Request-ID = %q, debug must not add a non-client header", got)
+	}
+	if tp := getHeaderExact(h, "traceparent"); !strings.HasPrefix(tp, "00-"+traceID+"-") {
+		t.Errorf("traceparent %q not linked to X-Trace-ID %q", tp, traceID)
+	}
+}
+
+
+
 // 下游只带链路 ID 的一部分时，网关必须按客户端不变量补齐同组伙伴，
 // 而不能让其余头另生成值 —— 后者会产出客户端不可能产生的组合（比缺失更显眼）。
 func TestPartialLinkHeadersAreCompletedCoherently(t *testing.T) {
@@ -2289,7 +2482,7 @@ func TestPartialLinkHeadersAreCompletedCoherently(t *testing.T) {
 	t.Run("only traceparent", func(t *testing.T) {
 		h := upstreamHeadersForSession(t, map[string]string{
 			"traceparent": "00-" + traceID + "-" + spanID + "-01",
-		})
+		}, false)
 		// trace 组：下游 traceparent 的 trace 段必须传播到全部同义头
 		for _, n := range []string{"X-Trace-ID", "X-Conversation-Request-ID", "X-Root-Request-ID", "X-B3-TraceId"} {
 			if got := getHeaderExact(h, n); got != traceID {
@@ -2306,7 +2499,7 @@ func TestPartialLinkHeadersAreCompletedCoherently(t *testing.T) {
 	})
 
 	t.Run("only X-Request-ID", func(t *testing.T) {
-		h := upstreamHeadersForSession(t, map[string]string{"X-Request-ID": reqID})
+		h := upstreamHeadersForSession(t, map[string]string{"X-Request-ID": reqID}, false)
 		if got := getHeaderExact(h, "X-Request-ID"); got != reqID {
 			t.Errorf("X-Request-ID = %q, want %q", got, reqID)
 		}
@@ -2320,7 +2513,7 @@ func TestPartialLinkHeadersAreCompletedCoherently(t *testing.T) {
 		parent := "298ea3b5a5796f21"
 		h := upstreamHeadersForSession(t, map[string]string{
 			"b3": traceID + "-" + spanID + "-1-" + parent,
-		})
+		}, false)
 		if got := getHeaderExact(h, "X-Trace-ID"); got != traceID {
 			t.Errorf("X-Trace-ID = %q, want %q (from b3)", got, traceID)
 		}
@@ -2337,7 +2530,7 @@ func TestPartialLinkHeadersAreCompletedCoherently(t *testing.T) {
 
 	// 下游未提供任何链路头时，合成值内部也必须自洽
 	t.Run("none", func(t *testing.T) {
-		h := upstreamHeadersForSession(t, nil)
+		h := upstreamHeadersForSession(t, nil, false)
 		trace := getHeaderExact(h, "X-Trace-ID")
 		span := getHeaderExact(h, "X-B3-SpanId")
 		if got := getHeaderExact(h, "X-B3-TraceId"); got != trace {

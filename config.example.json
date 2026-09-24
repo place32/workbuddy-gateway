@@ -1,0 +1,13 @@
+{
+  "debug": {
+    "enabled": false
+  },
+  "upstream": {
+    "headerTimeoutSeconds": 300,
+    "idleTimeoutSeconds": 120
+  },
+  "models": {
+    "blocklist": [],
+    "allowlist": []
+  }
+}

@@ -27,7 +27,7 @@ func TestStreamChatResponseSSEFraming(t *testing.T) {
 			upstream := tc.prefix + tc.data + "\n\ndata: [DONE]\n\n"
 			resp := &http.Response{Body: io.NopCloser(strings.NewReader(upstream))}
 			rec := httptest.NewRecorder()
-			streamChatResponse(rec, resp, "test-model", 1, &Account{Path: "test"}, &upstreamProfile{Label: "test"}, time.Now())
+			streamChatResponse(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), resp, "test-model", 1, &Account{Path: "test"}, &upstreamProfile{Label: "test"}, time.Now())
 			if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
 				t.Fatalf("Content-Type = %q", got)
 			}
