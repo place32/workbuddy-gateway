@@ -739,9 +739,14 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 
 ## 客户端指纹对齐
 
-网关向上游发起请求时，会逐项对齐官方客户端（WorkBuddyAI desktop **5.5.2** + bundled CLI **2.137.1**）的请求头，避免因自造字段或缺失字段形成可静态识别的机器特征。
+网关向上游发起请求时，会按账号所属站点逐项对齐官方客户端的请求头，避免因自造字段或缺失字段形成可静态识别的机器特征。
 
-**对齐基线**：官方客户端发往 `/v2/chat/completions` 的真实请求头（抓包实测，共 38 项，含 3 项传输层头）。
+两套基线来自同一次安装（WorkBuddyAI desktop **5.5.2**，内置 CLI 包版本 **2.137.1**）：
+
+- **国内站**：桌面宿主。`X-IDE-*` 为 `CodeBuddy` / `5.5.2`，UA 为 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1`。
+- **国际站**：同一安装内置 CLI 直连 `www.workbuddy.ai` 的抓包。`product.json` 的 `platform` 为 `CLI`，`X-IDE-Type` / `X-IDE-Name` / `X-IDE-Version` 均为 `CLI` / `CLI` / `2.137.1`，UA 为 `CLI/2.137.1 WorkBuddy AI/2.137.1`（无桌面三段尾部的 `CLI/`）。
+
+**对齐基线**：国际站官方客户端发往 `/v2/chat/completions` 的真实请求头（抓包实测，共 38 项，含传输层头）。
 
 ### 关键结论与依据
 
@@ -750,7 +755,8 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0 -port 831
 | `X-Client-ID` / `X-Client-Version` | **移除** | 客户端全量安装目录（含 `app.asar`）字节级 0 命中；旧值 `codebuddy-cli` / `2.143.1` 属网关自造 |
 | `Origin` / `Referer` | **移除** | Node/Electron 运行时无浏览器语义，客户端实测不发送；发送反而是不一致特征 |
 | `Accept` | `application/json`（单一值） | 客户端实测非浏览器默认的 `*/*` 列表 |
-| `User-Agent` | `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1` | 客户端 UA 组装口径：`${platform}/${ver} ${name} AI/${ver} CLI/${cliVer}` |
+| `User-Agent` | 国际站 `CLI/2.137.1 WorkBuddy AI/2.137.1`；国内站 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1` | CLI 走 `UserAgentHttpInterceptor`：`${platform}/${platformVersion} ${productName}/${productVersion}`。桌面宿主改走 `WorkbuddyUserAgentHttpInterceptor`：`${applicationName}/${productVersion} ${platform}/${platformVersion} CLI/${cliVersion}`，国内站 `applicationName` 与 `platform` 都是 `WorkBuddy`，`productName` 是 `WorkBuddy AI`，版本取 Electron `app.getVersion()` |
+| `X-IDE-Type` / `X-IDE-Name` / `X-IDE-Version` | 国际站 `CLI` / `CLI` / `2.137.1`；国内站 `CodeBuddy` / `CodeBuddy` / `5.5.2` | 客户端取 `telemetryClientInfo`，缺失时回退 `clientInfo.ideType` / `platform` / `platformVersion`。这与 UA 的 `applicationName` 不是同一字段：国内站 UA 是 `WorkBuddy`，`X-IDE-*` 仍是 `CodeBuddy` |
 | `X-Request-ID` | 32 位小写 hex，每请求唯一 | 客户端 `generateUUUID().replace(/-/g,"")` |
 | `X-Trace-ID` | 与 `X-Request-ID` **解耦**，为 OTel traceId（全链路同值） | 实测 `X-Trace-ID` == `traceparent` 的 traceId，且同一 session 内稳定 |
 | `traceparent` / `b3` / `X-B3-*` | 补齐（OTel + B3 双份） | 客户端同时发送两套传播头 |

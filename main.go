@@ -87,15 +87,18 @@ type upstreamProfile struct {
 	Platform        string        // auth/state 的 platform 参数
 	PlatformName    string        // X-IDE-Type / X-IDE-Name（宿主产品标识）
 	PlatformVersion string        // X-IDE-Version（宿主产品版本）
-	CliVersion      string        // X-IDE-Version 回退值 + UA 尾段（bundled CLI 版本）
+	ProductName     string        // UA 产品名；空则回退「PlatformName AI」
+	AppName         string        // 桌面 UA 的 platform / applicationName；空则用 PlatformName
+	CliVersion      string        // 桌面 UA 尾段（bundled CLI 版本）；CLI 宿主本身为空
 	Product         string        // X-Product
 	PortalOrigin    string        // 各站 Web 控制台源（仅用于 billing/额度等 Web API 的 URL 拼装，不作为请求头发送）
 	LoginTTL        time.Duration // login 命令等待授权完成的超时
 }
 
 // 客户端身份常量：与真实客户端实测流量对齐（详见 README「客户端指纹对齐」）。
-// 这些取值来源于 WorkBuddyAI desktop 5.5.2 + bundled CLI 2.137.1 的真实抓包，
-// 而非臆造——任何自造字段（如 X-Client-ID）都会形成可静态识别的机器特征。
+// 国内站取值来源于 WorkBuddyAI desktop 5.5.2 + bundled CLI 2.137.1 的抓包；
+// 国际站取值来源于同一安装（desktop 5.5.2）内置 CLI 直连 www.workbuddy.ai 的抓包。
+// 任何自造字段（如 X-Client-ID）都会形成可静态识别的机器特征。
 const (
 	// clientDomain 是上游请求携带的 X-Domain 默认值（账号未记录 domain 时使用）。
 	clientDomain = "www.workbuddy.ai"
@@ -112,6 +115,7 @@ var (
 		Key: "cn", Label: "国内站",
 		Base:     "https://copilot.tencent.com",
 		Platform: "VSCode", PlatformName: "CodeBuddy", PlatformVersion: "5.5.2",
+		AppName: "WorkBuddy", ProductName: "WorkBuddy AI",
 		CliVersion: "2.137.1", Product: "SaaS",
 		PortalOrigin: "https://www.codebuddy.cn",
 		LoginTTL:     5 * time.Minute,
@@ -119,8 +123,8 @@ var (
 	profileINTL = upstreamProfile{
 		Key: "intl", Label: "国际站",
 		Base:     "https://www.workbuddy.ai",
-		Platform: "workbuddy-ai", PlatformName: "WorkBuddy", PlatformVersion: "5.5.2",
-		CliVersion: "2.137.1", Product: "SaaS",
+		Platform: "workbuddy-ai", PlatformName: "CLI", PlatformVersion: "2.137.1",
+		ProductName: "WorkBuddy AI", Product: "SaaS",
 		PortalOrigin: "https://www.workbuddy.ai",
 		LoginTTL:     15 * time.Minute, // 浏览器内登录（邮箱/验证码/SSO）比扫码慢，放宽超时
 	}
@@ -3671,14 +3675,33 @@ func derivedUUID(key string) string {
 // ok 表示会话键存在，会话级 ID 可用；否则调用方应回退到每请求新值。
 func (s sessionScope) ok() bool { return s.conversationRequestID != "" }
 
-// buildUserAgent 复刻客户端的 UA 组装口径：
-// `${platform}/${platformVersion} ${productName}/${productVersion} ${userAgentExtension}`。
-// 真实桌面客户端实测值为 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1`。
+// buildUserAgent 复刻客户端 UserAgentHttpInterceptor 的组装口径：
+// `${platform}/${platformVersion} ${productName}/${productVersion}`，
+// 桌面宿主再追加 `CLI/${cliVersion}`。
+//
+// 国内站桌面宿主（WorkbuddyUserAgentHttpInterceptor）的 platform 与
+// applicationName 都取 product.json 的 applicationName（WorkBuddy），
+// productName 取 product.json 的 productName（WorkBuddy AI），版本取
+// Electron app.getVersion()。抓包：`WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1`。
+// X-IDE-* 走另一路（clientInfo.ideType / platform），仍是 CodeBuddy / 5.5.2。
+//
+// 国际站 CLI 直连抓包：`CLI/2.137.1 WorkBuddy AI/2.137.1`。CLI 的 product.json
+// 把 platformVersion / productVersion 留空，宿主注入的值与 bundled CLI 包版本
+// （package.json customPackage.version）相同，故两端同值。
 func buildUserAgent(prof *upstreamProfile) string {
-	return fmt.Sprintf("%s/%s %s AI/%s CLI/%s",
-		prof.PlatformName, prof.PlatformVersion,
-		prof.PlatformName, prof.PlatformVersion,
-		prof.CliVersion)
+	name := prof.ProductName
+	if name == "" {
+		name = prof.PlatformName + " AI"
+	}
+	platform := prof.AppName
+	if platform == "" {
+		platform = prof.PlatformName
+	}
+	ua := fmt.Sprintf("%s/%s %s/%s", platform, prof.PlatformVersion, name, prof.PlatformVersion)
+	if prof.CliVersion != "" {
+		ua += " CLI/" + prof.CliVersion
+	}
+	return ua
 }
 
 // setHeaderExact 以调用方给定的大小写逐字写入 Header，绕过 net/http 的 MIME 规范化。

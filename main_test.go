@@ -105,17 +105,25 @@ func TestProfileForEdition(t *testing.T) {
 			t.Errorf("profileForEdition(%q).Key = %s, want %s", c.edition, got, c.wantKey)
 		}
 	}
-	if p := profileForEdition("intl"); p.Base != "https://www.workbuddy.ai" || p.PlatformName != "WorkBuddy" {
+	if p := profileForEdition("intl"); p.Base != "https://www.workbuddy.ai" || p.PlatformName != "CLI" {
 		t.Errorf("intl profile base/platformName unexpected: %+v", p)
 	}
 	if p := profileForEdition("cn"); p.Base != "https://copilot.tencent.com" || p.Platform != "VSCode" {
 		t.Errorf("cn profile base/platform unexpected: %+v", p)
 	}
-	// 两个站点共享同一客户端版本基线（desktop 5.5.2 + bundled CLI 2.137.1）
-	for _, p := range []*upstreamProfile{&profileCN, &profileINTL} {
-		if p.PlatformVersion != "5.5.2" || p.CliVersion != "2.137.1" {
-			t.Errorf("profile %s client version baseline unexpected: %+v", p.Key, p)
-		}
+	// 国内站桌面：X-IDE-* 仍是 CodeBuddy/5.5.2，UA 的 platform 与 applicationName 是 WorkBuddy。
+	// 国际站 CLI 直连抓包为 CLI/2.137.1，不再发桌面三段 UA。
+	if p := &profileCN; p.PlatformVersion != "5.5.2" || p.CliVersion != "2.137.1" || p.PlatformName != "CodeBuddy" || p.AppName != "WorkBuddy" || p.ProductName != "WorkBuddy AI" {
+		t.Errorf("cn client version baseline unexpected: %+v", p)
+	}
+	if ua := buildUserAgent(&profileCN); ua != "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1" {
+		t.Errorf("cn user agent = %q", ua)
+	}
+	if p := &profileINTL; p.PlatformVersion != "2.137.1" || p.CliVersion != "" || p.PlatformName != "CLI" || p.ProductName != "WorkBuddy AI" || p.AppName != "" {
+		t.Errorf("intl client version baseline unexpected: %+v", p)
+	}
+	if ua := buildUserAgent(&profileINTL); ua != "CLI/2.137.1 WorkBuddy AI/2.137.1" {
+		t.Errorf("intl user agent = %q", ua)
 	}
 }
 
@@ -1779,13 +1787,17 @@ func TestChatCompletionToResponses(t *testing.T) {
 // 构成可静态识别的机器特征。以下测试锁定与官方客户端基线的逐项一致性。
 // -----------------------------------------------------------------------------
 
-// realClientChatHeaders 是官方客户端（WorkBuddyAI desktop 5.5.2 + bundled CLI 2.137.1）
-// 发往 /v2/chat/completions 的真实请求头基线，逐字取自抓包。
+// realClientChatHeaders 是官方客户端发往国际站 /v2/chat/completions 的真实请求头基线，
+// 逐字取自 WorkBuddyAI desktop 5.5.2 内置 CLI（包版本 2.137.1）直连 www.workbuddy.ai 的抓包。
 //
 // 基线含两类不参与应用层对齐的头：
 //   - 传输层：Host / Content-Length / Connection（由 net/http 自行管理）
 //   - 客户端本地网关安全头：x-codebuddy-request（源码 GatewayLocalServer 模块的
 //     withSecurityHeader 注入，仅存在于「客户端 → 本地网关」这一跳）
+//
+// Content-Encoding 不在基线内：CLI 的 GzipRequestProcessor 会在自定义
+// CODEBUDDY_BASE_URL 或非 external/internal/iOA 环境时跳过压缩，8 条直连
+// chat 抓包均为明文 JSON，故网关不压缩请求体。
 var realClientChatHeaders = [][2]string{
 	{"Accept", "application/json"},
 	{"Content-Type", "application/json"},
@@ -1797,31 +1809,31 @@ var realClientChatHeaders = [][2]string{
 	{"x-stainless-retry-count", "0"},
 	{"x-stainless-runtime", "node"},
 	{"x-stainless-runtime-version", "v22.22.2"},
-	{"X-Conversation-ID", "04bad56e-08d5-4647-9c3c-28e12897c1af"},
-	{"X-Conversation-Request-ID", "a2a2a25c3094ee6e6203d9e014ba6e8c"},
+	{"X-Conversation-ID", "0edc8165-3397-45c0-868f-7bec387c59d0"},
+	{"X-Conversation-Request-ID", "20802ec4240a004114f732205b0440d7"},
 	{"X-Agent-Intent", "craft"},
 	{"X-Agent-Purpose", "conversation"},
-	{"X-IDE-Type", "WorkBuddy"},
-	{"X-IDE-Name", "WorkBuddy"},
-	{"X-IDE-Version", "5.5.2"},
+	{"X-IDE-Type", "CLI"},
+	{"X-IDE-Name", "CLI"},
+	{"X-IDE-Version", "2.137.1"},
 	{"X-Private-Data", "true"},
-	{"X-Request-ID", "8e48c9ed463d48d08dce1185ed92b200"},
-	{"X-Conversation-Message-ID", "8e48c9ed463d48d08dce1185ed92b200"},
-	{"X-Root-Request-ID", "a2a2a25c3094ee6e6203d9e014ba6e8c"},
+	{"X-Request-ID", "83b09525d5f549109803065dc21ed0d6"},
+	{"X-Conversation-Message-ID", "83b09525d5f549109803065dc21ed0d6"},
+	{"X-Root-Request-ID", "20802ec4240a004114f732205b0440d7"},
 	{"X-Agent-Type", "main"},
-	{"traceparent", "00-a2a2a25c3094ee6e6203d9e014ba6e8c-61cc1c019243bd0c-01"},
-	{"b3", "a2a2a25c3094ee6e6203d9e014ba6e8c-61cc1c019243bd0c-1-298ea3b5a5796f21"},
-	{"X-B3-TraceId", "a2a2a25c3094ee6e6203d9e014ba6e8c"},
-	{"X-B3-ParentSpanId", "298ea3b5a5796f21"},
-	{"X-B3-SpanId", "61cc1c019243bd0c"},
+	{"traceparent", "00-20802ec4240a004114f732205b0440d7-11e637a02b970059-01"},
+	{"b3", "20802ec4240a004114f732205b0440d7-11e637a02b970059-1-6698cfe1242e783c"},
+	{"X-B3-TraceId", "20802ec4240a004114f732205b0440d7"},
+	{"X-B3-ParentSpanId", "6698cfe1242e783c"},
+	{"X-B3-SpanId", "11e637a02b970059"},
 	{"X-B3-Sampled", "1"},
-	{"X-Trace-ID", "a2a2a25c3094ee6e6203d9e014ba6e8c"},
+	{"X-Trace-ID", "20802ec4240a004114f732205b0440d7"},
 	// 基线中为真实 Bearer JWT，此处保留前缀（仅校验存在性与方案，不校验具体令牌）
 	{"Authorization", "Bearer eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJXVzhVVkZuS0l"},
 	{"X-User-Id", "8efc9f5d-4289-445e-b503-c8a49eeb52c5"},
 	{"X-Domain", "www.workbuddy.ai"},
 	{"X-Product", "SaaS"},
-	{"User-Agent", "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1"},
+	{"User-Agent", "CLI/2.137.1 WorkBuddy AI/2.137.1"},
 }
 
 // nonApplicationHeaders 是不参与应用层对齐的头。
@@ -2203,7 +2215,7 @@ func TestSmokeEndToEndUpstreamHeaders(t *testing.T) {
 		t.Errorf("X-Domain = %q", v)
 	}
 	// 合成指纹头存在
-	if v := getHeaderExact(h, "User-Agent"); v != "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1" {
+	if v := getHeaderExact(h, "User-Agent"); v != "CLI/2.137.1 WorkBuddy AI/2.137.1" {
 		t.Errorf("User-Agent = %q", v)
 	}
 	if v := getHeaderExact(h, "x-stainless-runtime"); v != "node" {
