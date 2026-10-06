@@ -152,7 +152,7 @@ func refreshTestServer(t *testing.T, handler func(call int) (int, string)) *http
 		if r.Header.Get("X-Refresh-Token") == "" {
 			t.Error("缺少 X-Refresh-Token")
 		}
-		if got := r.Header.Get("X-Auth-Refresh-Source"); got != "plugin" {
+		if got := r.Header.Get("X-Auth-Refresh-Source"); got != "workbuddy" {
 			t.Errorf("X-Auth-Refresh-Source=%q", got)
 		}
 		status, body := handler(calls)

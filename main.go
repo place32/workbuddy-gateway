@@ -1786,7 +1786,7 @@ func refreshTokenPayload(sa *StoredAuth) (int, error) {
 		if sa.Account.EnterpriseID != "" {
 			r.Header.Set("X-Enterprise-Id", sa.Account.EnterpriseID)
 		}
-		r.Header.Set("X-Auth-Refresh-Source", "plugin")
+		r.Header.Set("X-Auth-Refresh-Source", "workbuddy")
 	}
 
 	data, status, err := doJSON(cfg.HttpClient, http.MethodPost, prof.tokenRefreshURL(), headers, nil)
