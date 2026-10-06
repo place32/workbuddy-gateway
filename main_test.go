@@ -40,10 +40,21 @@ func chdirTemp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chdir(t.TempDir()); err != nil {
+	// 不使用 t.TempDir()：它的清理时机与「切回原工作目录」的相对顺序无法保证，
+	// 而 Windows 不允许删除仍是当前工作目录的目录，顺序错了会留下无效 cwd，
+	// 进而让后续测试的 os.Getwd/os.Chdir 全部失效。
+	dir, err := os.MkdirTemp("", "workbuddy-test-cwd-")
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chdir(old) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// 必须在同一个清理里先恢复工作目录、再删除，顺序不能颠倒。
+		_ = os.Chdir(old)
+		_ = os.RemoveAll(dir)
+	})
 }
 
 // 验证 429 消息中的重置时间解析
@@ -644,7 +655,8 @@ func TestNextAccountAllDisabled(t *testing.T) {
 	t.Logf("all-disabled error: %v", err)
 }
 
-// 验证 disableAccount：标记失效、删除凭据文件、写入失效标记文件
+// 验证 disableAccount：停止调度并写入失效标记。
+// 删除凭据需要「只读校验明确确认不可用」，测试环境没有 HTTP 客户端时应保守保留文件。
 func TestDisableAccount(t *testing.T) {
 	dir := t.TempDir()
 	authPath := dir + "/workbuddy-test.json"
@@ -670,9 +682,9 @@ func TestDisableAccount(t *testing.T) {
 	if reason == "" {
 		t.Fatal("disabled reason should be recorded")
 	}
-	// 凭据文件应被删除
-	if _, err := os.Stat(authPath); !os.IsNotExist(err) {
-		t.Fatalf("credential file should be deleted, stat err=%v", err)
+	// 无法确认凭据失效时必须保留文件：删除不可逆，误删只能重新登录。
+	if _, err := os.Stat(authPath); err != nil {
+		t.Fatalf("无法确认凭据失效时应保留凭据文件, stat err=%v", err)
 	}
 	// 失效标记文件应存在
 	if _, err := os.Stat(markerPath(authPath)); err != nil {
@@ -1211,28 +1223,27 @@ func TestParseQuotaSummary(t *testing.T) {
 	if total != 2000 || used != 569.98999993 || remaining != 1430.01000007 || !paid {
 		t.Fatalf("unexpected quota summary: total=%v used=%v remaining=%v paid=%v", total, used, remaining, paid)
 	}
-	if plan != "pro" {
-		t.Fatalf("IsPaidUser=true should show pro, got %q", plan)
+	if plan != planUnknown {
+		t.Fatalf("summary alone cannot establish the current plan, got %q", plan)
 	}
 }
 
-// 套餐展示规则：ProTrialStatus=1 → Pro试用；IsPaidUser=true → pro；
-// 其余（含字段缺失、类型异常、识别不出）→ 免费。
+// 摘要标记不再直接当成当前有效权益。
 func TestPlanLabelFromSummary(t *testing.T) {
 	cases := []struct {
 		name string
 		json string
 		want string
 	}{
-		{"Pro试用（数字1）", `{"ProTrialStatus":1,"IsPaidUser":false}`, "Pro试用"},
-		{"Pro试用（字符串1）", `{"ProTrialStatus":"1","IsPaidUser":false}`, "Pro试用"},
-		{"Pro试用优先于付费标记", `{"ProTrialStatus":1,"IsPaidUser":true}`, "Pro试用"},
-		{"正式付费pro", `{"ProTrialStatus":0,"IsPaidUser":true}`, "pro"},
-		{"试用已结束且非付费→免费", `{"ProTrialStatus":0,"IsPaidUser":false}`, "免费"},
-		{"字段缺失→免费", `{"Packages":[]}`, "免费"},
-		{"类型异常→免费", `{"ProTrialStatus":{"unexpected":true},"IsPaidUser":false}`, "免费"},
-		{"国内站无ProTrialStatus→免费", `{"IsPaidUser":false,"SubscriptionPackageCode":""}`, "免费"},
-		{"有订阅包但非试用非付费→免费", `{"IsPaidUser":false,"SubscriptionPackageCode":"pkg-code-000"}`, "免费"},
+		{"历史试用标记", `{"ProTrialStatus":1,"IsPaidUser":false}`, planUnknown},
+		{"字符串试用标记", `{"ProTrialStatus":"1","IsPaidUser":false}`, planUnknown},
+		{"试用与付费标记同时存在", `{"ProTrialStatus":1,"IsPaidUser":true}`, planUnknown},
+		{"付费标记不能决定等级", `{"ProTrialStatus":0,"IsPaidUser":true}`, planUnknown},
+		{"空标记也要查有效权益", `{"ProTrialStatus":0,"IsPaidUser":false}`, planUnknown},
+		{"字段缺失", `{"Packages":[]}`, planUnknown},
+		{"类型异常", `{"ProTrialStatus":{"unexpected":true},"IsPaidUser":false}`, planUnknown},
+		{"国内站无试用标记", `{"IsPaidUser":false,"SubscriptionPackageCode":""}`, planUnknown},
+		{"未知订阅包", `{"IsPaidUser":false,"SubscriptionPackageCode":"pkg-code-000"}`, planUnknown},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1385,7 +1396,7 @@ func TestEnsureLeadingSystemMessage(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			obj := newJSONObject()
 			obj.Set("messages", c.messages)
-			ensureLeadingSystemMessage(obj)
+			ensureLeadingSystemMessageOrdered(obj)
 			got := rolesOf(obj)
 			if len(got) != len(c.wantRoles) {
 				t.Fatalf("roles = %v, want %v", got, c.wantRoles)
@@ -1412,7 +1423,7 @@ func TestEnsureLeadingSystemMessage(t *testing.T) {
 // 验证缺失 / 非法 messages 字段时也能安全注入（不得 panic）
 func TestEnsureLeadingSystemMessageMissingField(t *testing.T) {
 	obj := newJSONObject()
-	ensureLeadingSystemMessage(obj)
+	ensureLeadingSystemMessageOrdered(obj)
 	raw, ok := obj.Get("messages")
 	messages, ok2 := raw.([]any)
 	if !ok || !ok2 || len(messages) != 1 {
@@ -1561,6 +1572,7 @@ func TestAggregateCompletionToolCalls(t *testing.T) {
 		`data: {"id":"cmpl-1","model":"hy3-preview","created":1700000000,"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}`,
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]}}]}`,
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Beijing\"}"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
 		`data: [DONE]`,
 	}, "\n")
 

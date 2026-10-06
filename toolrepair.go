@@ -388,3 +388,19 @@ func logToolSequenceRepair(r *http.Request, traceID string, requestID uint64, mo
 	}
 	debugEvent(r, "debug", "tool_sequence_checked", fields)
 }
+
+// assistantMessageHasPayload 判断 assistant 消息是否携带可见内容（正文或内容块）。
+func assistantMessageHasPayload(message any) bool {
+	content := messageField(message, "content")
+	if content == nil {
+		return false
+	}
+	switch value := content.(type) {
+	case string:
+		return strings.TrimSpace(value) != ""
+	case []any:
+		return len(value) > 0
+	default:
+		return false
+	}
+}

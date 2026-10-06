@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -89,9 +90,12 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	applyThinkingRules(chatReq)
 	sanitizeMessages(chatReq)
-	ensureLeadingSystemMessage(chatReq)
+	prepareSystemPromptForUpstream(chatReq, r, reqID, w.Header().Get("X-Trace-ID"))
 	repairReport := repairToolMessageSequence(chatReq)
 	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
+	logResponsesToolOutputConversion(r, reqID, respReq)
+	// 与 Chat 原生入口共用同一套 DeepSeek 多轮推理历史回填规则。
+	logReasoningHistoryRepair(r, reqID, modelName, repairReasoningHistory(chatReq))
 
 	// 以客户端口径序列化：不转义 < > &，无尾随换行
 	upstreamBytes, err := marshalJSON(chatReq)
@@ -134,14 +138,61 @@ func responsesToChatRequest(respReq *jsonObject, modelName string) (*jsonObject,
 			messages = append(messages, newObject("role", "user", "content", input))
 		}
 	case []any:
+		// DSH 将一次模型回复拆成 reasoning、message、function_call 等独立项；
+		// Chat 上游却要求同一次回复是一条 assistant 消息。连续的助手项在
+		// user/tool 结果处结束，遇到新的 reasoning 项也代表下一次助手回复。
+		// 即使一次输出没有 reasoning，也必须将正文与工具调用合在一起。
+		var pendingReasoning string
+		var pendingAssistant any
+		flushAssistant := func() {
+			if pendingAssistant != nil {
+				messages = append(messages, pendingAssistant)
+				pendingAssistant = nil
+			}
+			pendingReasoning = ""
+		}
 		for _, itemAny := range input {
 			switch item := itemAny.(type) {
 			case string:
+				flushAssistant()
 				messages = append(messages, newObject("role", "user", "content", item))
 			case *jsonObject:
-				messages = append(messages, convertResponsesInputItem(item)...)
+				typ, _ := item.Get("type")
+				if typ == "reasoning" {
+					if pendingAssistant != nil {
+						flushAssistant() // 新 reasoning 项代表下一次助手回复
+					}
+					if text := reasoningReplayTextOrdered(item); text != "" {
+						if pendingReasoning != "" {
+							pendingReasoning += "\n\n"
+						}
+						pendingReasoning += text
+					}
+					continue
+				}
+				if typ == "web_search_call" {
+					continue // 不把历史搜索项误转成会打断工具调用的消息
+				}
+				for _, msgAny := range convertResponsesInputItem(item) {
+					if roleOfMessage(msgAny) == "assistant" {
+						if pendingAssistant == nil {
+							pendingAssistant = msgAny
+							if pendingReasoning != "" {
+								if v := messageField(pendingAssistant, "reasoning_content"); v == nil {
+									setMessageField(pendingAssistant, "reasoning_content", pendingReasoning)
+								}
+							}
+						} else {
+							mergeResponsesAssistant(pendingAssistant, msgAny)
+						}
+						continue
+					}
+					flushAssistant() // user/tool 边界，不把旧推理带到下一轮
+					messages = append(messages, msgAny)
+				}
 			}
 		}
+		flushAssistant()
 	}
 
 	if len(messages) == 0 {
@@ -193,6 +244,146 @@ func responsesToChatRequest(respReq *jsonObject, modelName string) (*jsonObject,
 	return chat, nil
 }
 
+// reasoningReplayText 取出 DSH 回放的 reasoning 项里的推理正文。
+// 网关自己发出去的项把全文放在 summary；官方 Responses 也可能把全文放在 content。
+// 有 content 时用 content，否则用 summary。encrypted_content 不是明文，不能当成 reasoning_content。
+// reasoningReplayTextOrdered 是 reasoningReplayText 的 *jsonObject 适配版。
+func reasoningReplayTextOrdered(item *jsonObject) string {
+	contentRaw, _ := item.Get("content")
+	summaryRaw, _ := item.Get("summary")
+	m := map[string]any{"content": contentRaw, "summary": summaryRaw}
+	return reasoningReplayText(m)
+}
+
+func reasoningReplayText(item map[string]any) string {
+	if text := joinReasoningParts(item["content"]); text != "" {
+		return text
+	}
+	return joinReasoningParts(item["summary"])
+}
+
+func joinReasoningParts(raw any) string {
+	parts, ok := raw.([]any)
+	if !ok {
+		return ""
+	}
+	var b strings.Builder
+	for _, partAny := range parts {
+		part := messageToMap(partAny)
+		if part == nil {
+			continue
+		}
+		text, _ := part["text"].(string)
+		if text == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(text)
+	}
+	return b.String()
+}
+
+// mergeResponsesAssistant 是 mergeResponsesAssistantItem 的类型适配版。
+// dst 和 item 可以是 *jsonObject 或 map[string]any，修改直接写入 dst。
+func mergeResponsesAssistant(dst, item any) {
+	dstMap := messageToMap(dst)
+	itemMap := messageToMap(item)
+	if dstMap == nil || itemMap == nil {
+		return
+	}
+	mergeResponsesAssistantItem(dstMap, itemMap)
+	// 将合并结果写回 dst（对 *jsonObject 需要逐键设置）
+	if dstObj, ok := dst.(*jsonObject); ok {
+		for k, v := range dstMap {
+			dstObj.Set(k, jsonValueToOrdered(v))
+		}
+	}
+}
+
+// jsonValueToOrdered 将 map[string]any 递归转为 *jsonObject，保持其他类型不变。
+func jsonValueToOrdered(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		obj := newJSONObject()
+		for k, val := range t {
+			obj.Set(k, jsonValueToOrdered(val))
+		}
+		return obj
+	case []any:
+		out := make([]any, len(t))
+		for i, item := range t {
+			out[i] = jsonValueToOrdered(item)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// messageToMap 将消息项统一为 map[string]any，用于推理合并逻辑。
+// *jsonObject 递归展开为 map；map 原样返回；其他类型返回 nil。
+func messageToMap(v any) map[string]any {
+	switch m := v.(type) {
+	case map[string]any:
+		return m
+	case *jsonObject:
+		return m.toMap()
+	default:
+		return nil
+	}
+}
+
+// mergeResponsesAssistantItem 将一个 Responses 回复的正文与工具调用合成同一条 Chat assistant。
+// reasoning_content 已在第一项上，后续项只补充正文和工具列表，不复制推理。
+func mergeResponsesAssistantItem(dst, item map[string]any) {
+	if assistantMessageHasPayload(item) {
+		if !assistantMessageHasPayload(dst) {
+			dst["content"] = item["content"]
+		} else {
+			dst["content"] = append(responsesChatContentParts(dst["content"]), responsesChatContentParts(item["content"])...)
+		}
+	}
+	if calls, ok := item["tool_calls"].([]any); ok && len(calls) > 0 {
+		if existing, ok := dst["tool_calls"].([]any); ok {
+			dst["tool_calls"] = append(existing, calls...)
+		} else {
+			dst["tool_calls"] = calls
+		}
+	}
+}
+
+func responsesChatContentParts(content any) []any {
+	switch value := content.(type) {
+	case []any:
+		return value
+	case string:
+		if value != "" {
+			return []any{map[string]any{"type": "text", "text": value}}
+		}
+	}
+	return nil
+}
+
+func reasoningPassthroughStats(chat map[string]any) (attached int, chars int, missing int) {
+	list, _ := chat["messages"].([]any)
+	for _, msgAny := range list {
+		msg, ok := msgAny.(map[string]any)
+		if !ok || msg["role"] != "assistant" {
+			continue
+		}
+		text, _ := msg["reasoning_content"].(string)
+		if text == "" {
+			missing++
+			continue
+		}
+		attached++
+		chars += utf8.RuneCountInString(text)
+	}
+	return attached, chars, missing
+}
+
 // convertResponsesInputItem 将单个 Responses input item 转换为 0..1 条 chat 消息。
 func convertResponsesInputItem(item *jsonObject) []any {
 	typRaw, _ := item.Get("type")
@@ -222,14 +413,23 @@ func convertResponsesInputItem(item *jsonObject) []any {
 		callIDRaw, _ := item.Get("call_id")
 		callID, _ := callIDRaw.(string)
 		outRaw, _ := item.Get("output")
-		return []any{newObject(
+		text, images := convertResponsesToolOutput(outRaw)
+		messages := []any{newObject(
 			"role", "tool",
 			"tool_call_id", callID,
-			"content", stringifyToolOutput(outRaw),
+			"content", text,
 		)}
+		if len(images) > 0 {
+			// 与 Anthropic tool_result 的图片处理一致：tool 保留文本，
+			// 图片提升成 user 多模态内容，不能把 Base64 当普通文本回放。
+			// handleResponses 随后的工具序列修复会将并行批次的图片消息
+			// 移至全部 tool 结果之后，避免打断调用/结果配对（11148）。
+			messages = append(messages, newObject("role", "user", "content", images))
+		}
+		return messages
 	case "reasoning", "web_search_call":
-		// 上游无法接收这些 Responses 历史项；尤其不能把 web_search_call 误转为空 user 消息，
-		// 否则会插入并行 function_call 与 output 之间并触发 11148。
+		// reasoning 的正文在 responsesToChatRequest 里挂到助手消息的 reasoning_content。
+		// web_search_call 不能转成消息：插在并行 function_call 与 output 之间会触发 11148。
 		return nil
 	}
 
@@ -239,7 +439,16 @@ func convertResponsesInputItem(item *jsonObject) []any {
 		role = "user"
 	}
 	contentRaw, _ := item.Get("content")
-	return []any{newObject("role", role, "content", convertResponsesContent(contentRaw))}
+	reasoningRaw, _ := item.Get("reasoning_content")
+	message := newObject("role", role, "content", convertResponsesContent(contentRaw))
+	if role == "assistant" {
+		// 有些客户端直接在助手历史消息上携带 Chat 风格的推理字段；
+		// 不要在 Responses 转 Chat 的过程中再次丢弃它。
+		if reasoning, ok := reasoningRaw.(string); ok && reasoning != "" {
+			message.Set("reasoning_content", reasoning)
+		}
+	}
+	return []any{message}
 }
 
 // convertResponsesContent 将 Responses content（string 或 parts 数组）转换为 chat content。
@@ -288,6 +497,106 @@ func convertResponsesContent(content any) any {
 	default:
 		return fmt.Sprintf("%v", c)
 	}
+}
+
+// convertResponsesToolOutput 处理 Responses 的字符串或多模态工具结果。
+// 普通 JSON 对象/数组维持旧序列化行为；明确的文本块提取原文，图片块作为
+// 多模态内容返回。未知块仍作为 JSON 文本保留，不静默丢弃工具数据。
+func convertResponsesToolOutput(output any) (string, []any) {
+	blocks, ok := output.([]any)
+	if !ok {
+		return stringifyToolOutput(output), nil
+	}
+	typed := false
+	for _, raw := range blocks {
+		block := messageToMap(raw)
+		if block == nil {
+			continue
+		}
+		switch stringField(block, "type") {
+		case "input_text", "output_text", "text", "input_image", "image_url":
+			typed = true
+		}
+	}
+	if !typed {
+		return stringifyToolOutput(output), nil
+	}
+	var texts []string
+	var images []any
+	for _, raw := range blocks {
+		block := messageToMap(raw)
+		if block != nil {
+			switch stringField(block, "type") {
+			case "input_text", "output_text", "text":
+				if text, ok := block["text"].(string); ok {
+					texts = append(texts, text)
+					continue
+				}
+			case "input_image", "image_url":
+				url, _ := block["image_url"].(string)
+				detail, _ := block["detail"].(string)
+				if nested, ok := block["image_url"].(map[string]any); ok {
+					url, _ = nested["url"].(string)
+					detail, _ = nested["detail"].(string)
+				}
+				if url != "" {
+					image := map[string]any{"url": url}
+					if detail != "" {
+						image["detail"] = detail
+					}
+					images = append(images, map[string]any{"type": "image_url", "image_url": image})
+					continue
+				}
+			}
+		}
+		texts = append(texts, stringifyToolOutput(raw))
+	}
+	text := strings.Join(texts, "\n")
+	if text == "" && len(images) > 0 {
+		text = "[图片]"
+	}
+	return text, images
+}
+
+// logResponsesToolOutputConversion 只记录块数、位置与长度；图片 URL、
+// Base64、工具正文及提示词不进入日志，沿用请求的 TraceID 和文件日志。
+func logResponsesToolOutputConversion(r *http.Request, reqID uint64, request any) {
+	var input []any
+	switch req := request.(type) {
+	case *jsonObject:
+		raw, _ := req.Get("input")
+		input, _ = raw.([]any)
+	case map[string]any:
+		input, _ = req["input"].([]any)
+	}
+	outputs, textChars, imageCount := 0, 0, 0
+	for _, raw := range input {
+		typ := ""
+		var output any
+		switch item := raw.(type) {
+		case *jsonObject:
+			typRaw, _ := item.Get("type")
+			typ, _ = typRaw.(string)
+			output, _ = item.Get("output")
+		case map[string]any:
+			typ, _ = item["type"].(string)
+			output = item["output"]
+		}
+		if typ != "function_call_output" {
+			continue
+		}
+		text, images := convertResponsesToolOutput(output)
+		outputs++
+		textChars += utf8.RuneCountInString(text)
+		imageCount += len(images)
+	}
+	log.Printf("[Responses工具结果转换] traceId=%s requestId=%d 工具结果=%d 文本字符数=%d 图片块=%d 图片位置=工具结果之后的user多模态消息 结果=图片不再作为Base64文本计入上下文，原工具文本保留且不记录正文",
+		debugTraceID(r), reqID, outputs, textChars, imageCount)
+	debugEvent(r, "debug", "responses_tool_output_converted", map[string]any{
+		"tool_outputs": outputs, "text_chars": textChars, "image_blocks": imageCount,
+		"image_position":  "user_after_tool_results",
+		"business_impact": "保留工具文本与图片；避免Base64被当文本计费或撑满上下文；不记录正文",
+	})
 }
 
 // stringifyToolOutput 将 function_call_output 的 output 统一转为字符串。
@@ -393,7 +702,7 @@ func writeResponsesAggregate(w http.ResponseWriter, r *http.Request, resp *http.
 			"error_type": debugErrorType(err),
 			"error":      safeDebugError(err),
 		})
-		log.Printf("[#%d] 聚合响应失败: %v", reqID, err)
+		logAggregateFailure(r, reqID, err)
 		writeOpenAIError(w, http.StatusInternalServerError, "aggregate_error", "聚合上游流式响应失败: "+err.Error())
 		return
 	}
@@ -655,13 +964,19 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 	}
 
 	var usage map[string]any
+	finishReason := ""
+	sawDone := false
 
 	body := newTTFTReader(resp.Body, startTime)
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		data := stripDataPrefix(scanner.Text())
-		if data == "" || data == "[DONE]" {
+		if data == "" {
+			continue
+		}
+		if data == "[DONE]" {
+			sawDone = true
 			continue
 		}
 		var chunk map[string]any
@@ -671,9 +986,13 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 		if u, ok := chunk["usage"].(map[string]any); ok {
 			usage = u
 		}
+		finishReason = noteFinishReason(finishReason, chunk)
 		choices, _ := chunk["choices"].([]any)
 		for _, c := range choices {
 			choice, _ := c.(map[string]any)
+			if choice == nil {
+				continue
+			}
 			delta, _ := choice["delta"].(map[string]any)
 			if delta == nil {
 				continue
@@ -758,6 +1077,32 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 		failed["error"] = map[string]any{"code": "stream_interrupted", "message": reason}
 		emit("response.failed", map[string]any{"response": failed})
 		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游流式读取 账号=%s 异常=%v 业务影响=本次响应不完整，已下发 response.failed 而非伪造完成", debugTraceID(r), reqID, acc.Path, scanErr)
+		recordModelTTFT(modelName, body.duration())
+		recordModelLatency(modelName, time.Since(startTime))
+		return
+	}
+	if finishReason == "" {
+		// 干净 EOF：读错误是空的，但没有非空 finish_reason。
+		// 不能把已经收到的推理再塞进 output_item.done / response.completed，
+		// 那会让客户端把残缺输出当成完整结果；只发一个小的 response.failed。
+		debugEvent(r, "error", "stream_closed_without_finish", map[string]any{
+			"error_type":      "stream_closed_without_finish",
+			"finish_reason":   "",
+			"saw_done":        sawDone,
+			"reasoning_chars": reasoningSB.Len(),
+			"message_chars":   msgSB.Len(),
+			"tool_call_count": len(toolOrder),
+			"business_impact": "上游干净结束但没有 finish_reason，已拒绝 response.completed，改为小的 response.failed",
+		})
+		failed := buildResponsesEnvelope(respID, modelName, created)
+		failed["status"] = "failed"
+		failed["error"] = map[string]any{
+			"code":    "stream_closed_without_finish",
+			"message": errStreamClosedWithoutFinish.Error(),
+		}
+		emit("response.failed", map[string]any{"response": failed})
+		log.Printf("[异常] traceId=%s requestId=%d 发生阶段=Responses收尾 账号=%s 结果=拒绝当成成功 原因=上游干净结束但没有 finish_reason 是否看到DONE=%t 已收到推理字符数=%d 已收到正文字符数=%d 工具调用数=%d 业务影响=不下发 output_item.done 和 response.completed，客户端收到 response.failed 是否已处理=是",
+			debugTraceID(r), reqID, acc.Path, sawDone, reasoningSB.Len(), msgSB.Len(), len(toolOrder))
 		recordModelTTFT(modelName, body.duration())
 		recordModelLatency(modelName, time.Since(startTime))
 		return

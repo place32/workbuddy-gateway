@@ -268,7 +268,7 @@ type modelStatSnapshot struct {
 	IntlFree       string `json:"intlFree,omitempty"`       // 国际站：是 | 否 | 混合 | -
 	CNMultiplier   string `json:"cnMultiplier,omitempty"`   // 国内站倍率展示值，如 0.29x / 0.00x / -
 	IntlMultiplier string `json:"intlMultiplier,omitempty"` // 国际站倍率展示值
-	// AvailableAccounts 为两个站点合计的可服务账号数。
+	// AvailableAccounts 为两个站点合计的可服务账号数（已按模型账号黑白名单过滤）。
 	AvailableAccounts int    `json:"availableAccounts"`
 	Requests          int64  `json:"requests,omitempty"`
 	Success           int64  `json:"success,omitempty"`
@@ -334,6 +334,26 @@ func freeLabel(freeSeen, paidSeen bool) string {
 	}
 }
 
+// freeModelDisplayCounts 只复用模型统计表最终显示的站点倍率。
+// 不能用这个展示数量补写账号实测账本，或判断账号能否请求某个模型。
+func freeModelDisplayCounts(rows []modelStatSnapshot) (cn, intl int) {
+	for _, row := range rows {
+		if row.CNMultiplier == "0.00x" {
+			cn++
+		}
+		if row.IntlMultiplier == "0.00x" {
+			intl++
+		}
+	}
+	return cn, intl
+}
+
+// 调用方持有 accountMu，仅在展示数量发生变化时记录，避免每 3 秒重复刷日志。
+var lastFreeModelDisplay struct {
+	initialized bool
+	cn, intl    int
+}
+
 // buildModelStatSnapshots 汇总「官方/静态模型目录 ∪ 有统计的模型」的统计行。
 func buildModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot {
 	ids, source := mergedModelIDs()
@@ -358,7 +378,8 @@ func buildModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot
 		// 若混在一起会显示成无意义的“混合”。
 		var cnFree, cnPaid, intlFree, intlPaid bool
 		for _, acc := range accs {
-			if modelServableLocked(acc, id, now) {
+			allowed, _ := modelAccountAllowed(id, acc, accs)
+			if allowed && modelServableLocked(acc, id, now) {
 				row.AvailableAccounts++
 			}
 			state := acc.ModelStates[id]
@@ -412,6 +433,9 @@ func buildModelStatSnapshots(now time.Time, accs []*Account) []modelStatSnapshot
 	}
 
 	for _, id := range ids {
+		appendRow(id)
+	}
+	for _, id := range modelAccountRuleIDs() {
 		appendRow(id)
 	}
 	for id := range modelStats {

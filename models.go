@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -316,6 +317,8 @@ func parseLiveCatalog(data []byte) ([]catalogModel, int, error) {
 // -----------------------------------------------------------------------------
 
 func fetchNPMCatalogVersion() (string, error) {
+	traceID := newTraceID()
+	log.Printf("[模型目录] traceId=%s 来源=npm 阶段=版本查询开始 镜像数=%d", traceID, len(npmBases))
 	var lastErr error
 	for _, base := range npmBases {
 		ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
@@ -323,18 +326,27 @@ func fetchNPMCatalogVersion() (string, error) {
 		if reqErr != nil {
 			cancel()
 			lastErr = reqErr
+			log.Printf("[模型目录] traceId=%s 来源=npm 镜像=%s 阶段=创建请求 结果=失败 原因=%v", traceID, base, reqErr)
 			continue
 		}
 		resp, err := cfg.HttpClient.Do(req)
-		cancel()
 		if err != nil {
+			cancel()
 			lastErr = err
+			log.Printf("[模型目录] traceId=%s 来源=npm 镜像=%s 阶段=外部请求 结果=失败 原因=%v", traceID, base, err)
 			continue
 		}
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		cancel()
+		if readErr != nil {
+			lastErr = readErr
+			log.Printf("[模型目录] traceId=%s 来源=npm 镜像=%s 状态码=%d 阶段=读取响应 结果=失败 原因=%v", traceID, base, resp.StatusCode, readErr)
+			continue
+		}
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			log.Printf("[模型目录] traceId=%s 来源=npm 镜像=%s 结果=失败 原因=%v", traceID, base, lastErr)
 			continue
 		}
 		var m struct {
@@ -342,10 +354,13 @@ func fetchNPMCatalogVersion() (string, error) {
 		}
 		if err := json.Unmarshal(body, &m); err != nil || strings.TrimSpace(m.Version) == "" {
 			lastErr = fmt.Errorf("manifest 缺少 version")
+			log.Printf("[模型目录] traceId=%s 来源=npm 镜像=%s 阶段=解析版本 结果=失败 原因=%v", traceID, base, lastErr)
 			continue
 		}
+		log.Printf("[模型目录] traceId=%s 来源=npm 结果=成功 版本=%s 说明=响应体已读取并关闭，再释放请求上下文", traceID, strings.TrimSpace(m.Version))
 		return strings.TrimSpace(m.Version), nil
 	}
+	log.Printf("[模型目录] traceId=%s 来源=npm 结果=查询失败 原因=%v 业务影响=继续由现有目录兜底逻辑处理", traceID, lastErr)
 	return "", lastErr
 }
 
@@ -667,19 +682,35 @@ func siteKnownFree(site, modelID string) bool {
 	if modelProbeVerdict(site, modelID) == "free" {
 		return true
 	}
-	accountMu.Lock()
-	for _, acc := range accounts {
-		if profileForEdition(acc.Auth.Edition).Key != site && acc.Edition != site {
-			continue
-		}
-		if acc.ModelStates != nil {
+	accountFree := func() (knownFree bool) {
+		accountMu.Lock()
+		skipped := 0
+		defer func() {
+			accountMu.Unlock()
+			if skipped > 0 {
+				log.Printf("[站点免费判断] 站点=%s 模型=%s 跳过不可调度账号=%d 有效账号免费记录=%t 说明=空账号、失效标记及缺少凭据的账号不参与判断",
+					site, modelID, skipped, knownFree)
+			}
+		}()
+		for _, acc := range accounts {
+			// 启动时会载入 .disabled 标记形成无 Auth 的占位账号；
+			// 它们不能参与调度，也不能因历史免费状态影响站点选择。
+			if acc == nil || acc.Disabled || acc.Auth == nil || acc.Auth.Auth.AccessToken == "" {
+				skipped++
+				continue
+			}
+			if acc.Profile().Key != site && acc.Edition != site {
+				continue
+			}
 			if st := acc.ModelStates[normalizeModelName(modelID)]; st != nil && st.CostClass == modelCostFree {
-				accountMu.Unlock()
 				return true
 			}
 		}
+		return false
+	}()
+	if accountFree {
+		return true
 	}
-	accountMu.Unlock()
 	entry, ok := modelEntry(site, modelID)
 	return ok && entry.HasMultiplier && entry.Multiplier == 0 && !entry.PromoExpired
 }
@@ -862,6 +893,10 @@ func modelsRefreshLoop(interval time.Duration) {
 // modelPriceProbeLoop 周期性执行价格探测。
 // 首轮在启动后很快执行；只要仍有待探测模型就用较短间隔追赶，收敛后回到长间隔。
 func modelPriceProbeLoop() {
+	if cfg.DisablePriceProbes {
+		log.Printf("[ModelPrice] 阶段=自动探测调度 结果=已关闭 原因=指定-disable-price-probes 业务影响=不会自动请求模型，客户端请求和显式probe不受影响")
+		return
+	}
 	timer := time.NewTimer(modelPriceProbeStartDelay)
 	defer timer.Stop()
 	for {
@@ -886,6 +921,9 @@ func modelPendingProbeCount() int {
 	for _, site := range catalogSites {
 		for _, id := range ids {
 			if !modelNeedsProbe(site, id, modelRequestCount(id)) {
+				continue
+			}
+			if pickProbeAccountForModel(site, id) == nil {
 				continue
 			}
 			modelsMu.RLock()
@@ -924,15 +962,15 @@ func modelPriceProbeOnce() {
 		if done >= batch {
 			break
 		}
-		acc := pickProbeAccount(site)
-		if acc == nil {
-			continue
-		}
 		for _, id := range ids {
 			if done >= batch {
 				break
 			}
 			if !modelNeedsProbe(site, id, modelRequestCount(id)) {
+				continue
+			}
+			acc := pickProbeAccountForModel(site, id)
+			if acc == nil {
 				continue
 			}
 			modelsMu.RLock()
@@ -967,6 +1005,10 @@ func modelPriceProbeOnce() {
 // 返回 20017 无权限的账号）——探测若命中 14018 只会被忽略，不会污染判定。
 // 仅跳过「已知耗尽」与失效账号。
 func pickProbeAccount(site string) *Account {
+	return pickProbeAccountForModel(site, "")
+}
+
+func pickProbeAccountForModel(site, model string) *Account {
 	accountMu.Lock()
 	defer accountMu.Unlock()
 	var unknownQuota *Account
@@ -975,6 +1017,10 @@ func pickProbeAccount(site string) *Account {
 			continue
 		}
 		if profileForEdition(acc.Auth.Edition).Key != site {
+			continue
+		}
+		if allowed, reason := modelAccountAllowed(model, acc, accounts); !allowed {
+			log.Printf("[ModelPrice] 站点=%s 模型=%s 凭据=%s 结果=跳过 原因=账号名单%s", site, model, filepath.Base(acc.Path), reason)
 			continue
 		}
 		if acc.QuotaKnown {

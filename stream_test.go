@@ -11,7 +11,7 @@ import (
 )
 
 func TestStreamChatResponseSSEFraming(t *testing.T) {
-	chunk := `{"choices":[{"index":0,"delta":{"content":"你好"}}]}`
+	chunk := `{"choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":"stop"}]}`
 	for _, tc := range []struct {
 		name   string
 		prefix string

@@ -87,6 +87,32 @@ func (o *jsonObject) Keys() []string {
 // Len 返回键数量。
 func (o *jsonObject) Len() int { return len(o.keys) }
 
+// toMap 展开为 map[string]any，值中的 *jsonObject 递归展开为 map。
+// 用于调用上游 map-based 函数（如 prepareSystemPromptForUpstream / repairReasoningHistory）。
+func (o *jsonObject) toMap() map[string]any {
+	m := make(map[string]any, len(o.keys))
+	for _, k := range o.keys {
+		m[k] = jsonValueToMap(o.vals[k])
+	}
+	return m
+}
+
+// jsonValueToMap 递归将 *jsonObject 转为 map[string]any。
+func jsonValueToMap(v any) any {
+	switch t := v.(type) {
+	case *jsonObject:
+		return t.toMap()
+	case []any:
+		out := make([]any, len(t))
+		for i, item := range t {
+			out[i] = jsonValueToMap(item)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
 // appendTo 按键序把对象写入 buf。
 func (o *jsonObject) appendTo(buf *bytes.Buffer) error {
 	buf.WriteByte('{')
