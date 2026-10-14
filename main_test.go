@@ -123,17 +123,18 @@ func TestProfileForEdition(t *testing.T) {
 	if p := profileForEdition("intl"); p.Base != "https://www.workbuddy.ai" || p.PlatformName != "WorkBuddy" {
 		t.Errorf("intl profile base/platformName unexpected: %+v", p)
 	}
-	if p := profileForEdition("cn"); p.Base != "https://copilot.tencent.com" || p.Platform != "VSCode" {
+	if p := profileForEdition("cn"); p.Base != "https://copilot.tencent.com" || p.Platform != "workbuddy" {
 		t.Errorf("cn profile base/platform unexpected: %+v", p)
 	}
-	// 国内站桌面：X-IDE-* 仍是 CodeBuddy/5.5.2，UA 的 platform 与 applicationName 是 WorkBuddy。
-	// 国际站：同一桌面宿主（WorkBuddyAI desktop 5.7.6 + bundled CLI 2.156.0）注入的
-	// CLIENT_INFO_* 决定身份 —— X-IDE-* 与 UA 的 platform 都是宿主产品标识 WorkBuddy，
-	// 宿主版本取 app.getVersion()（5.7.6），UA 尾段为 bundled CLI 包版本（2.156.0）。
-	if p := &profileCN; p.PlatformVersion != "5.5.2" || p.CliVersion != "2.137.1" || p.PlatformName != "CodeBuddy" || p.AppName != "WorkBuddy" || p.ProductName != "WorkBuddy AI" {
+	// 两站都跑同一个桌面宿主（`@genie/workbuddy-desktop`），身份由宿主注入的
+	// CLIENT_INFO_* 决定：X-IDE-* 与 UA 首段是宿主产品标识 WorkBuddy，宿主版本取
+	// app.getVersion()，UA 中段/尾段取 bundled product.json 的 productName 与 bundled
+	// CLI 包版本。国内站 5.5.3 + CLI 2.137.1（productName 也是 WorkBuddy），
+	// 国际站 5.7.6 + CLI 2.156.0（productName 是 WorkBuddy AI）。
+	if p := &profileCN; p.PlatformVersion != "5.5.3" || p.CliVersion != "2.137.1" || p.PlatformName != "WorkBuddy" || p.AppName != "WorkBuddy" || p.ProductName != "WorkBuddy" || !p.GzipBody {
 		t.Errorf("cn client version baseline unexpected: %+v", p)
 	}
-	if ua := buildUserAgent(&profileCN); ua != "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1" {
+	if ua := buildUserAgent(&profileCN); ua != "WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1" {
 		t.Errorf("cn user agent = %q", ua)
 	}
 	if p := &profileINTL; p.PlatformVersion != "5.7.6" || p.CliVersion != "2.156.0" || p.PlatformName != "WorkBuddy" || p.ProductName != "WorkBuddy AI" || p.AppName != "WorkBuddy" || !p.GzipBody {
@@ -142,15 +143,20 @@ func TestProfileForEdition(t *testing.T) {
 	if ua := buildUserAgent(&profileINTL); ua != "WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0" {
 		t.Errorf("intl user agent = %q", ua)
 	}
-	// 国际站 product.json features.RequestBodyGzip = true；国内站未观测到该特性，保持不压缩。
-	if profileCN.GzipBody {
-		t.Error("cn profile must not gzip model request bodies (no evidence of the feature flag)")
+	// 压缩协商按站点分叉：国际站 CLI 2.156.0 发 Accept-Encoding，国内站 CLI 2.137.1 不发。
+	// 用同一个值覆盖两站，必然使其中一站多出（或少掉）一个客户端实测存在的头。
+	if profileCN.AcceptEncoding != "" {
+		t.Errorf("cn profile must not send Accept-Encoding (client 2.137.1 does not), got %q", profileCN.AcceptEncoding)
+	}
+	if profileINTL.AcceptEncoding != "gzip, compress, deflate, br" {
+		t.Errorf("intl AcceptEncoding = %q", profileINTL.AcceptEncoding)
 	}
 }
 
 // x-stainless-runtime-version 是「运行 bundled OpenAI SDK 的 Node 进程」版本，随宿主客户端
-// 自带的 Electron 走，故两站基线不同（5.7.6 → v22.21.1，5.5.2 → v22.22.2）。
-// 用同一个常数覆盖两站，必然使其中一站的模型请求带上对方客户端的 Node 版本。
+// 自带的 Electron 走。两站当前安装的 Electron 都是 37.10.3 → v22.21.1（各自
+// ELECTRON_RUN_AS_NODE=1 实测），但该值仍按 Profile 取，不写死成常数：宿主升级会同时
+// 改变两站的 Node 版本，而下一次实测可能只覆盖其中一站。
 func TestStainlessNodeVersionFollowsProfile(t *testing.T) {
 	sa := &StoredAuth{
 		Auth:    StoredTokens{AccessToken: "tok", Domain: "www.workbuddy.ai"},
@@ -160,7 +166,7 @@ func TestStainlessNodeVersionFollowsProfile(t *testing.T) {
 		prof *upstreamProfile
 		want string
 	}{
-		{&profileCN, "v22.22.2"},
+		{&profileCN, "v22.21.1"},
 		{&profileINTL, "v22.21.1"},
 	} {
 		req, err := http.NewRequest(http.MethodPost, c.prof.chatURL(), nil)
@@ -177,7 +183,7 @@ func TestStainlessNodeVersionFollowsProfile(t *testing.T) {
 // 验证各站点上游 URL 构建与旧版常量完全一致（国内站回归）+ 国际站正确
 func TestUpstreamProfileURLs(t *testing.T) {
 	cn := profileForEdition("cn")
-	if got := cn.authStateURL(); got != "https://copilot.tencent.com/v2/plugin/auth/state?platform=VSCode" {
+	if got := cn.authStateURL(); got != "https://copilot.tencent.com/v2/plugin/auth/state?platform=workbuddy" {
 		t.Errorf("cn authStateURL = %s", got)
 	}
 	if got := cn.chatURL(); got != "https://copilot.tencent.com/v2/chat/completions" {
@@ -605,7 +611,7 @@ func TestCheckinAccountCNAndSkipIntl(t *testing.T) {
 			"X-Requested-With": "XMLHttpRequest",
 			"Accept":           "application/json, text/plain, */*",
 			"X-Product":        "SaaS",
-			"User-Agent":       "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1",
+			"User-Agent":       "WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1",
 		} {
 			if got := r.Header.Get(name); got != want {
 				t.Errorf("%s = %q, want %q", name, got, want)
@@ -2070,8 +2076,8 @@ func TestUnauthedRequestDeclaresNoAuth(t *testing.T) {
 	if got := getHeaderExact(req.Header, "X-No-User-Id"); got != "true" {
 		t.Errorf("X-No-User-Id = %q, want \"true\"", got)
 	}
-	if got := getHeaderExact(req.Header, "X-Domain"); got != clientDomain {
-		t.Errorf("X-Domain = %q, want fallback %q", got, clientDomain)
+	if got := getHeaderExact(req.Header, "X-Domain"); got != profileINTL.domain() {
+		t.Errorf("X-Domain = %q, want fallback %q", got, profileINTL.domain())
 	}
 }
 
@@ -2427,21 +2433,43 @@ func TestModelsListReflectsMergedCatalog(t *testing.T) {
 	}
 }
 
-// intlAccountForTest 把一份国际站凭据装进账号池供端到端用例使用，返回时自动还原。
-// 走真实凭据加载路径（loadAccountFile），而非手工构造 Account。
-func intlAccountForTest(t *testing.T, token, uid string) {
+// gunzipUpstreamBody 解压出站请求体：站点 Profile 的 GzipBody 开启时（两站当前都开启），
+// 假上游收到的是压缩字节。断言对象是「上游实际收到什么」，故按 gzip 魔数判定后解压，
+// 未压缩的请求体原样返回。可从任意 goroutine 调用（只使用 t.Errorf）。
+func gunzipUpstreamBody(t *testing.T, body []byte) []byte {
+	t.Helper()
+	if len(body) < 2 || body[0] != 0x1f || body[1] != 0x8b {
+		return body
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Errorf("解压出站请求体失败: %v", err)
+		return body
+	}
+	defer zr.Close()
+	plain, err := io.ReadAll(zr)
+	if err != nil {
+		t.Errorf("读取解压后的出站请求体失败: %v", err)
+		return body
+	}
+	return plain
+}
+
+// accountForTest 写入一个指定站点的凭据文件并装载进账号池（走真实凭据加载路径
+// loadAccountFile，而非手工构造 Account）；结束测试时还原账号池。
+func accountForTest(t *testing.T, edition, domain, token, uid string) {
 	t.Helper()
 
-	credPath := filepath.Join(t.TempDir(), "workbuddy-intl.json")
+	credPath := filepath.Join(t.TempDir(), "workbuddy-"+edition+".json")
 	raw, _ := json.Marshal(map[string]any{
 		"auth": map[string]any{
 			"accessToken":  token,
 			"refreshToken": token + "-refresh",
 			"expiresAt":    time.Now().Add(24 * time.Hour).Unix(),
-			"domain":       "www.workbuddy.ai",
+			"domain":       domain,
 		},
 		"account": map[string]any{"uid": uid},
-		"edition": "intl",
+		"edition": edition,
 	})
 	if err := os.WriteFile(credPath, raw, 0o600); err != nil {
 		t.Fatal(err)
@@ -2456,7 +2484,7 @@ func intlAccountForTest(t *testing.T, token, uid string) {
 		accountMu.Unlock()
 		t.Fatalf("loadAccountFile: %v", err)
 	}
-	accounts = append(accounts, &Account{Path: credPath, Auth: sa, Edition: "intl"})
+	accounts = append(accounts, &Account{Path: credPath, Auth: sa, Edition: edition})
 	accountMu.Unlock()
 
 	t.Cleanup(func() {
@@ -2464,6 +2492,11 @@ func intlAccountForTest(t *testing.T, token, uid string) {
 		accounts = prev
 		accountMu.Unlock()
 	})
+}
+
+func intlAccountForTest(t *testing.T, token, uid string) {
+	t.Helper()
+	accountForTest(t, "intl", "www.workbuddy.ai", token, uid)
 }
 
 // 端到端冒烟：驱动真实 handleChatCompletions → upstreamChat → 生产 transport →
@@ -2584,6 +2617,141 @@ func TestSmokeEndToEndUpstreamHeaders(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "ok") {
 		t.Errorf("client body = %q", rec.Body.String())
+	}
+}
+
+// 国内站模型请求的端到端指纹：驱动真实 handleChatCompletions → upstreamChat →
+// 生产 transport → 本地假上游。国内站身份与国际站**不同**（客户端 5.5.3 + bundled
+// CLI 2.137.1 的抓包实测）：
+//   - UA `WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1`（中段是 productName，国内站也是 WorkBuddy）
+//   - X-IDE-Type / X-IDE-Name `WorkBuddy`、X-IDE-Version `5.5.3`
+//   - x-stainless-runtime-version `v22.21.1`（宿主 Electron 37.10.3 内置 Node）
+//   - 请求体 gzip，且**不发** Accept-Encoding（CLI 2.137.1 模型与控制面两族都不发）
+func TestCNModelRequestMatchesClient(t *testing.T) {
+	got := make(chan http.Header, 1)
+	gotBody := make(chan []byte, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- r.Header.Clone()
+		raw, _ := io.ReadAll(r.Body)
+		gotBody <- raw
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+
+	origBase := profileCN.Base
+	profileCN.Base = up.URL
+	defer func() { profileCN.Base = origBase }()
+
+	// 生产 transport（含 DisableCompression 等指纹相关设置）
+	origClient := cfg.HttpClient
+	initHTTPClient()
+	defer func() { cfg.HttpClient = origClient }()
+
+	accountForTest(t, "cn", "copilot.tencent.com", "cn-smoke-token", "u-cn")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"default-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handleChatCompletions(rec, req)
+
+	var h http.Header
+	select {
+	case h = <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream never received request")
+	}
+
+	for name, want := range map[string]string{
+		"User-Agent":                  "WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1",
+		"X-IDE-Type":                  "WorkBuddy",
+		"X-IDE-Name":                  "WorkBuddy",
+		"X-IDE-Version":               "5.5.3",
+		"x-stainless-runtime-version": "v22.21.1",
+		"x-stainless-package-version": "6.25.0",
+		"X-Product":                   "SaaS",
+		"X-Domain":                    "copilot.tencent.com",
+		"Authorization":               "Bearer cn-smoke-token",
+		"Content-Encoding":            "gzip",
+	} {
+		if v := getHeaderExact(h, name); v != want {
+			t.Errorf("%s = %q, want %q", name, v, want)
+		}
+	}
+	// 国内站客户端不声明压缩协商：多出该头即为可静态识别的偏差。
+	if v := h.Get("Accept-Encoding"); v != "" {
+		t.Errorf("cn request must not carry Accept-Encoding, got %q", v)
+	}
+	select {
+	case raw := <-gotBody:
+		zr, err := gzip.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("cn upstream body is not gzip: %v", err)
+		}
+		plain, err := io.ReadAll(zr)
+		if err != nil {
+			t.Fatalf("gunzip: %v", err)
+		}
+		if !bytes.Contains(plain, []byte(`"model":"default-model"`)) {
+			t.Errorf("decompressed cn body = %s", plain)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no cn upstream body captured")
+	}
+	if !strings.Contains(rec.Body.String(), "ok") {
+		t.Errorf("client body = %q", rec.Body.String())
+	}
+}
+
+// 国内站控制面（签到/额度/刷新）同样不发 Accept-Encoding —— 该头随站点分叉，
+// 用国际站的值覆盖国内站会多出一个客户端实测不存在的头。
+func TestCNControlPlaneOmitsAcceptEncoding(t *testing.T) {
+	got := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- r.Header.Clone()
+		_, _ = w.Write([]byte(`{"code":0,"data":{"Packages":[]}}`))
+	}))
+	defer server.Close()
+
+	origBase, origPortal := profileCN.Base, profileCN.PortalOrigin
+	profileCN.Base, profileCN.PortalOrigin = server.URL, server.URL
+	defer func() { profileCN.Base, profileCN.PortalOrigin = origBase, origPortal }()
+
+	origClient := cfg.HttpClient
+	initHTTPClient()
+	defer func() { cfg.HttpClient = origClient }()
+
+	if _, _, err := doJSON(cfg.HttpClient, http.MethodGet, profileCN.quotaSummaryURL(),
+		func(r *http.Request) { controlHeaders(r, &profileCN) }, nil); err != nil {
+		t.Fatalf("cn control-plane request: %v", err)
+	}
+
+	select {
+	case h := <-got:
+		if v := h.Get("Accept-Encoding"); v != "" {
+			t.Errorf("cn control-plane must not carry Accept-Encoding, got %q", v)
+		}
+		if v := getHeaderExact(h, "User-Agent"); v != "WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1" {
+			t.Errorf("cn control-plane User-Agent = %q", v)
+		}
+		if v := getHeaderExact(h, "Accept"); v != "application/json, text/plain, */*" {
+			t.Errorf("cn control-plane Accept = %q", v)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cn control-plane upstream never received request")
+	}
+
+	// 国际站仍带该头（避免把站点分叉写成「两边都不发」）。
+	ireq, err := http.NewRequest(http.MethodGet, profileINTL.quotaSummaryURL(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlHeaders(ireq, &profileINTL)
+	if v := ireq.Header.Get("Accept-Encoding"); v != "gzip, compress, deflate, br" {
+		t.Errorf("intl control-plane Accept-Encoding = %q", v)
 	}
 }
 

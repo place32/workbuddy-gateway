@@ -329,7 +329,7 @@ func captureUpstreamBody(t *testing.T, route, requestBody string) []byte {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		captured <- body
+		captured <- gunzipUpstreamBody(t, body)
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
 	}))
@@ -527,7 +527,7 @@ func captureUpstreamMessages(t *testing.T, route, requestBody string) []any {
 			return
 		}
 		var request map[string]any
-		if err := json.Unmarshal(body, &request); err != nil {
+		if err := json.Unmarshal(gunzipUpstreamBody(t, body), &request); err != nil {
 			t.Errorf("decode upstream body: %v: %s", err, body)
 			w.WriteHeader(http.StatusBadRequest)
 			return

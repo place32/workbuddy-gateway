@@ -74,6 +74,7 @@ func maxTokensCatalog() map[string][]catalogModel {
 
 func decodeUpstreamBody(t *testing.T, body []byte) map[string]any {
 	t.Helper()
+	body = gunzipUpstreamBody(t, body)
 	var out map[string]any
 	if err := json.Unmarshal(body, &out); err != nil {
 		t.Fatalf("解析出站请求失败: %v\n%s", err, body)

@@ -69,8 +69,11 @@ func TestUpstreamRetriesTransientFailureAndSucceeds(t *testing.T) {
 			return nil, io.EOF // 建连失败，请求头与请求体都未发送
 		}
 		body, err := io.ReadAll(req.Body)
-		if err != nil || string(body) != `{"model":"m"}` {
-			t.Errorf("request body on attempt %d: %q, %v", n, body, err)
+		if err != nil {
+			t.Errorf("read request body on attempt %d: %v", n, err)
+		} else if plain := gunzipUpstreamBody(t, body); string(plain) != `{"model":"m"}` {
+			// 站点开启 GzipBody 时重试重放的仍是同一份压缩字节：解压后再比对内容。
+			t.Errorf("request body on attempt %d: %q", n, plain)
 		}
 		if !req.Close {
 			t.Error("retry must request a new connection")

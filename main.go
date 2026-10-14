@@ -41,7 +41,7 @@ import (
 )
 
 const (
-	version = "1.14.4"
+	version = "1.14.5"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -244,7 +244,8 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 // （实测：auth/state、auth/token、login/account、auth/token/refresh、chat/completions
 // 的路径与响应包络完全一致），差异仅在：
 //   - 上游域名与 Web Origin（国际站位于腾讯 EdgeOne 国际 CDN）
-//   - 登录 platform 参数（workbuddy-ai 而非 VSCode），登录在浏览器内完成（邮箱/验证码/SSO）
+//   - 登录 platform 参数（国内站 workbuddy、国际站 workbuddy-ai，均取各站 product.json 的
+//     authentication.attributes.platform），国际站在浏览器内完成登录（邮箱/验证码/SSO）
 //   - 等待授权期间 auth/token 轮询返回 code 11217 (login ing...)
 // 每个账号凭据文件通过 edition 字段记录所属站点，账号池支持国内/国际混挂轮询。
 // -----------------------------------------------------------------------------
@@ -261,24 +262,29 @@ type upstreamProfile struct {
 	CliVersion      string // 桌面 UA 尾段（bundled CLI 版本）；CLI 宿主本身为空
 	Product         string // X-Product
 	// NodeVersion 是 x-stainless-runtime-version：**运行 bundled OpenAI SDK 的 Node 进程**版本。
-	// 桌面宿主以 ELECTRON_RUN_AS_NODE=1 用自带 Electron 启动 CLI，故该值随宿主客户端版本走，
-	// 两站可能不同（国际站 5.7.6 → v22.21.1；国内站 5.5.2 抓包实测 v22.22.2）。
-	NodeVersion  string        // x-stainless-runtime-version
-	PortalOrigin string        // 各站 Web 控制台源（仅用于 billing/额度等 Web API 的 URL 拼装，不作为请求头发送）
-	LoginTTL     time.Duration // login 命令等待授权完成的超时
+	// 桌面宿主以 ELECTRON_RUN_AS_NODE=1 用自带 Electron 启动 CLI，故该值随宿主客户端版本走。
+	// 两站当前实测同值：两个安装的 Electron 均为 37.10.3 → v22.21.1（国内站 5.5.3、国际站 5.7.6）。
+	NodeVersion string // x-stainless-runtime-version
+	// AcceptEncoding 是请求携带的压缩协商头；空串表示**不发送该头**（国内站实测如此）。
+	// 该头由客户端 Node http 适配器补齐，值随 bundled CLI 版本走：国际站 CLI 2.156.0 发
+	// `gzip, compress, deflate, br`（控制面与模型请求都发），国内站 CLI 2.137.1 两族都不发。
+	AcceptEncoding string
+	PortalOrigin   string        // 各站 Web 控制台源（仅用于 billing/额度等 Web API 的 URL 拼装，不作为请求头发送）
+	LoginTTL       time.Duration // login 命令等待授权完成的超时
 	// GzipBody 表示模型请求体是否 gzip 压缩（Content-Encoding: gzip）。
-	// 对应客户端 product.json 的 features.RequestBodyGzip 开关：开启时 GzipRequestProcessor
-	// 对模型请求体统一压缩，国际站 product.json 实测为 true。
+	// 两站当前实测都压缩（国内站 5.5.3 抓包：模型请求带 `Content-Encoding: gzip`，
+	// 请求体以 gzip 魔数 1f 8b 开头）。
 	GzipBody bool
 }
 
 // 客户端身份常量：与真实客户端实测流量对齐（详见 README「客户端指纹对齐」）。
-// 国内站取值来源于 WorkBuddyAI desktop 5.5.2 + bundled CLI 2.137.1 的抓包；
-// 国际站取值来源于 WorkBuddyAI desktop 5.7.6 + bundled CLI 2.156.0：宿主以
-// CLIENT_INFO_* 注入身份后由 CLI 直连 www.workbuddy.ai 的抓包（38 项头，含传输层头）。
+// 国内站取值来源于本机安装的 WorkBuddy desktop 5.5.3（`D:\workbuddy`）+
+// bundled CLI 2.137.1：桌面注入的 CLIENT_INFO_* 决定身份，模型请求走本地 sink 抓包实测；
+// 国际站取值来源于 WorkBuddyAI desktop 5.7.6 + bundled CLI 2.156.0 的抓包。
 // 任何自造字段（如 X-Client-ID）都会形成可静态识别的机器特征。
 const (
-	// clientDomain 是上游请求携带的 X-Domain 默认值（账号未记录 domain 时使用）。
+	// clientDomain 是上游请求携带的 X-Domain 兜底值（账号与站点都没给出域名时使用）。
+	// 正常路径取账号凭据里的 domain，其次取站点主机名（见 backendHeaders / profile.domain）。
 	clientDomain = "www.workbuddy.ai"
 	// agentIntent 对应客户端 session meta 的 codebuddy.ai/mode，默认 craft。
 	agentIntent = "craft"
@@ -292,13 +298,27 @@ var (
 	profileCN = upstreamProfile{
 		Key: "cn", Label: "国内站",
 		Base:     "https://copilot.tencent.com",
-		Platform: "VSCode", PlatformName: "CodeBuddy", PlatformVersion: "5.5.2",
-		AppName: "WorkBuddy", ProductName: "WorkBuddy AI",
+		// auth/state 的 platform 取 product.json authentication.attributes.platform：国内站
+		// `workbuddy`（CLI 源码 `configuration.authentication?.attributes?.platform ?? configuration.platform`）。
+		Platform: "workbuddy",
+		// 桌面注入的 CLIENT_INFO_*（desktop client-info-env 模块）：
+		//   CLIENT_INFO_PLATFORM / IDE_TYPE = WORKBUDDY_PLATFORM = "WorkBuddy"
+		//   PLATFORM_VERSION / PRODUCT_VERSION / PLUGIN_VERSION = app.getVersion() = 5.5.3
+		//   PRODUCT_NAME = bundled product.json productName = "WorkBuddy"
+		//   USER_AGENT_EXTENSION = `CLI/${bundled cli version}` = CLI/2.137.1
+		// 故 X-IDE-* 为 WorkBuddy / WorkBuddy / 5.5.3，UA 为
+		// `WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1`（本机 5.5.3 客户端抓包逐字一致）。
+		PlatformName: "WorkBuddy", PlatformVersion: "5.5.3",
+		AppName: "WorkBuddy", ProductName: "WorkBuddy",
 		CliVersion: "2.137.1", Product: "SaaS",
-		// 5.5.2 桌面宿主抓包实测（x-stainless-runtime-version 随宿主自带的 Node 走）。
-		NodeVersion:  "v22.22.2",
-		PortalOrigin: "https://www.codebuddy.cn",
-		LoginTTL:     5 * time.Minute,
+		// 宿主 Electron 37.10.3 内置 Node（ELECTRON_RUN_AS_NODE=1 实测）。
+		NodeVersion: "v22.21.1",
+		// 国内站 CLI 2.137.1 的模型请求与控制面请求都不带 Accept-Encoding（抓包实测）。
+		AcceptEncoding: "",
+		PortalOrigin:   "https://www.codebuddy.cn",
+		LoginTTL:       5 * time.Minute,
+		// 模型请求体 gzip：5.5.3 抓包实测 `Content-Encoding: gzip` + 请求体 gzip 魔数。
+		GzipBody: true,
 	}
 	profileINTL = upstreamProfile{
 		Key: "intl", Label: "国际站",
@@ -316,10 +336,13 @@ var (
 		AppName: "WorkBuddy", ProductName: "WorkBuddy AI", CliVersion: "2.156.0",
 		Product: "SaaS",
 		// 5.7.6 内置 Electron 37.10.3 → 自带 Node 22.21.1（ELECTRON_RUN_AS_NODE 实测）。
-		NodeVersion:  "v22.21.1",
-		PortalOrigin: "https://www.workbuddy.ai",
-		LoginTTL:     15 * time.Minute, // 浏览器内登录（邮箱/验证码/SSO）比扫码慢，放宽超时
-		// product.json features.RequestBodyGzip = true，模型请求体 gzip（抓包实测 Content-Encoding: gzip）。
+		NodeVersion: "v22.21.1",
+		// 国际站 CLI 2.156.0 由 Node http 适配器补写该头（axios 默认值），控制面与模型
+		// 请求都带；线上字节抓包实测位于 Content-Length 与 Host 之间。
+		AcceptEncoding: "gzip, compress, deflate, br",
+		PortalOrigin:   "https://www.workbuddy.ai",
+		LoginTTL:       15 * time.Minute, // 浏览器内登录（邮箱/验证码/SSO）比扫码慢，放宽超时
+		// 模型请求体 gzip（抓包实测 Content-Encoding: gzip）。
 		GzipBody: true,
 	}
 )
@@ -4482,13 +4505,14 @@ func (s sessionScope) ok() bool { return s.conversationRequestID != "" }
 //
 // 国内站桌面宿主（WorkbuddyUserAgentHttpInterceptor）的 platform 与
 // applicationName 都取 product.json 的 applicationName（WorkBuddy），
-// productName 取 product.json 的 productName（WorkBuddy AI），版本取
-// Electron app.getVersion()。抓包：`WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1`。
-// X-IDE-* 走另一路（clientInfo.ideType / platform），仍是 CodeBuddy / 5.5.2。
+// productName 取 product.json 的 productName（国内站也是 WorkBuddy，国际站是 WorkBuddy AI），
+// 版本取 Electron app.getVersion()。国内站抓包：
+// `WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1`；X-IDE-* 走另一路
+// （clientInfo.ideType / platform = CLIENT_INFO_IDE_TYPE/PLATFORM），也是 WorkBuddy / 5.5.3。
 //
-// 国际站 CLI 直连抓包：`CLI/2.137.1 WorkBuddy AI/2.137.1`。CLI 的 product.json
-// 把 platformVersion / productVersion 留空，宿主注入的值与 bundled CLI 包版本
-// （package.json customPackage.version）相同，故两端同值。
+// 国际站抓包：`WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0`。桌面宿主注入的值与
+// bundled CLI 包版本（`cli/package.json` publishConfig.customPackage.version）相同，
+// 故 UA 尾段与 X-IDE-Version 各自随宿主版本走。
 func buildUserAgent(prof *upstreamProfile) string {
 	name := prof.ProductName
 	if name == "" {
@@ -4855,7 +4879,7 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, in
 	for k, v := range stainlessFingerprint {
 		setHeaderExact(req.Header, k, v)
 	}
-	// 运行该 SDK 的 Node 进程版本随宿主客户端走（国际站 5.7.6 → v22.21.1；国内站 5.5.2 → v22.22.2）。
+	// 运行该 SDK 的 Node 进程版本随宿主客户端走（两站安装的 Electron 均为 37.10.3 → v22.21.1）。
 	setHeaderExact(req.Header, "x-stainless-runtime-version", prof.NodeVersion)
 
 	// 客户端自带身份/链路头优先（覆盖上面的合成值）
@@ -4892,21 +4916,23 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, in
 	// 注意：X-Refresh-Token 只出现在 auth/token/refresh 与 account/switch 链路
 	// （客户端源码 enterpriseHeaders 之外单独注入），chat 请求实测不携带，故此处不设置。
 
-	// X-Domain 是 chat 请求的常驻头（客户端实测始终携带），无凭据时回退站点默认域名。
+	// X-Domain 是 chat 请求的常驻头（客户端实测始终携带），无凭据时回退站点主机名。
 	if sa != nil && sa.Auth.Domain != "" {
 		setHeaderExact(req.Header, "X-Domain", sa.Auth.Domain)
 	} else {
-		setHeaderExact(req.Header, "X-Domain", clientDomain)
+		setHeaderExact(req.Header, "X-Domain", prof.domain())
 	}
 
 	setHeaderExact(req.Header, "X-Product", prof.Product)
 
-	// 压缩协商：客户端模型请求由 Node http 适配器在传输层补
+	// 压缩协商按站点 Profile 决定：国际站 CLI 2.156.0 由 Node http 适配器在传输层补
 	// `Accept-Encoding: gzip, compress, deflate, br`（值来自 axios 默认头；线上字节抓包
-	// 实测位于 Content-Length 之后、Host 之前）。网关显式写出同名同值头，并按
-	// Content-Encoding 流式解压响应（wrapUpstreamDecoding），因此不需要
-	// 「不声明以免上游压缩」的旧取舍。
-	setHeaderExact(req.Header, "Accept-Encoding", "gzip, compress, deflate, br")
+	// 实测位于 Content-Length 之后、Host 之前）；国内站 CLI 2.137.1 不发该头（抓包实测）。
+	// 发出时不代表上游压缩：网关按 Content-Encoding 流式解压响应
+	// （wrapUpstreamDecoding），因此不需要「不声明以免上游压缩」的旧取舍。
+	if prof.AcceptEncoding != "" {
+		setHeaderExact(req.Header, "Accept-Encoding", prof.AcceptEncoding)
+	}
 
 	// 传输层头。客户端（Node http 模块）对模型请求恒发送 `Connection: keep-alive`，
 	// 位置在头部块末位（见 .client_ref/capture2.jsonl 实测：Content-Length / Host /
@@ -5014,9 +5040,12 @@ func controlHeaders(req *http.Request, prof *upstreamProfile) {
 	setHeaderExact(req.Header, "X-Requested-With", "XMLHttpRequest")
 	setHeaderExact(req.Header, "User-Agent", buildUserAgent(prof))
 	setHeaderExact(req.Header, "X-Product", prof.Product)
-	// 控制面请求由 Node HTTP 栈发出，实测带完整的 Accept-Encoding（模型请求反而不带）。
+	// 控制面压缩协商同模型请求一样按站点走：国际站 CLI 2.156.0 带完整的
+	// `gzip, compress, deflate, br`，国内站 CLI 2.137.1 不带（抓包实测，两族一致）。
 	// 响应解压由 doJSONContext 显式处理（transport 已禁用自动压缩）。
-	setHeaderExact(req.Header, "Accept-Encoding", "gzip, compress, deflate, br")
+	if prof.AcceptEncoding != "" {
+		setHeaderExact(req.Header, "Accept-Encoding", prof.AcceptEncoding)
+	}
 }
 
 // loginStateHeaders 复刻客户端 fetchAuthState 的请求头集合（login 链路第一步）。

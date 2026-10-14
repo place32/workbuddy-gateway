@@ -15,6 +15,8 @@
 
 **v1.14.4（本 fork）**：消除模型请求唯一遗留的主动偏差 —— 按客户端线上字节补上 `Accept-Encoding: gzip, compress, deflate, br`（`Content-Length` 与 `Host` 之间），响应侧自行解压（`br` 用纯 Go 依赖，无 CGO）；同时修正控制面请求形状（刷新链路带 body `{}`、GET 不带 `Content-Type`）。无配置变化，升级即生效（详见[客户端指纹对齐](#客户端指纹对齐)）。
 
+**v1.14.5（本 fork）**：**国内站指纹按本机 5.5.3 客户端重新对齐**（此前基线是 5.5.2 桌面宿主抓包）。国内站 `X-IDE-*` 改为 `WorkBuddy` / `WorkBuddy` / **5.5.3**、UA 改为 `WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1`、`x-stainless-runtime-version` 改为 `v22.21.1`、`auth/state` 的 `platform` 改为 `workbuddy`（取 `product.json` 的 `authentication.attributes.platform`）；国内站模型请求体**改为 gzip 压缩**，且模型请求与控制面请求**一律不再发送** `Accept-Encoding`。依据是本机 5.5.3 国内站客户端链路的线上字节抓包（`.client_ref/cap/cn_chat_capture.jsonl`）与磁盘源码（`.client_ref/cn/main__client-info-env.js`）。国际站不变。无配置变化，升级即生效（详见[客户端指纹对齐](#客户端指纹对齐)）。
+
 **同时支持两个上游站点**（同一套 `/v2/plugin/*` 协议，凭据按站点隔离，账号池可混挂轮询）：
 
 | 站点 | 上游 | 登录方式 | 登录命令 |
@@ -1076,12 +1078,14 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 
 两套基线来自两次安装抓包：
 
-- **国内站**：桌面宿主 **5.5.2**（内置 CLI 包版本 **2.137.1**）。`X-IDE-*` 为 `CodeBuddy` / `5.5.2`，UA 为 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1`。
+- **国内站**：**本机 5.5.3 客户端**（`D:\workbuddy` 安装，productName `WorkBuddy`，内置 CLI 包版本 **2.137.1**）的 bundled CLI 被按宿主方式驱动（注入宿主 `CLIENT_INFO_*` + 指向本地 sink 的 `product.json`）后的线上字节抓包（`.client_ref/cap/cn_chat_capture.jsonl`，6 条请求：模型请求 1 条 + `/v3/config`、`/v2/report` 控制面族）。`X-IDE-Type` / `X-IDE-Name` / `X-IDE-Version` 为 `WorkBuddy` / `WorkBuddy` / `5.5.3`，UA 为 `WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1`；模型请求体 gzip 压缩（`Content-Encoding: gzip`），且模型请求与控制面请求**都不发送** `Accept-Encoding`（`Host` / `Content-Length` 齐备，故该缺席是线上实测而非钩子层级盲区）。
+
+> 国内站旧基线（桌面宿主 5.5.2，`X-IDE-*` = `CodeBuddy` / `5.5.2`，UA `…/5.5.2 CLI/2.137.1`）来自一次 5.5.2 桌面宿主抓包中宿主侧注入的 `CodeBuddy` 自述。本机 5.5.3 安装在磁盘上的 `@genie/workbuddy-desktop` 5.5.3 的 `main/client-info-env` 模块算出的注入值是 `CLIENT_INFO_PLATFORM = WORKBUDDY_PLATFORM = "WorkBuddy"`、`CLIENT_INFO_IDE_TYPE = "WorkBuddy"`、`CLIENT_INFO_PLATFORM_VERSION / PRODUCT_VERSION / PLUGIN_VERSION = app.getVersion() = "5.5.3"`、`CLIENT_INFO_USER_AGENT_EXTENSION = "CLI/2.137.1"`（对应 `.client_ref/cn/main__client-info-env.js`、`.client_ref/cn/main__workbuddy-product-config.js`），与 5.5.3 客户端的实发抓包逐字一致。网关按**实测实发**对齐 —— 风控判定的是线上字节，不是源码里的分支。
 - **国际站**：桌面宿主 **5.7.6**（内置 CLI 包版本 **2.156.0**）驱动其 bundled CLI 直连 `www.workbuddy.ai` 的抓包。桌面宿主以 `CLIENT_INFO_*` 环境变量注入身份（`buildWorkbuddyClientInfoEnv`）：`CLIENT_INFO_PLATFORM` / `CLIENT_INFO_IDE_TYPE` 为 `WorkBuddy`，`CLIENT_INFO_PLATFORM_VERSION` / `PRODUCT_VERSION` / `PLUGIN_VERSION` 为 `app.getVersion()`（`5.7.6`），`CLIENT_INFO_USER_AGENT_EXTENSION` 为 `CLI/2.156.0`。故 `X-IDE-Type` / `X-IDE-Name` / `X-IDE-Version` 为 `WorkBuddy` / `WorkBuddy` / `5.7.6`，UA 为 `WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0`。
 
 > 旧版本曾以「CLI 直连」的裸 CLI 身份（`X-IDE-*` = `CLI`、UA = `CLI/2.137.1 WorkBuddy AI/2.137.1`）作为国际站基线。真实国际版客户端是**桌面宿主 + 内置 CLI**，裸 CLI 身份与之不符：宿主不会发送 `CLI/CLI` 的 `X-IDE-*`，而会注入自己的产品标识。
 
-> 运行时版本也随宿主走：宿主以 `ELECTRON_RUN_AS_NODE=1` 用自带 Electron 二进制启动 CLI，故 `x-stainless-runtime-version` 是 Electron 内置 Node 的版本（国际站 5.7.6 → Electron 37.10.3 → `v22.21.1`；国内站 5.5.2 → `v22.22.2`），不是系统 Node 版本。两站各取自己的实测值（`upstreamProfile.NodeVersion`），不共用一个常数。
+> 运行时版本也随宿主走：宿主以 `ELECTRON_RUN_AS_NODE=1` 用自带 Electron 二进制启动 CLI，故 `x-stainless-runtime-version` 是 Electron 内置 Node 的版本，不是系统 Node 版本。本机 5.5.3（国内站）与 5.7.6（国际站）两个桌面客户端实发值都是 `v22.21.1`（本次两次抓包各自实测：`upstreamProfile.NodeVersion`），5.5.2 那份旧抓包的 `v22.22.2` 已被取代 —— 本机两个客户端自带的 Electron 内置 Node 均为 `v22.21.1`（即 Electron 37 系），故两站同值。
 
 **对齐基线**：国际站官方客户端发往 `/v2/chat/completions` 的真实请求头（线上字节抓包实测，共 39 项，含传输层头）。
 
@@ -1152,20 +1156,20 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 | `X-Client-Platform` | **移除** | 客户端全量安装目录字节级 0 命中（旧值 `web` 属网关自造）；原仅出现在额度与签到两个控制台探测上，与模型请求头集合叠加后形成客户端不可能发出的组合 |
 | `Origin` / `Referer` | **移除** | Node/Electron 运行时无浏览器语义，客户端实测不发送；发送反而是不一致特征 |
 | `Accept` | `application/json`（单一值） | 客户端实测非浏览器默认的 `*/*` 列表 |
-| `User-Agent` | 国际站 `WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0`；国内站 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1` | CLI 走 `UserAgentHttpInterceptor`：`${platform}/${platformVersion} ${productName}/${productVersion}`。桌面宿主改走 `WorkbuddyUserAgentHttpInterceptor`：`${applicationName}/${productVersion} ${platform}/${platformVersion} CLI/${cliVersion}`，两站的 `applicationName` 与 `platform` 都是 `WorkBuddy`，`productName` 是 `WorkBuddy AI`，版本取 Electron `app.getVersion()` |
-| `X-IDE-Type` / `X-IDE-Name` / `X-IDE-Version` | 国际站 `WorkBuddy` / `WorkBuddy` / `5.7.6`；国内站 `CodeBuddy` / `CodeBuddy` / `5.5.2` | 客户端取 `telemetryClientInfo`，缺失时回退 `clientInfo.ideType` / `platform` / `platformVersion`。国内站的 `X-IDE-*` 是宿主注入的 `CodeBuddy`，而国际站宿主注入的是 `WorkBuddy` —— 与 UA 的 `applicationName` 同源 |
+| `User-Agent` | 国际站 `WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0`；国内站 `WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1` | 模型请求由桌面宿主的 `WorkbuddyUserAgentHttpInterceptor` 生成：`${applicationName}/${productVersion} ${platform}/${platformVersion} CLI/${cliVersion}`。两站的 `applicationName` = `platform` = `WorkBuddy`、`productName` = `WorkBuddy AI`、`productVersion` = Electron `app.getVersion()`（国际站 5.7.6 / 国内站 5.5.3，均实测）。国内站旧值 `WorkBuddy AI/5.5.2` 来自 5.5.2 抓包时的宿主注入，本机 5.5.3 实发已是 `WorkBuddy/5.5.3` |
+| `X-IDE-Type` / `X-IDE-Name` / `X-IDE-Version` | 国际站 `WorkBuddy` / `WorkBuddy` / `5.7.6`；国内站 `WorkBuddy` / `WorkBuddy` / `5.5.3` | 客户端取 `telemetryClientInfo`，缺失时回退宿主注入的 `clientInfo.ideType` / `platform` / `platformVersion`；两站的注入值都由宿主的 `client-info-env` 模块算出（国内站 5.5.3 磁盘源码：`.client_ref/cn/main__client-info-env.js` 的 `WORKBUDDY_PLATFORM = "WorkBuddy"` + `app.getVersion()`），与线上实发一致（`.client_ref/cap/cn_chat_capture.jsonl`）。旧值 `CodeBuddy` / `5.5.2` 来自 5.5.2 桌面宿主抓包，未被本机 5.5.3 实发复现 |
 | `X-Request-ID` | 32 位小写 hex，每请求唯一，**UUID v7 形态**（版本位 `7`，前 48 位为毫秒时间戳） | 客户端 `uuidv7().replace(/-/g,"")`（bundled CLI 依赖 `uuidv7@^1.2.1`，源码 `nH: () => uuidv7`） |
 | `X-Trace-ID` | 与 `X-Request-ID` **解耦**，为 OTel traceId（全链路同值） | 实测 `X-Trace-ID` == `traceparent` 的 traceId，且同一 session 内稳定 |
 | `traceparent` / `b3` / `X-B3-*` | 补齐（OTel + B3 双份） | 客户端同时发送两套传播头 |
 | `X-Conversation-*` / `X-Root-Request-ID` / `X-Agent-*` | 补齐 | 客户端会话与 Agent 语义骨架，缺失即特征 |
-| `x-stainless-*` | 合成（6 项固定 + 1 项按站点取值，**全小写键名**），`x-stainless-runtime-version` = 国际站 `v22.21.1` / 国内站 `v22.22.2`（`upstreamProfile.NodeVersion`） | 客户端 chat 请求由 bundled OpenAI Node SDK 发出，上游始终可见该指纹族；网关用 Go `net/http` 发起，不合成即为缺失。SDK 以全小写发出该族头。**不透传下游的 `x-stainless-*` / `User-Agent`**：第三方下游（Claude Code 等）会带自己的 SDK 版本与 UA，与 WorkBuddy 的 IDE 头构成官方客户端不可能产生的组合。`x-stainless-runtime-version` 是**运行 SDK 的 Node 版本**：桌面宿主以 `ELECTRON_RUN_AS_NODE=1` 用自带 Electron 二进制启动 CLI（源码 `buildBaseEnv`），WorkBuddyAI 5.7.6 内置 Electron 37.10.3 → `node 22.21.1`（该 exe 在 `ELECTRON_RUN_AS_NODE` 下实测 `process.versions.node`），故不能用系统 Node 版本或臆造值 |
-| `Accept-Encoding` | 模型请求与控制面请求均发送 `gzip, compress, deflate, br`；响应自行解压（`gzip` / `deflate` 标准库、`br` 纯 Go 解码器） | 模型请求：`.client_ref/cap/intl_chat_capture.jsonl` / `intl_toolturn_capture.jsonl`（5 + 72 次模型请求的线上字节）第 36 槽即该头（`Content-Length` 与 `Host` 之间），值逐字一致；旧结论「不发送」源于只钩到头部对象层、看不到传输层补齐的头。控制面：按「桌面客户端 `GET /v2/plugin/accounts`」实测逐字复刻 |
+| `x-stainless-*` | 合成（6 项固定 + 1 项按站点取值，**全小写键名**），`x-stainless-runtime-version` 两站均为 `v22.21.1`（`upstreamProfile.NodeVersion`，各自抓包实测） | 客户端 chat 请求由 bundled OpenAI Node SDK 发出，上游始终可见该指纹族；网关用 Go `net/http` 发起，不合成即为缺失。SDK 以全小写发出该族头。**不透传下游的 `x-stainless-*` / `User-Agent`**：第三方下游（Claude Code 等）会带自己的 SDK 版本与 UA，与 WorkBuddy 的 IDE 头构成官方客户端不可能产生的组合。`x-stainless-runtime-version` 是**运行 SDK 的 Node 版本**：桌面宿主以 `ELECTRON_RUN_AS_NODE=1` 用自带 Electron 二进制启动 CLI（源码 `buildBaseEnv`），故取 Electron 内置 Node 版本 —— 本机 5.5.3（国内站）与 5.7.6（国际站）两个宿主实发均为 `v22.21.1`；5.5.2 旧抓包的 `v22.22.2` 已被取代 |
+| `Accept-Encoding` | **模型请求（两站）**发 `gzip, compress, deflate, br`；**控制面：国际站发同值、国内站不发**；响应自行解压（`gzip` / `deflate` 标准库、`br` 纯 Go 解码器） | 国际站模型请求：`.client_ref/cap/intl_chat_capture.jsonl` / `intl_toolturn_capture.jsonl`（5 + 72 次，39 个头）第 36 槽即该头（`Content-Length` 与 `Host` 之间）。国际站控制面：按「桌面客户端 `GET /v2/plugin/accounts`」实测逐字复刻。**国内站是例外**：`.client_ref/cap/cn_chat_capture.jsonl` 里同一条 CLI 链路的模型请求、`/v3/config`、`/v2/report` 全部不带该头（该抓包在 sink 侧做，`Host` / `Content-Length` 齐备，故不是钩子层级盲区）—— 同一个头在两个站点分叉，不能按一套写死 |
 | `X-No-*` | 仅未鉴权时成组发送，值 `"true"` | 实测两种形态：已鉴权（`Authorization`+`X-User-Id`+`X-Domain`+`X-Product`，无任何 `X-No-*`）；未鉴权仅 `X-No-*` |
 | `X-Refresh-Token` | 仅刷新链路发送，chat 不发送 | 客户端源码中该头只出现在 `auth/token/refresh` 与 `account/switch` 调用 |
 | `X-Auth-Refresh-Source` | 刷新链路发送 `plugin` | 旧值 `workbuddy` 属网关自造；客户端 `refreshSession` 实测为 `plugin` |
 | `X-Tenant-Id` | 与 `X-Enterprise-Id` 同值，仅企业账号发送 | `AuthenticationHttpInterceptor` 在账号存在 `enterpriseId` 时无条件补该头（同一分支里 `X-No-Enterprise-Id` 只拦 `X-Enterprise-Id`，不拦 `X-Tenant-Id`） |
 | `x-codebuddy-request` | **合成 `"1"`**，客户端自带时透传 | 客户端对模型请求恒发送该头（源码 `withSecurityHeader` 注入；桌面宿主 `daemon-bootstrap` 的模型请求构造器亦显式 `set`），CLI 直连与桌面宿主两条链路、含非回环目标均携带 |
-| `Content-Encoding` | 国际站模型请求体 gzip 压缩 | 国际站 `product.json` 的 `features.RequestBodyGzip = true`，客户端 `GzipRequestProcessor` 对模型请求体统一压缩（与体积无关）；国内站未观测到该特性，保持不压缩 |
+| `Content-Encoding` | **两站**模型请求体均 gzip 压缩（`Content-Encoding: gzip`，与体积无关） | 客户端 `GzipRequestProcessor`（处理器链 `priority=9999`）对模型请求体统一压缩：`product.json` 的 `features.RequestBodyGzip = true`。国内站旧结论「保持不压缩」是本 fork 早期未实测该站点所致；本机 5.5.3 国内站链路抓包实测请求体带 gzip 魔数与 `Content-Encoding: gzip`（`.client_ref/cap/cn_chat_capture.jsonl`），故两站一律压缩 |
 | `Connection` | 模型请求与守护进程请求发送 `keep-alive` | 客户端由 Node http 模块补齐（模型请求实测恒在头部块末位），Go transport 默认不写；缺失即为可识别偏差 |
 
 ### 字节级对齐（v1.8.4 新增）
@@ -1188,7 +1192,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 
 「头部集合与键名大小写一致」仍不等于「字节一致」：`net/http` 会把 `Host` / `User-Agent` / `Content-Length` 单独前置，其余头部经 `http.Header`（map）按**规范化键名字典序**写出，而客户端按**属性插入顺序**写出 —— 两者头部字节序列截然不同，同样无需解析语义即可判定。
 
-`wireorder.go` 在 **conn 层**复刻该顺序（`installWireOrder`）：`net/http` 写头部的位置不可拦截，但其写出的字节必经 `net.Conn.Write`，故把 conn 包一层，在每个请求的头部块写出前按实测顺序重排。顺序基线取自两处实测：本机 5.7.6 客户端的线上字节抓包（`.client_ref/cap/intl_chat_capture.jsonl` / `intl_toolturn_capture.jsonl`，每条模型请求 39 个头），以及一份按**线上字节顺序**记录的 5.5.2 桌面客户端抓包（38 个头）。两者的应用层顺序完全一致；差异只在传输层末尾：5.7.6 的线上字节在 `Content-Length` 与 `Host` 之间还有 `Accept-Encoding`（v1.14.4 已按此对齐），5.5.2 那份抓包未见该头，属抓包层级/版本差异，以本机 5.7.6 的线上字节为准。抓包含 Authorization 等凭据，属本地研究产物、不入仓库。成因可在 bundled CLI 源码中逐条定位：
+`wireorder.go` 在 **conn 层**复刻该顺序（`installWireOrder`）：`net/http` 写头部的位置不可拦截，但其写出的字节必经 `net.Conn.Write`，故把 conn 包一层，在每个请求的头部块写出前按实测顺序重排。顺序基线取自三处实测：本机 5.7.6 客户端的线上字节抓包（`.client_ref/cap/intl_chat_capture.jsonl` / `intl_toolturn_capture.jsonl`，每条模型请求 39 个头）、一份按**线上字节顺序**记录的 5.5.2 桌面客户端抓包（38 个头），以及本机 5.5.3 国内站客户端链路的模型请求（`.client_ref/cap/cn_chat_capture.jsonl`，38 个头）。三者的应用层顺序完全一致；差异只在传输层末尾的 `Accept-Encoding`：国际站该头位于 `Content-Length` 与 `Host` 之间，国内站没有该头（尾部即 `Content-Length → Host → Connection`）。顺序表按**头名**匹配，缺席的头自然不写出，故两站共用一张表即可各自对齐。抓包含 Authorization 等凭据，属本地研究产物、不入仓库。成因可在 bundled CLI 源码中逐条定位：
 
 ```text
 SDK 默认头 → 应用自建头表（会话/Agent/IDE/隐私标记）→ 处理器链（GzipRequestProcessor 末位，追加 Content-Encoding）

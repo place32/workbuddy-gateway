@@ -145,7 +145,7 @@ func refreshTestServer(t *testing.T, handler func(call int) (int, string)) *http
 				"X-Requested-With": "XMLHttpRequest",
 				"Accept":           "application/json, text/plain, */*",
 				"X-Product":        "SaaS",
-				"User-Agent":       "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1",
+				"User-Agent":       "WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1",
 			} {
 				if got := r.Header.Get(name); got != want {
 					t.Errorf("只读校验 %s = %q, want %q", name, got, want)
