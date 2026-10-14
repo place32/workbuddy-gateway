@@ -31,7 +31,8 @@ jobs:
         id: tag
         shell: pwsh
         run: |
-          $tag = '${{ inputs.tag }}'.Trim()
+          # push 事件没有 inputs 上下文，故取 github.event.inputs（非 dispatch 时为空）而不是 inputs.*
+          $tag = '${{ github.event.inputs.tag }}'.Trim()
           if (-not $tag) { $tag = '${{ github.ref_name }}' }
           if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
             throw "标签必须形如 v1.2.3，实际：'$tag'（workflow_dispatch 请显式传入标签名）"
@@ -40,13 +41,13 @@ jobs:
           "version=$($tag.Substring(1))" >> $env:GITHUB_OUTPUT
 
       - name: 检出
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.tag.outputs.tag }}
           fetch-depth: 1
 
       - name: 安装 Go（版本取自 go.mod）
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -81,7 +82,7 @@ jobs:
           $lines
 
       - name: 上传工作流产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: workbuddy-gateway-${{ steps.tag.outputs.version }}
           path: dist/*
