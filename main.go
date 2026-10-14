@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -38,7 +40,7 @@ import (
 )
 
 const (
-	version = "1.14.2"
+	version = "1.14.3"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -138,6 +140,27 @@ func isTransientNetworkError(err error) bool {
 	return false
 }
 
+// upstreamBody 按站点 Profile 决定模型请求体是否 gzip，返回最终字节与是否已压缩。
+//
+// 客户端 GzipRequestProcessor 的判定（源码）：仅当 productFeature
+// `RequestBodyGzip` 为真、请求体非空、且运行时环境不是 internal 时压缩 —— 与请求体
+// 大小无关。国际站 product.json 该特性为 true，抓包实测模型请求带
+// `Content-Encoding: gzip`（38KB 请求体）。
+func upstreamBody(prof *upstreamProfile, raw []byte) ([]byte, bool) {
+	if !prof.GzipBody || len(raw) == 0 {
+		return raw, false
+	}
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(raw); err != nil {
+		return raw, false
+	}
+	if err := zw.Close(); err != nil {
+		return raw, false
+	}
+	return buf.Bytes(), true
+}
+
 // doUpstreamRequest 发送上游请求，并对瞬时网络错误做有界重试。
 //
 // 仅在「尚未写出完整请求头」时重试；已发送 POST 后收到 EOF 无法判定上游
@@ -147,6 +170,9 @@ func isTransientNetworkError(err error) bool {
 func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, upstreamBytes []byte, reqID uint64, traceID string, sess sessionScope) (*http.Response, context.CancelFunc, error) {
 	var lastErr error
 	_, _, retries := upstreamSettings()
+	// 请求体压缩在重试循环外只做一次：客户端 GzipRequestProcessor 对每个模型请求体
+	// 压缩一次，重试属网关自身的网络层行为，不应改变上游可见的字节。
+	body, gzipped := upstreamBody(prof, upstreamBytes)
 	for try := 0; try <= retries; try++ {
 		upstreamCtx, upstreamCancel := context.WithCancel(r.Context())
 		var headersWritten, bodyWritten atomic.Bool
@@ -158,12 +184,17 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 				}
 			},
 		}
-		req, err := http.NewRequestWithContext(httptrace.WithClientTrace(upstreamCtx, trace), http.MethodPost, prof.chatURL(), bytes.NewReader(upstreamBytes))
+		req, err := http.NewRequestWithContext(httptrace.WithClientTrace(upstreamCtx, trace), http.MethodPost, prof.chatURL(), bytes.NewReader(body))
 		if err != nil {
 			upstreamCancel()
 			return nil, nil, err
 		}
 		backendHeaders(req, acc.Auth, prof, r.Header, sess)
+		if gzipped {
+			// 客户端压缩后自行声明 Content-Encoding；Content-Length 由 Net/HTTP 按实际字节写入，
+			// 与客户端一致（均为压缩后长度）。
+			setHeaderExact(req.Header, "Content-Encoding", "gzip")
+		}
 		if try > 0 {
 			// 重试时不复用已被对端关闭的空闲连接。
 			req.Close = true
@@ -218,23 +249,32 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 // -----------------------------------------------------------------------------
 
 type upstreamProfile struct {
-	Key             string        // 存储于凭据文件 edition 字段的站点标识
-	Label           string        // 控制台展示名
-	Base            string        // 上游 API 基础地址
-	Platform        string        // auth/state 的 platform 参数
-	PlatformName    string        // X-IDE-Type / X-IDE-Name（宿主产品标识）
-	PlatformVersion string        // X-IDE-Version（宿主产品版本）
-	ProductName     string        // UA 产品名；空则回退「PlatformName AI」
-	AppName         string        // 桌面 UA 的 platform / applicationName；空则用 PlatformName
-	CliVersion      string        // 桌面 UA 尾段（bundled CLI 版本）；CLI 宿主本身为空
-	Product         string        // X-Product
-	PortalOrigin    string        // 各站 Web 控制台源（仅用于 billing/额度等 Web API 的 URL 拼装，不作为请求头发送）
-	LoginTTL        time.Duration // login 命令等待授权完成的超时
+	Key             string // 存储于凭据文件 edition 字段的站点标识
+	Label           string // 控制台展示名
+	Base            string // 上游 API 基础地址
+	Platform        string // auth/state 的 platform 参数
+	PlatformName    string // X-IDE-Type / X-IDE-Name（宿主产品标识）
+	PlatformVersion string // X-IDE-Version（宿主产品版本）
+	ProductName     string // UA 产品名；空则回退「PlatformName AI」
+	AppName         string // 桌面 UA 的 platform / applicationName；空则用 PlatformName
+	CliVersion      string // 桌面 UA 尾段（bundled CLI 版本）；CLI 宿主本身为空
+	Product         string // X-Product
+	// NodeVersion 是 x-stainless-runtime-version：**运行 bundled OpenAI SDK 的 Node 进程**版本。
+	// 桌面宿主以 ELECTRON_RUN_AS_NODE=1 用自带 Electron 启动 CLI，故该值随宿主客户端版本走，
+	// 两站可能不同（国际站 5.7.6 → v22.21.1；国内站 5.5.2 抓包实测 v22.22.2）。
+	NodeVersion  string        // x-stainless-runtime-version
+	PortalOrigin string        // 各站 Web 控制台源（仅用于 billing/额度等 Web API 的 URL 拼装，不作为请求头发送）
+	LoginTTL     time.Duration // login 命令等待授权完成的超时
+	// GzipBody 表示模型请求体是否 gzip 压缩（Content-Encoding: gzip）。
+	// 对应客户端 product.json 的 features.RequestBodyGzip 开关：开启时 GzipRequestProcessor
+	// 对模型请求体统一压缩，国际站 product.json 实测为 true。
+	GzipBody bool
 }
 
 // 客户端身份常量：与真实客户端实测流量对齐（详见 README「客户端指纹对齐」）。
 // 国内站取值来源于 WorkBuddyAI desktop 5.5.2 + bundled CLI 2.137.1 的抓包；
-// 国际站取值来源于同一安装（desktop 5.5.2）内置 CLI 直连 www.workbuddy.ai 的抓包。
+// 国际站取值来源于 WorkBuddyAI desktop 5.7.6 + bundled CLI 2.156.0：宿主以
+// CLIENT_INFO_* 注入身份后由 CLI 直连 www.workbuddy.ai 的抓包（38 项头，含传输层头）。
 // 任何自造字段（如 X-Client-ID）都会形成可静态识别的机器特征。
 const (
 	// clientDomain 是上游请求携带的 X-Domain 默认值（账号未记录 domain 时使用）。
@@ -254,16 +294,32 @@ var (
 		Platform: "VSCode", PlatformName: "CodeBuddy", PlatformVersion: "5.5.2",
 		AppName: "WorkBuddy", ProductName: "WorkBuddy AI",
 		CliVersion: "2.137.1", Product: "SaaS",
+		// 5.5.2 桌面宿主抓包实测（x-stainless-runtime-version 随宿主自带的 Node 走）。
+		NodeVersion:  "v22.22.2",
 		PortalOrigin: "https://www.codebuddy.cn",
 		LoginTTL:     5 * time.Minute,
 	}
 	profileINTL = upstreamProfile{
 		Key: "intl", Label: "国际站",
-		Base:     "https://www.workbuddy.ai",
-		Platform: "workbuddy-ai", PlatformName: "CLI", PlatformVersion: "2.137.1",
-		ProductName: "WorkBuddy AI", Product: "SaaS",
+		Base: "https://www.workbuddy.ai",
+		// auth/state 的 platform 取 product.json authentication.attributes.platform。
+		Platform: "workbuddy-ai",
+		// 桌面宿主注入 bundled CLI 的 CLIENT_INFO_*（Desktop 源码 buildWorkbuddyClientInfoEnv）：
+		//   CLIENT_INFO_PLATFORM/IDE_TYPE = WorkBuddy
+		//   CLIENT_INFO_PLATFORM_VERSION/PRODUCT_VERSION/PLUGIN_VERSION = app.getVersion() = 5.7.6
+		//   CLIENT_INFO_PRODUCT_NAME = product.json productName = WorkBuddy AI
+		//   CLIENT_INFO_USER_AGENT_EXTENSION = CLI/<bundled cli version> = CLI/2.156.0
+		// 因此 X-IDE-* 为 WorkBuddy / WorkBuddy / 5.7.6，UA 为
+		// `WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0`（抓包逐字一致）。
+		PlatformName: "WorkBuddy", PlatformVersion: "5.7.6",
+		AppName: "WorkBuddy", ProductName: "WorkBuddy AI", CliVersion: "2.156.0",
+		Product: "SaaS",
+		// 5.7.6 内置 Electron 37.10.3 → 自带 Node 22.21.1（ELECTRON_RUN_AS_NODE 实测）。
+		NodeVersion:  "v22.21.1",
 		PortalOrigin: "https://www.workbuddy.ai",
 		LoginTTL:     15 * time.Minute, // 浏览器内登录（邮箱/验证码/SSO）比扫码慢，放宽超时
+		// product.json features.RequestBodyGzip = true，模型请求体 gzip（抓包实测 Content-Encoding: gzip）。
+		GzipBody: true,
 	}
 )
 
@@ -290,6 +346,17 @@ func (p *upstreamProfile) authTokenURL(state string) string {
 }
 
 func (p *upstreamProfile) tokenRefreshURL() string { return p.Base + "/v2/plugin/auth/token/refresh" }
+
+// domain 返回站点 endpoint 的主机名。
+//
+// 客户端 enterpriseHeaders() 在账号尚无 domain 时用 URI.parse(endpoint).authority 作为
+// X-Domain（登录链路每步都带该头），故登录/续期请求的 X-Domain 取站点主机名。
+func (p *upstreamProfile) domain() string {
+	if u, err := url.Parse(p.Base); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return clientDomain
+}
 
 func (p *upstreamProfile) chatURL() string { return p.Base + "/v2/chat/completions" }
 
@@ -758,6 +825,9 @@ func initHTTPClient() {
 		}
 		transport.Proxy = http.ProxyURL(pURL)
 	}
+	// 头部顺序复刻（见 wireorder.go）：net/http 按规范化键名字典序写头部，官方客户端按
+	// 属性插入顺序写，顺序本身即静态特征。此处把钩子挂在拨号层，在 TLS 之上重排头部块。
+	installWireOrder(transport)
 	// 注意：这里刻意不设置 http.Client.Timeout。
 	// 总超时会给整条流设一个硬上限（原为 180s），大请求长时间但持续有输出的流会被中途掐断，
 	// 导致上游 usage 丢失、客户端收到不完整响应，并被 CPA 判为 provider 故障而触发 503。
@@ -1854,15 +1924,28 @@ func refreshTokenPayload(sa *StoredAuth) (int, error) {
 	registerCredentialSecrets(sa)
 	prof := profileForEdition(sa.Edition)
 	headers := func(r *http.Request) {
-		commonHeaders(r, prof)
-		// 客户端刷新链路实测同样携带 OTel/B3 传播头（traceSpan.requestHeaders）。
-		// 刷新是一次独立操作、无下游会话语义，故不参与会话作用域：全部 ID 新生成。
-		setTraceHeaders(r, resolveLinkIDs(nil, sessionScope{}))
-		r.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
-		if sa.Account.EnterpriseID != "" {
-			r.Header.Set("X-Enterprise-Id", sa.Account.EnterpriseID)
+		controlHeaders(r, prof)
+		// 客户端 refreshSession 实测：enterpriseHeaders(auth)（X-Domain）+ X-Refresh-Token
+		// + X-Auth-Refresh-Source: plugin + traceSpan 头；AuthenticationHttpInterceptor 再补
+		// Authorization 与 X-User-Id/X-Enterprise-Id/X-Tenant-Id（该步不声明任何 X-No-*）。
+		setControlTraceHeaders(r)
+		if sa.Auth.AccessToken != "" {
+			setHeaderExact(r.Header, "Authorization", "Bearer "+sa.Auth.AccessToken)
 		}
-		r.Header.Set("X-Auth-Refresh-Source", "workbuddy")
+		if sa.Account.UID != "" {
+			setHeaderExact(r.Header, "X-User-Id", sa.Account.UID)
+		}
+		setHeaderExact(r.Header, "X-Refresh-Token", sa.Auth.RefreshToken)
+		if sa.Account.EnterpriseID != "" {
+			setHeaderExact(r.Header, "X-Enterprise-Id", sa.Account.EnterpriseID)
+			setHeaderExact(r.Header, "X-Tenant-Id", sa.Account.EnterpriseID)
+		}
+		if sa.Auth.Domain != "" {
+			setHeaderExact(r.Header, "X-Domain", sa.Auth.Domain)
+		} else {
+			setHeaderExact(r.Header, "X-Domain", prof.domain())
+		}
+		setHeaderExact(r.Header, "X-Auth-Refresh-Source", "plugin")
 	}
 
 	data, status, err := doJSON(cfg.HttpClient, http.MethodPost, prof.tokenRefreshURL(), headers, nil)
@@ -2089,16 +2172,28 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	prof := acc.Profile()
 	accountMu.Unlock()
 
-	traceID := uuid.NewString()
+	traceID := newTraceID()
 	log.Printf("[Quota] traceId=%s 账号 %s 开始查询额度，站点=%s，接口=%s", traceID, path, prof.Label, prof.quotaSummaryURL())
+	// 该接口由客户端主进程经 axios（RestOperations）调用：
+	//   post(`/billing/meter/get-user-resource-summary`, {}, {headers:{"Accept-Language": locale}})
+	// 故走控制面头集合（非模型请求头集合），身份头由 AuthenticationHttpInterceptor 补。
+	// 旧实现混用了模型请求头集合并自造 `X-Client-Platform: web`（客户端全量安装目录 0 命中）。
 	headers := func(r *http.Request) {
-		commonHeaders(r, prof)
-		r.Header.Set("Authorization", "Bearer "+auth.Auth.AccessToken)
-		r.Header.Set("X-Client-Platform", "web")
-		r.Header.Set("X-Trace-ID", traceID)
-		if auth.Account.EnterpriseID != "" {
-			r.Header.Set("X-Enterprise-Id", auth.Account.EnterpriseID)
+		controlHeaders(r, prof)
+		setHeaderExact(r.Header, "Authorization", "Bearer "+auth.Auth.AccessToken)
+		if auth.Account.UID != "" {
+			setHeaderExact(r.Header, "X-User-Id", auth.Account.UID)
 		}
+		if auth.Auth.Domain != "" {
+			setHeaderExact(r.Header, "X-Domain", auth.Auth.Domain)
+		} else {
+			setHeaderExact(r.Header, "X-Domain", prof.domain())
+		}
+		if auth.Account.EnterpriseID != "" {
+			setHeaderExact(r.Header, "X-Enterprise-Id", auth.Account.EnterpriseID)
+			setHeaderExact(r.Header, "X-Tenant-Id", auth.Account.EnterpriseID)
+		}
+		setControlTraceHeadersWithID(r, traceID, newSpanID())
 	}
 	data, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.quotaSummaryURL(), headers, strings.NewReader("{}"))
 	if err != nil {
@@ -2298,20 +2393,26 @@ func checkinAccount(ctx context.Context, acc *Account) (string, error) {
 	defer cancel()
 
 	log.Printf("[Checkin] 账号 %s 开始每日签到，站点=%s，接口=%s", path, prof.Label, prof.dailyCheckinURL())
+	// 客户端 `checkin()`（billingPrefix=/v2）同样经 axios `RestOperations` 发出：
+	//   post(`/v2/billing/meter/daily-checkin`)  // 带 X-Device-Token（Turing 设备令牌）
+	// 故头集合取控制面集合，而非模型请求集合；旧实现混用模型头并自造 `X-Client-Platform: web`。
+	// 网关无法产出 Turing 设备令牌（需本地原生风控 SDK），此处不臆造该头。
 	headers := func(r *http.Request) {
-		commonHeaders(r, prof)
-		r.Header.Set("Authorization", "Bearer "+auth.Auth.AccessToken)
-		r.Header.Set("X-Client-Platform", "web")
+		controlHeaders(r, prof)
+		setHeaderExact(r.Header, "Authorization", "Bearer "+auth.Auth.AccessToken)
 		if auth.Account.UID != "" {
-			r.Header.Set("X-User-Id", auth.Account.UID)
+			setHeaderExact(r.Header, "X-User-Id", auth.Account.UID)
 		}
 		if auth.Account.EnterpriseID != "" {
-			r.Header.Set("X-Enterprise-Id", auth.Account.EnterpriseID)
-			r.Header.Set("X-Tenant-Id", auth.Account.EnterpriseID)
+			setHeaderExact(r.Header, "X-Enterprise-Id", auth.Account.EnterpriseID)
+			setHeaderExact(r.Header, "X-Tenant-Id", auth.Account.EnterpriseID)
 		}
 		if auth.Auth.Domain != "" {
-			r.Header.Set("X-Domain", auth.Auth.Domain)
+			setHeaderExact(r.Header, "X-Domain", auth.Auth.Domain)
+		} else {
+			setHeaderExact(r.Header, "X-Domain", prof.domain())
 		}
+		setControlTraceHeaders(r)
 	}
 	_, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.dailyCheckinURL(), headers, strings.NewReader("{}"))
 	if err == nil {
@@ -2980,13 +3081,13 @@ func runLogin() {
 		Jar:     cfg.HttpClient.Jar,
 	}
 
-	// 轮询 auth/token 时与官方客户端一致，显式声明无 Authorization
-	pollHeaders := func(r *http.Request) {
-		commonHeaders(r, prof)
-		r.Header.Set("X-No-Authorization", "true")
-	}
+	// 三步登录请求的头集合各自对应客户端源码里的一个方法（详见 README「控制面与模型请求」）：
+	// auth/state → fetchAuthState，auth/token 轮询 → loopGetToken，login/account → loopGetAccount。
+	stateHeaders := loginStateHeaders(prof)
+	pollHeaders := loginPollHeaders(prof)
+	siteDomain := prof.domain()
 
-	data, _, err := doJSON(loginClient, http.MethodPost, prof.authStateURL(), nil, bytes.NewReader([]byte("{}")))
+	data, _, err := doJSON(loginClient, http.MethodPost, prof.authStateURL(), stateHeaders, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		fmt.Printf("获取登录状态失败: %v\n", err)
 		return
@@ -3033,12 +3134,15 @@ func runLogin() {
 				continue
 			}
 
-			// 登录成功，拉取账号信息
+			// 登录成功，拉取账号信息。
+			// 客户端 loopGetAccount：enterpriseHeaders(auth)（X-Domain 取 token 的 domain）+ Authorization
+			// + traceSpan 头 + X-No-User-Id / X-No-Enterprise-Id / X-No-Department-Info。
 			var acct accountData
-			acctHeaders := func(r *http.Request) {
-				commonHeaders(r, prof)
-				r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+			acctDomain := tok.Domain
+			if acctDomain == "" {
+				acctDomain = siteDomain
 			}
+			acctHeaders := loginAccountHeaders(prof, tok.AccessToken, acctDomain)
 			if acctRaw, _, errAcct := doJSON(loginClient, http.MethodGet, prof.loginAcctURL(st.State), acctHeaders, nil); errAcct == nil {
 				_ = json.Unmarshal(acctRaw, &acct)
 			}
@@ -3490,7 +3594,6 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 
 		// 按账号所属站点（国内站/国际站）路由上游与指纹 Header
 		prof := acc.Profile()
-
 
 		debugEvent(r, "info", "upstream_request_started", map[string]any{
 			"upstream_host": prof.Base,
@@ -4207,6 +4310,27 @@ func newSpanID() string {
 	return strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
 }
 
+// newUUIDv7 生成 RFC 9562 UUID v7（48 位毫秒时间戳 + 74 位随机），带连字符小写形态。
+//
+// 客户端自 2.156.0 起用 uuidv7 生成会话/消息 ID（bundled CLI 依赖 uuidv7@^1.2.1，
+// 源码 `nH: () => uuidv7`，X-Conversation-ID = nH()，X-Request-ID = nH().replace(/-/g,"")），
+// 抓包实测会话/消息/请求 ID 的版本位恒为 7、前 48 位为请求时刻的毫秒时间戳。
+// 随机 UUID v4 在该版本位与时间前缀上与之不符，属可静态识别的偏差。
+func newUUIDv7() string {
+	u, err := uuid.NewV7()
+	if err != nil {
+		// 仅在系统熵源不可用时发生；回退到随机 UUID，保持长度与形态可用。
+		return uuid.New().String()
+	}
+	return u.String()
+}
+
+// newUUIDv7Compact 返回去掉连字符的 32 位形态（X-Request-ID / X-Conversation-Message-ID
+// / X-Conversation-Request-ID 等客户端以 `.replace(/-/g,"")` 发出的字段）。
+func newUUIDv7Compact() string {
+	return strings.ReplaceAll(newUUIDv7(), "-", "")
+}
+
 // sessionScope 是「同一条下游会话」内恒定的链路标识。
 //
 // 官方客户端把链路 ID 分成两个作用域（源码 chat_headers_full 实测）：
@@ -4252,11 +4376,10 @@ func newSessionScope(conversationID, conversationRequestID string) sessionScope 
 	if conversationID == "" {
 		return sessionScope{}
 	}
-	sum := sha256.Sum256([]byte(sessionScopeSeed + conversationID))
 	// 取前 16 字节（32 位 hex），与客户端 X-Conversation-Request-ID 同形态。
 	return sessionScope{
 		conversationID:        conversationID,
-		conversationRequestID: hex.EncodeToString(sum[:16]),
+		conversationRequestID: derivedCompactID(conversationID),
 	}
 }
 
@@ -4265,10 +4388,56 @@ const sessionScopeSeed = "workbuddy-gateway/session/"
 
 // derivedUUID 由会话键派生一个带连字符的 UUID 形态标识（不用于承载任何真实语义，
 // 仅当下游缺失 X-Conversation-ID 时保持该头的形态恒定）。
-func derivedUUID(key string) string {
-	sum := sha256.Sum256([]byte(sessionScopeSeed + "conv-id/" + key))
-	h := hex.EncodeToString(sum[:16])
-	return fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
+func derivedUUID(key string) string { return dashUUID(derivedCompactID(key)) }
+
+// derivedCompactID 由会话键派生 32 位 hex 的 UUID 紧凑形态 ID。
+//
+// 形态对齐：客户端 2.156.0 发出的会话/消息 ID 均为 UUID v7（版本位 7，前 48 位为
+// 创建时刻的毫秒时间戳）。派生值沿用同一套位域布局 —— 时间戳取自同类 ID 自身
+// （即该会话的真实创建时刻），其余位由会话键哈希填充：
+//   - 请求 ID 派生自会话 ID 时，两者前 48 位同值，与客户端「同一次会话内生成」的
+//     时序关系一致，且派生可复现、无状态；
+//   - 模板非 v7（老客户端）时退化为 v4 位域，避免产出客户端不会生成的随机版本位。
+//
+// 不泄露会话键本身：输出与会话键同为 32 位 hex，无法反推。
+func derivedCompactID(key string) string {
+	sum := sha256.Sum256([]byte(sessionScopeSeed + key))
+	var b [16]byte
+	copy(b[:], sum[:16])
+	if ts, ok := uuidV7Timestamp(key); ok {
+		b[0] = byte(ts >> 40)
+		b[1] = byte(ts >> 32)
+		b[2] = byte(ts >> 24)
+		b[3] = byte(ts >> 16)
+		b[4] = byte(ts >> 8)
+		b[5] = byte(ts)
+		b[6] = 0x70 | (b[6] & 0x0f) // version 7
+	} else {
+		b[6] = 0x40 | (b[6] & 0x0f) // version 4
+	}
+	b[8] = 0x80 | (b[8] & 0x3f) // RFC 4122 variant
+	return hex.EncodeToString(b[:])
+}
+
+// uuidV7Timestamp 从 UUID v7（32 位紧凑或带连字符形态）解析前 48 位毫秒时间戳。
+func uuidV7Timestamp(s string) (uint64, bool) {
+	compact := strings.ReplaceAll(s, "-", "")
+	if !isHexLen(compact, 32) || compact[12] != '7' {
+		return 0, false
+	}
+	ts, err := strconv.ParseUint(compact[:12], 16, 64)
+	if err != nil {
+		return 0, false
+	}
+	return ts, true
+}
+
+// dashUUID 把 32 位紧凑形态切回客户端 X-Conversation-ID 使用的带连字符形态。
+func dashUUID(compact string) string {
+	if !isHexLen(compact, 32) {
+		return compact
+	}
+	return fmt.Sprintf("%s-%s-%s-%s-%s", compact[0:8], compact[8:12], compact[12:16], compact[16:20], compact[20:32])
 }
 
 // ok 表示会话键存在，会话级 ID 可用；否则调用方应回退到每请求新值。
@@ -4377,7 +4546,8 @@ func resolveLinkIDs(in http.Header, sess sessionScope) linkIDs {
 		getHeaderExact(in, "X-Conversation-Message-ID"),
 	)
 	if requestID == "" {
-		requestID = newTraceID()
+		// 客户端 messageId = uuidv7().replace(/-/g,"")（源码 nH = uuidv7）。
+		requestID = newUUIDv7Compact()
 	}
 
 	// span 组（每请求级）：traceparent 的 span 段 == b3 的 span 段 == X-B3-SpanId。
@@ -4401,7 +4571,8 @@ func resolveLinkIDs(in http.Header, sess sessionScope) linkIDs {
 
 	conversationID := firstNonEmpty(getHeaderExact(in, "X-Conversation-ID"), sess.conversationID)
 	if conversationID == "" {
-		conversationID = uuid.New().String()
+		// 客户端 X-Conversation-ID = uuidv7()（带连字符）。
+		conversationID = newUUIDv7()
 	}
 
 	return linkIDs{
@@ -4507,6 +4678,37 @@ func setTraceHeaders(req *http.Request, ids linkIDs) {
 	setHeaderExact(req.Header, "X-B3-Sampled", "1")
 }
 
+// setControlTraceHeaders 写控制面请求的链路头，复刻客户端 traceSpan.requestHeaders
+// + CommonHeaderHttpInterceptor.injectRequestIdHeader 的组合。
+//
+// 与模型请求（setTraceHeaders）的差别，逐条对应实测与源码：
+//   - 客户端 `OpenTelemetrySpan.requestHeaders` 只产出六项：
+//     `{X-Trace-ID, b3, X-B3-TraceId, X-B3-ParentSpanId, X-B3-SpanId, X-B3-Sampled}`
+//     —— **没有 traceparent**（那是模型请求链路单独加的），且 b3 为四段
+//     `${trace}-${span}-${flags}-${parent}`，无父 span 时末段为空。
+//   - `injectRequestIdHeader`（axios 请求拦截器，见 CommonHeaderHttpInterceptor）：
+//     `X-Request-ID` 缺失时**取 X-Trace-ID**（取不到才随机 32 位 hex）。故控制面请求的
+//     `X-Request-ID` 恒等于 `X-Trace-ID` —— 这与模型请求把两者解耦的口径相反。
+//   - 控制面请求不带会话语义，无父 span：`X-B3-ParentSpanId` 为空值。
+func setControlTraceHeaders(r *http.Request) {
+	setControlTraceHeadersWithID(r, newTraceID(), newSpanID())
+}
+
+// setControlTraceHeadersWithID 用指定 trace/span 写控制面链路头。
+//
+// 客户端把两次请求放进同一逻辑操作（额度摘要 + 套餐资源列表）时，OTel 上下文里的
+// traceId 相同、spanId 不同；网关据此在一次刷新周期内复用 trace、逐请求换 span，
+// 既保留审计关联（plans_test 断言两请求 traceId 相同），也与客户端一致。
+func setControlTraceHeadersWithID(r *http.Request, traceID, spanID string) {
+	setHeaderExact(r.Header, "X-Trace-ID", traceID)
+	setHeaderExact(r.Header, "X-Request-ID", traceID)
+	setHeaderExact(r.Header, "b3", fmt.Sprintf("%s-%s-1-", traceID, spanID))
+	setHeaderExact(r.Header, "X-B3-TraceId", traceID)
+	setHeaderExact(r.Header, "X-B3-ParentSpanId", "")
+	setHeaderExact(r.Header, "X-B3-SpanId", spanID)
+	setHeaderExact(r.Header, "X-B3-Sampled", "1")
+}
+
 // clientPassthroughHeaders 是允许从下游客户端原样透传到上游的 Header 白名单。
 //
 // 仅包含「客户端身份 / 会话链路 / SDK 指纹」这类与账号凭据无关的字段。鉴权类字段
@@ -4515,6 +4717,13 @@ func setTraceHeaders(req *http.Request, ids linkIDs) {
 //
 // 语义：客户端真实携带时原样转发（避免网关臆造值造成特征偏差）；未携带时由
 // backendHeaders 回退到合成值。
+//
+// 白名单只收「WorkBuddy 客户端族专有的身份头」：只有官方客户端会发送它们，
+// 透传即等于复现官方值。两类**不收**（改为一律按 Profile 合成）：
+//   - `User-Agent`：第三方下游（Claude Code 等）会带自己的 UA
+//     （如 `claude-cli/2.x (external, cli)`），透传后上游会看到「WorkBuddy 的
+//     IDE 头 + 别的客户端的 UA」这种官方客户端不可能产生的组合；
+//   - `x-stainless-*`：同理会带对方 SDK 的包版本（Anthropic SDK ≠ openai 6.25.0）。
 //
 // 注意：链路 ID 类头（X-Conversation-*、X-Root-Request-ID、X-Trace-ID、X-Request-ID、
 // traceparent、b3、X-B3-*）**不在此列**，它们由 resolveLinkIDs 统一决定。原因是这些头
@@ -4541,7 +4750,6 @@ var clientPassthroughHeaders = []string{
 	// B3 采样标志（链路 ID 本身由 resolveLinkIDs 决定，见上）
 	"X-B3-Sampled",
 	"x-requested-with",
-	"User-Agent",
 	"Accept",
 }
 
@@ -4556,22 +4764,14 @@ func applyClientPassthrough(dst *http.Request, in http.Header) {
 			setHeaderExact(dst.Header, name, v)
 		}
 	}
-	// OpenAI SDK（stainless）指纹族按前缀整体透传。客户端发出的键名为全小写，
-	// 故透传时同样写全小写（Go 服务端已把入站键名规范化为 X-Stainless-*，
-	// 这里统一还原为客户端实际发送的小写形态）。
-	for name, vals := range in {
-		if len(vals) == 0 || !strings.HasPrefix(strings.ToLower(name), "x-stainless-") {
-			continue
-		}
-		setHeaderExact(dst.Header, strings.ToLower(name), vals[0])
-	}
 }
 
 // stainlessFingerprint 复刻官方客户端 chat 链路的 OpenAI Node SDK（stainless）指纹族。
 // 客户端 chat 请求由 bundled openai SDK 发出，因此上游始终能看到这一组头；
 // 网关自身用 Go net/http 发起请求，若不合成即为可识别的缺失特征。
-// 取值来自真实抓包（WorkBuddyAI desktop 5.5.2 / Node v22.22.2）。
-// 键名为全小写：openai SDK 以全小写发出这一族头，上游按原样可见。
+// 取值来自真实抓包与客户端运行时探测。`x-stainless-runtime-version` 随宿主客户端版本走，
+// 故不在此表中，而由各站点 Profile 的 NodeVersion 提供（见 upstreamProfile）。
+// 用系统 Node（如 v24.x）或臆造值的安装会与桌面客户端不一致。
 var stainlessFingerprint = map[string]string{
 	"x-stainless-arch":            "x64",
 	"x-stainless-lang":            "js",
@@ -4579,14 +4779,13 @@ var stainlessFingerprint = map[string]string{
 	"x-stainless-package-version": "6.25.0",
 	"x-stainless-retry-count":     "0",
 	"x-stainless-runtime":         "node",
-	"x-stainless-runtime-version": "v22.22.2",
 }
 
 // backendHeaders 设置上游专用鉴权 Header 与链路追踪 Header（按站点 Profile 生成）。
 //
 // 与真实客户端实测流量的对齐要点：
 //   - 不发送 X-Client-ID / X-Client-Version：官方客户端全库无此字段，属可静态识别的机器特征。
-//   - X-Request-ID 为 32 位 hex（客户端 generateUUUID().replace(/-/g,"")），
+//   - X-Request-ID 为 32 位 hex（客户端 uuidv7().replace(/-/g,"")），
 //     与 X-Trace-ID 解耦：后者是 OTel traceId，全链路同一值。
 //   - 补齐会话/Agent/IDE 骨架、OTel + B3 双份传播头与 stainless 指纹族，缺失同样是可识别特征。
 //   - 下游客户端自带身份头时优先透传（applyClientPassthrough），仅在缺失时合成。
@@ -4613,10 +4812,18 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, in
 	// （国际站 product.json 的 DisableYuanbaoChannel=true ⇒ 恒为 true）。
 	setHeaderExact(req.Header, "X-Private-Data", "true")
 
+	// 本地网关安全头。客户端对模型请求恒发送该头，取值恒为 "1"
+	// （源码 withSecurityHeader 注入；桌面宿主 daemon-bootstrap 的模型请求构造器
+	// 亦为其模型请求显式 set。抓包实测：CLI 直连与桌面宿主两条链路均携带，且
+	// 目标为非回环地址时同样携带 —— 它不是仅对本地网关生效的头）。
+	setHeaderExact(req.Header, "x-codebuddy-request", "1")
+
 	// OpenAI SDK 指纹族
 	for k, v := range stainlessFingerprint {
 		setHeaderExact(req.Header, k, v)
 	}
+	// 运行该 SDK 的 Node 进程版本随宿主客户端走（国际站 5.7.6 → v22.21.1；国内站 5.5.2 → v22.22.2）。
+	setHeaderExact(req.Header, "x-stainless-runtime-version", prof.NodeVersion)
 
 	// 客户端自带身份/链路头优先（覆盖上面的合成值）
 	applyClientPassthrough(req, in)
@@ -4640,6 +4847,10 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, in
 
 	if sa != nil && sa.Account.EnterpriseID != "" {
 		setHeaderExact(req.Header, "X-Enterprise-Id", sa.Account.EnterpriseID)
+		// 客户端 AuthenticationHttpInterceptor 在账号存在 enterpriseId 时无条件补 X-Tenant-Id
+		// （源码中该分支唯一的例外是 X-No-Enterprise-Id：它只拦 X-Enterprise-Id，不拦 X-Tenant-Id），
+		// 取值与 X-Enterprise-Id 相同；企业账号请求缺失该头即为可识别偏差。
+		setHeaderExact(req.Header, "X-Tenant-Id", sa.Account.EnterpriseID)
 	} else if !authed {
 		setHeaderExact(req.Header, "X-No-Enterprise-Id", "true")
 		setHeaderExact(req.Header, "X-No-Department-Info", "true")
@@ -4656,6 +4867,13 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, in
 	}
 
 	setHeaderExact(req.Header, "X-Product", prof.Product)
+
+	// 传输层头。客户端（Node http 模块）对模型请求恒发送 `Connection: keep-alive`，
+	// 位置在头部块末位（见 .client_ref/capture2.jsonl 实测：Content-Length / Host /
+	// Connection 恒为最后三位）。Go transport 默认不写该头，缺失即为可识别偏差；
+	// 显式提供时 Go 会原样写出（Connection 不在 reqWriteExcludeHeader 内），
+	// 且请求语义不变（HTTP/1.1 默认即长连接）。
+	setHeaderExact(req.Header, "Connection", "keep-alive")
 }
 
 // commonHeaders 按站点 Profile 设置通用 Header。
@@ -4672,6 +4890,184 @@ func commonHeaders(req *http.Request, prof *upstreamProfile) {
 	setHeaderExact(req.Header, "X-IDE-Type", prof.PlatformName)
 	setHeaderExact(req.Header, "X-IDE-Name", prof.PlatformName)
 	setHeaderExact(req.Header, "X-IDE-Version", prof.PlatformVersion)
+}
+
+// daemonHeaders 设置桌面客户端**守护进程**（`workbuddy-server`）接口的 Header。
+//
+// 第三套头集合。守护进程经注入的 `serverFetch = (e,t)=>fetch(e,t)`（Electron 主进程的
+// Node 全局 fetch = undici，见 `main/index.js` 的 `serverFetch` 注入）发出请求，头表来自
+// `main/server.js` 的 `buildAuthHeaders`，与 axios 控制面（`controlHeaders`）、模型请求
+// （`backendHeaders`）都**不同**：
+//
+//	{Accept: application/json, Authorization, X-User-Id, X-Enterprise-Id, X-Tenant-Id,
+//	 X-Domain, X-B3-TraceId, X-B3-SpanId, X-B3-Sampled:"1", X-Trace-Id, b3:`${trace}-${span}-1`,
+//	 X-Request-ID}
+//
+// 关键差别（逐条对应源码与实测）：
+//   - 自动头来自 undici 而非 axios：`user-agent: node`、`accept-encoding: gzip, deflate`、
+//     `accept-language: *`、`sec-fetch-mode: cors`、`connection: keep-alive`
+//     （客户端运行时 Electron 37.10.3 / Node 22.21.1 / undici 6.22.0 实测逐字）。
+//   - 链路头键名是 `X-Trace-Id`（非 `X-Trace-ID`），`b3` 只有三段且无尾空段
+//     （axios 侧是四段 `${trace}-${span}-1-`），`X-Request-ID` 取 `X-Trace-Id`。
+//   - **没有** `X-IDE-*` / `X-Agent-*` / `x-stainless-*` / `X-Product` / `traceparent`。
+//   - GET 不设 `Content-Type`（`includeJsonContentType:false`），也无 `X-Domain` 缺省回退。
+func daemonHeaders(req *http.Request, sa *StoredAuth) {
+	setHeaderExact(req.Header, "Accept", "application/json")
+	// undici 自动头（客户端运行时实测，大小写逐字）。
+	// User-Agent 需要两步：Go 的 transport 只在 `Header` 里存在**规范化键** `User-Agent`
+	// 时才用它的值（否则回退 `Go-http-client/1.1`），而客户端发的是全小写 `user-agent`。
+	// 故把规范化键置空（transport 视为「显式不发送」并跳过），再写入小写键由 writeSubset 原样输出。
+	setHeaderExact(req.Header, "User-Agent", "")
+	setHeaderExact(req.Header, "user-agent", "node")
+	setHeaderExact(req.Header, "accept-encoding", "gzip, deflate")
+	setHeaderExact(req.Header, "accept-language", "*")
+	setHeaderExact(req.Header, "sec-fetch-mode", "cors")
+	setHeaderExact(req.Header, "Connection", "keep-alive")
+	if sa == nil {
+		return
+	}
+	if sa.Auth.AccessToken != "" {
+		setHeaderExact(req.Header, "Authorization", "Bearer "+sa.Auth.AccessToken)
+	}
+	if sa.Account.UID != "" {
+		setHeaderExact(req.Header, "X-User-Id", sa.Account.UID)
+	}
+	if sa.Account.EnterpriseID != "" {
+		setHeaderExact(req.Header, "X-Enterprise-Id", sa.Account.EnterpriseID)
+		setHeaderExact(req.Header, "X-Tenant-Id", sa.Account.EnterpriseID)
+	}
+	if sa.Auth.Domain != "" {
+		setHeaderExact(req.Header, "X-Domain", sa.Auth.Domain)
+	}
+	traceID, spanID := newTraceID(), newSpanID()
+	setHeaderExact(req.Header, "X-B3-TraceId", traceID)
+	setHeaderExact(req.Header, "X-B3-SpanId", spanID)
+	setHeaderExact(req.Header, "X-B3-Sampled", "1")
+	setHeaderExact(req.Header, "X-Trace-Id", traceID)
+	setHeaderExact(req.Header, "b3", traceID+"-"+spanID+"-1")
+	setHeaderExact(req.Header, "X-Request-ID", traceID)
+}
+
+// controlHeaders 设置控制面请求（登录、令牌轮询/续期、账号快照）的 Header。
+//
+// 这类请求由客户端 axios 实例（RestOperations）发出，与模型请求（openai SDK + 客户端
+// 自建头表）的头部集合**不同**，实测（CLI 2.156.0 直连非回环地址抓包）：
+//   - Accept 为 axios 默认的 `application/json, text/plain, */*`（模型请求为单一 application/json）
+//   - `X-Requested-With` 为规范化大小写（axios 侧经规范化；模型请求是小写 x-requested-with）
+//   - 不携带 X-IDE-* / X-Agent-* / X-Conversation-* / x-stainless-*（这些只出现在模型请求）
+//   - X-Product 由 ProductEndpointHttpInterceptor 对**每个**请求注入（值取 deploymentType，回退 SaaS）
+//
+// 照搬模型请求的头表会同时产生「多出官方控制面请求没有的头」与「缺失官方控制面请求
+// 必带的头」两类偏差，故控制面必须走这一套。
+func controlHeaders(req *http.Request, prof *upstreamProfile) {
+	setHeaderExact(req.Header, "Content-Type", "application/json")
+	setHeaderExact(req.Header, "Accept", "application/json, text/plain, */*")
+	setHeaderExact(req.Header, "X-Requested-With", "XMLHttpRequest")
+	setHeaderExact(req.Header, "User-Agent", buildUserAgent(prof))
+	setHeaderExact(req.Header, "X-Product", prof.Product)
+	// 控制面请求由 Node HTTP 栈发出，实测带完整的 Accept-Encoding（模型请求反而不带）。
+	// 响应解压由 doJSONContext 显式处理（transport 已禁用自动压缩）。
+	setHeaderExact(req.Header, "Accept-Encoding", "gzip, compress, deflate, br")
+}
+
+// loginStateHeaders 复刻客户端 fetchAuthState 的请求头集合（login 链路第一步）。
+//
+// 源码逐字（cli-external-link / account-scoped 两套实现同形）：
+//
+//	post(`/v2${prefixPath}/auth/state?platform=${authentication?.attributes?.platform ?? platform}`, {},
+//	     {headers:{...this.enterpriseHeaders(), ...traceSpan.requestHeaders,
+//	               "X-No-Authorization":"true","X-No-User-Id":"true",
+//	               "X-No-Enterprise-Id":"true","X-No-Department-Info":"true"}})
+//
+// enterpriseHeaders() 无参时 X-Domain 取 configuration.authentication.endpoint || endpoint
+// 的 authority，即站点主机名（www.workbuddy.ai）。
+func loginStateHeaders(prof *upstreamProfile) func(*http.Request) {
+	domain := prof.domain()
+	return func(r *http.Request) {
+		controlHeaders(r, prof)
+		controlNoAuth(r, true)
+		setHeaderExact(r.Header, "X-Domain", domain)
+		setControlTraceHeaders(r)
+	}
+}
+
+// loginPollHeaders 复刻客户端 loopGetToken 的请求头集合（auth/token 轮询）。
+//
+// 源码：`get(`/v2${prefixPath}/auth/token?state=${state}`, {headers:{...traceSpan.requestHeaders,
+// "X-No-Authorization":"true","X-No-User-Id":"true","X-No-Enterprise-Id":"true","X-No-Department-Info":"true"}})`
+//
+// 与 auth/state 的唯一差别：**不带** X-Domain（该步不调 enterpriseHeaders）。
+func loginPollHeaders(prof *upstreamProfile) func(*http.Request) {
+	return func(r *http.Request) {
+		controlHeaders(r, prof)
+		controlNoAuth(r, true)
+		setControlTraceHeaders(r)
+	}
+}
+
+// loginAccountHeaders 复刻客户端 loopGetAccount 的请求头集合（登录成功后取账号快照）。
+//
+// 源码：`get(`/v2${prefixPath}/login/account?state=${state}`, {headers:{...this.enterpriseHeaders(auth),
+// Authorization:`Bearer ${auth.accessToken}`, ...traceSpan.requestHeaders,
+// "X-No-User-Id":"true","X-No-Enterprise-Id":"true","X-No-Department-Info":"true"}})`
+//
+// 该步必带 Authorization，故**不声明** X-No-Authorization；X-Domain 取 token 的 domain
+// （enterpriseHeaders(auth) = auth.domain || URI.parse(endpoint).authority）。
+func loginAccountHeaders(prof *upstreamProfile, accessToken, domain string) func(*http.Request) {
+	if domain == "" {
+		domain = prof.domain()
+	}
+	return func(r *http.Request) {
+		controlHeaders(r, prof)
+		controlNoAuth(r, false)
+		setHeaderExact(r.Header, "Authorization", "Bearer "+accessToken)
+		setHeaderExact(r.Header, "X-Domain", domain)
+		setControlTraceHeaders(r)
+	}
+}
+
+// controlNoAuth 声明控制面请求「不带身份类凭据」，复刻客户端 AuthenticationHttpInterceptor
+// 的跳过语义：任一 X-No-* 置 "true" 即跳过对应头的自动注入。
+//
+// 客户端在各登录步骤里成组声明：
+//   - auth/state：X-No-Authorization / X-No-User-Id / X-No-Enterprise-Id / X-No-Department-Info
+//   - auth/token 轮询：同上四项
+//   - login/account：X-No-User-Id / X-No-Enterprise-Id / X-No-Department-Info（该步必带 Authorization）
+func controlNoAuth(req *http.Request, noAuthorization bool) {
+	if noAuthorization {
+		setHeaderExact(req.Header, "X-No-Authorization", "true")
+	}
+	setHeaderExact(req.Header, "X-No-User-Id", "true")
+	setHeaderExact(req.Header, "X-No-Enterprise-Id", "true")
+	setHeaderExact(req.Header, "X-No-Department-Info", "true")
+}
+
+// readControlBody 读取控制面响应体并按 Content-Encoding 解压。
+//
+// 上游对控制面响应通常不压缩（241 字节的 auth/state 实测无 Content-Encoding），
+// 但客户端声明了 br，故这里对未知编码显式报错，避免把压缩字节当 JSON 解析。
+func readControlBody(resp *http.Response) ([]byte, error) {
+	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	switch enc {
+	case "", "identity":
+		return io.ReadAll(resp.Body)
+	case "gzip", "x-gzip":
+		zr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("解压上游 gzip 响应失败: %w", err)
+		}
+		defer zr.Close()
+		return io.ReadAll(zr)
+	case "deflate":
+		zr, err := zlib.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("解压上游 deflate 响应失败: %w", err)
+		}
+		defer zr.Close()
+		return io.ReadAll(zr)
+	default:
+		return nil, fmt.Errorf("上游响应使用了网关不支持的压缩编码 %q", enc)
+	}
 }
 
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
@@ -4697,7 +5093,12 @@ func doJSONContext(ctx context.Context, client *http.Client, method, fullURL str
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	// 控制面请求显式声明了 Accept-Encoding（见 controlHeaders），transport 又禁用了自动压缩，
+	// 故此处自行解压：gzip / deflate 由标准库覆盖，其余（如 br）明确报错而非静默解析失败。
+	raw, err := readControlBody(resp)
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
 	if resp.StatusCode >= 400 {
 		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d: %s", resp.StatusCode, string(raw))
 	}

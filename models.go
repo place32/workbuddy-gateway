@@ -196,11 +196,11 @@ func fetchLiveCatalog(edition string) ([]catalogModel, int, error) {
 func fetchLiveCatalogByAuth(auth *StoredAuth) ([]catalogModel, int, error) {
 	prof := profileForEdition(auth.Edition)
 	headers := func(r *http.Request) {
-		// 网关自发请求（无下游请求上下文）：链路 ID 以零值 sessionScope 合成，
-		// 不臆造会话关联；鉴权头、站点头与白名单由 backendHeaders 统一设置，
-		// 与 probe 链路口径一致，且不发送 X-Client-ID / X-Client-Version
-		// （官方客户端全库无此字段，属可静态识别特征）。
-		backendHeaders(r, auth, prof, nil, sessionScope{})
+		// 该接口（`/v2/enterprises/personal/models`）在官方客户端里只由守护进程
+		// （`workbuddy-server` 的 `listAvailableModels`）经 Node fetch 调用，故走守护进程头家族：
+		// 无 X-IDE-* / x-stainless-* / traceparent，自动头为 undici 的 `user-agent: node` 等。
+		// 旧实现复用模型请求头集合（backendHeaders），是官方客户端不可能产生的组合。
+		daemonHeaders(r, auth)
 	}
 	data, status, err := doJSON(cfg.HttpClient, http.MethodGet, prof.Base+modelsPath, headers, nil)
 	if err != nil {

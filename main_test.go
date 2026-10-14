@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -116,25 +117,57 @@ func TestProfileForEdition(t *testing.T) {
 			t.Errorf("profileForEdition(%q).Key = %s, want %s", c.edition, got, c.wantKey)
 		}
 	}
-	if p := profileForEdition("intl"); p.Base != "https://www.workbuddy.ai" || p.PlatformName != "CLI" {
+	if p := profileForEdition("intl"); p.Base != "https://www.workbuddy.ai" || p.PlatformName != "WorkBuddy" {
 		t.Errorf("intl profile base/platformName unexpected: %+v", p)
 	}
 	if p := profileForEdition("cn"); p.Base != "https://copilot.tencent.com" || p.Platform != "VSCode" {
 		t.Errorf("cn profile base/platform unexpected: %+v", p)
 	}
 	// 国内站桌面：X-IDE-* 仍是 CodeBuddy/5.5.2，UA 的 platform 与 applicationName 是 WorkBuddy。
-	// 国际站 CLI 直连抓包为 CLI/2.137.1，不再发桌面三段 UA。
+	// 国际站：同一桌面宿主（WorkBuddyAI desktop 5.7.6 + bundled CLI 2.156.0）注入的
+	// CLIENT_INFO_* 决定身份 —— X-IDE-* 与 UA 的 platform 都是宿主产品标识 WorkBuddy，
+	// 宿主版本取 app.getVersion()（5.7.6），UA 尾段为 bundled CLI 包版本（2.156.0）。
 	if p := &profileCN; p.PlatformVersion != "5.5.2" || p.CliVersion != "2.137.1" || p.PlatformName != "CodeBuddy" || p.AppName != "WorkBuddy" || p.ProductName != "WorkBuddy AI" {
 		t.Errorf("cn client version baseline unexpected: %+v", p)
 	}
 	if ua := buildUserAgent(&profileCN); ua != "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1" {
 		t.Errorf("cn user agent = %q", ua)
 	}
-	if p := &profileINTL; p.PlatformVersion != "2.137.1" || p.CliVersion != "" || p.PlatformName != "CLI" || p.ProductName != "WorkBuddy AI" || p.AppName != "" {
+	if p := &profileINTL; p.PlatformVersion != "5.7.6" || p.CliVersion != "2.156.0" || p.PlatformName != "WorkBuddy" || p.ProductName != "WorkBuddy AI" || p.AppName != "WorkBuddy" || !p.GzipBody {
 		t.Errorf("intl client version baseline unexpected: %+v", p)
 	}
-	if ua := buildUserAgent(&profileINTL); ua != "CLI/2.137.1 WorkBuddy AI/2.137.1" {
+	if ua := buildUserAgent(&profileINTL); ua != "WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0" {
 		t.Errorf("intl user agent = %q", ua)
+	}
+	// 国际站 product.json features.RequestBodyGzip = true；国内站未观测到该特性，保持不压缩。
+	if profileCN.GzipBody {
+		t.Error("cn profile must not gzip model request bodies (no evidence of the feature flag)")
+	}
+}
+
+// x-stainless-runtime-version 是「运行 bundled OpenAI SDK 的 Node 进程」版本，随宿主客户端
+// 自带的 Electron 走，故两站基线不同（5.7.6 → v22.21.1，5.5.2 → v22.22.2）。
+// 用同一个常数覆盖两站，必然使其中一站的模型请求带上对方客户端的 Node 版本。
+func TestStainlessNodeVersionFollowsProfile(t *testing.T) {
+	sa := &StoredAuth{
+		Auth:    StoredTokens{AccessToken: "tok", Domain: "www.workbuddy.ai"},
+		Account: StoredAccount{UID: "u"},
+	}
+	for _, c := range []struct {
+		prof *upstreamProfile
+		want string
+	}{
+		{&profileCN, "v22.22.2"},
+		{&profileINTL, "v22.21.1"},
+	} {
+		req, err := http.NewRequest(http.MethodPost, c.prof.chatURL(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		backendHeaders(req, sa, c.prof, nil, sessionScope{})
+		if got := getHeaderExact(req.Header, "x-stainless-runtime-version"); got != c.want {
+			t.Errorf("%s 站 x-stainless-runtime-version = %q, want %q", c.prof.Key, got, c.want)
+		}
 	}
 }
 
@@ -562,6 +595,31 @@ func TestCheckinAccountCNAndSkipIntl(t *testing.T) {
 		}
 		if r.Header.Get("Authorization") != "Bearer test-access" || r.Header.Get("X-User-Id") != "user-1" {
 			t.Errorf("missing checkin auth headers")
+		}
+		// 签到是控制面接口（客户端 `checkin()` 经 axios `RestOperations`），
+		// 不得带模型请求专有头或已移除的自造头 X-Client-Platform。
+		for name, want := range map[string]string{
+			"X-Requested-With": "XMLHttpRequest",
+			"Accept":           "application/json, text/plain, */*",
+			"X-Product":        "SaaS",
+			"User-Agent":       "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1",
+		} {
+			if got := r.Header.Get(name); got != want {
+				t.Errorf("%s = %q, want %q", name, got, want)
+			}
+		}
+		if r.Header.Get("X-Request-ID") != r.Header.Get("X-Trace-ID") {
+			t.Error("控制面 X-Request-ID 必须等于 X-Trace-ID")
+		}
+		// 凭据未记录 domain 时回退站点主机（客户端为 auth.domain 或 endpoint authority）
+		if r.Header.Get("X-Domain") == "" {
+			t.Error("签到请求缺少 X-Domain")
+		}
+		for _, name := range []string{"X-Client-Platform", "X-IDE-Type", "x-stainless-runtime",
+			"x-codebuddy-request", "traceparent", "X-Conversation-ID", "X-Refresh-Token"} {
+			if v := r.Header.Get(name); v != "" {
+				t.Errorf("签到请求不得携带 %s=%q", name, v)
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{}}`))
@@ -1800,16 +1858,15 @@ func TestChatCompletionToResponses(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 // realClientChatHeaders 是官方客户端发往国际站 /v2/chat/completions 的真实请求头基线，
-// 逐字取自 WorkBuddyAI desktop 5.5.2 内置 CLI（包版本 2.137.1）直连 www.workbuddy.ai 的抓包。
+// 逐字取自 WorkBuddyAI desktop 5.7.6 驱动内置 CLI（包版本 2.156.0）直连非回环地址的抓包。
 //
 // 基线含两类不参与应用层对齐的头：
 //   - 传输层：Host / Content-Length / Connection（由 net/http 自行管理）
-//   - 客户端本地网关安全头：x-codebuddy-request（源码 GatewayLocalServer 模块的
-//     withSecurityHeader 注入，仅存在于「客户端 → 本地网关」这一跳）
+//   - Content-Encoding：由 upstreamBody 在 doUpstreamRequest 里按站点特性写入
+//     （gateway 只在「拼头」阶段比对，压缩在发送阶段，见 TestIntlModelRequestBodyIsGzipped）
 //
-// Content-Encoding 不在基线内：CLI 的 GzipRequestProcessor 会在自定义
-// CODEBUDDY_BASE_URL 或非 external/internal/iOA 环境时跳过压缩，8 条直连
-// chat 抓包均为明文 JSON，故网关不压缩请求体。
+// x-codebuddy-request 属应用层基线：客户端对模型请求恒发送该头（withSecurityHeader 注入，
+// 桌面宿主 daemon-bootstrap 的模型请求构造器亦显式 set），且目标为非回环地址时同样携带。
 var realClientChatHeaders = [][2]string{
 	{"Accept", "application/json"},
 	{"Content-Type", "application/json"},
@@ -1820,38 +1877,39 @@ var realClientChatHeaders = [][2]string{
 	{"x-stainless-package-version", "6.25.0"},
 	{"x-stainless-retry-count", "0"},
 	{"x-stainless-runtime", "node"},
-	{"x-stainless-runtime-version", "v22.22.2"},
-	{"X-Conversation-ID", "0edc8165-3397-45c0-868f-7bec387c59d0"},
-	{"X-Conversation-Request-ID", "20802ec4240a004114f732205b0440d7"},
+	{"x-stainless-runtime-version", "v22.21.1"},
+	{"X-Conversation-ID", "01a1382f-91d3-714c-a1ef-0487655ec2b0"},
+	{"X-Conversation-Request-ID", "01a1382f925a7f33b5adbd0105db2289"},
 	{"X-Agent-Intent", "craft"},
 	{"X-Agent-Purpose", "conversation"},
-	{"X-IDE-Type", "CLI"},
-	{"X-IDE-Name", "CLI"},
-	{"X-IDE-Version", "2.137.1"},
+	{"X-IDE-Type", "WorkBuddy"},
+	{"X-IDE-Name", "WorkBuddy"},
+	{"X-IDE-Version", "5.7.6"},
 	{"X-Private-Data", "true"},
-	{"X-Request-ID", "83b09525d5f549109803065dc21ed0d6"},
-	{"X-Conversation-Message-ID", "83b09525d5f549109803065dc21ed0d6"},
-	{"X-Root-Request-ID", "20802ec4240a004114f732205b0440d7"},
+	{"x-codebuddy-request", "1"},
+	{"X-Request-ID", "01a1382f93107f5b9a4fff258e4f34f4"},
+	{"X-Conversation-Message-ID", "01a1382f93107f5b9a4fff258e4f34f4"},
+	{"X-Root-Request-ID", "01a1382f925a7f33b5adbd0105db2289"},
 	{"X-Agent-Type", "main"},
-	{"traceparent", "00-20802ec4240a004114f732205b0440d7-11e637a02b970059-01"},
-	{"b3", "20802ec4240a004114f732205b0440d7-11e637a02b970059-1-6698cfe1242e783c"},
-	{"X-B3-TraceId", "20802ec4240a004114f732205b0440d7"},
-	{"X-B3-ParentSpanId", "6698cfe1242e783c"},
-	{"X-B3-SpanId", "11e637a02b970059"},
+	{"traceparent", "00-db2fa486083cae43e282286363b59112-12bbcfc116d7a52b-01"},
+	{"b3", "db2fa486083cae43e282286363b59112-12bbcfc116d7a52b-1-6afdfbcaf2b0a3a7"},
+	{"X-B3-TraceId", "db2fa486083cae43e282286363b59112"},
+	{"X-B3-ParentSpanId", "6afdfbcaf2b0a3a7"},
+	{"X-B3-SpanId", "12bbcfc116d7a52b"},
 	{"X-B3-Sampled", "1"},
-	{"X-Trace-ID", "20802ec4240a004114f732205b0440d7"},
+	{"X-Trace-ID", "db2fa486083cae43e282286363b59112"},
 	// 基线中为真实 Bearer JWT，此处保留前缀（仅校验存在性与方案，不校验具体令牌）
 	{"Authorization", "Bearer eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJXVzhVVkZuS0l"},
 	{"X-User-Id", "8efc9f5d-4289-445e-b503-c8a49eeb52c5"},
 	{"X-Domain", "www.workbuddy.ai"},
 	{"X-Product", "SaaS"},
-	{"User-Agent", "CLI/2.137.1 WorkBuddy AI/2.137.1"},
+	{"User-Agent", "WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0"},
 }
 
 // nonApplicationHeaders 是不参与应用层对齐的头。
 var nonApplicationHeaders = map[string]bool{
 	"Host": true, "Content-Length": true, "Connection": true,
-	"X-Codebuddy-Request": true,
+	"Content-Encoding": true,
 }
 
 // 上游请求头指纹必须与真实客户端逐项一致：不多、不少、关键字段形态正确。
@@ -1952,6 +2010,16 @@ func TestUpstreamFingerprintMatchesRealClient(t *testing.T) {
 	if cid := getHeaderExact(h, "X-Conversation-ID"); len(cid) != 36 || strings.Count(cid, "-") != 4 {
 		t.Errorf("X-Conversation-ID = %q, want dashed UUID", cid)
 	}
+	// 4b. ID 必须为 UUID v7 形态：客户端用 uuidv7 生成会话/消息 ID（版本位恒为 7，
+	// 前 48 位为毫秒时间戳），随机 v4 属可静态识别的偏差。
+	for _, n := range []string{"X-Request-ID", "X-Conversation-Message-ID"} {
+		if v := getHeaderExact(h, n); v[12] != '7' {
+			t.Errorf("%s = %q, want UUIDv7 version nibble '7'", n, v)
+		}
+	}
+	if cid := getHeaderExact(h, "X-Conversation-ID"); strings.ReplaceAll(cid, "-", "")[12] != '7' {
+		t.Errorf("X-Conversation-ID = %q, want UUIDv7 version nibble '7'", cid)
+	}
 
 	// 5. 链路传播头必须互相自洽
 	traceID := getHeaderExact(h, "X-Trace-ID")
@@ -1999,27 +2067,149 @@ func TestUnauthedRequestDeclaresNoAuth(t *testing.T) {
 	}
 }
 
-// x-codebuddy-request 是客户端本地网关安全头，网关不得自行合成（会构成假特征），
-// 但客户端真带上时必须原样透传；同时客户端身份/会话头应优先于网关合成值。
+// 登录链路三步（auth/state → auth/token 轮询 → login/account）的头集合必须与客户端
+// 源码逐项一致：控制面走 axios 族（与模型请求不同），且三步的 X-No-* / X-Domain /
+// Authorization 组合各自不同。上游只看这三个请求就能分辨「官方客户端登录」与「自造客户端」。
+func TestLoginControlPlaneHeadersMatchClient(t *testing.T) {
+	prof := &profileINTL
+	controlOnly := map[string]string{
+		"Accept":           "application/json, text/plain, */*",
+		"Content-Type":     "application/json",
+		"X-Requested-With": "XMLHttpRequest",
+		"User-Agent":       "WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0",
+		"X-Product":        "SaaS",
+		"Accept-Encoding":  "gzip, compress, deflate, br",
+	}
+	// 控制面请求不得出现模型请求专有的头，也不得出现任何 x-stainless-*。
+	mustBeAbsent := []string{
+		"X-IDE-Type", "X-IDE-Name", "X-IDE-Version", "X-Agent-Type", "X-Agent-Intent",
+		"X-Agent-Purpose", "X-Private-Data", "x-codebuddy-request",
+		"X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID",
+		"X-Root-Request-ID", "X-Parent-Conversation-ID", "X-Session-ID",
+		// traceparent 只出现在模型请求链路；控制面的 traceSpan.requestHeaders 不含它
+		"traceparent",
+		"x-stainless-arch", "x-stainless-lang", "x-stainless-os", "x-stainless-package-version",
+		"x-stainless-retry-count", "x-stainless-runtime", "x-stainless-runtime-version",
+	}
+
+	steps := []struct {
+		name    string
+		headers func(*http.Request)
+		want    map[string]string
+		absent  []string
+	}{
+		{
+			name:    "auth/state",
+			headers: loginStateHeaders(prof),
+			want: map[string]string{
+				"X-Domain":             "www.workbuddy.ai",
+				"X-No-Authorization":   "true",
+				"X-No-User-Id":         "true",
+				"X-No-Enterprise-Id":   "true",
+				"X-No-Department-Info": "true",
+			},
+		},
+		{
+			name:    "auth/token",
+			headers: loginPollHeaders(prof),
+			want: map[string]string{
+				"X-No-Authorization":   "true",
+				"X-No-User-Id":         "true",
+				"X-No-Enterprise-Id":   "true",
+				"X-No-Department-Info": "true",
+			},
+			// loopGetToken 不调 enterpriseHeaders，故不带 X-Domain
+			absent: []string{"X-Domain"},
+		},
+		{
+			name:    "login/account",
+			headers: loginAccountHeaders(prof, "tok-123", "www.workbuddy.ai"),
+			want: map[string]string{
+				"Authorization":        "Bearer tok-123",
+				"X-Domain":             "www.workbuddy.ai",
+				"X-No-User-Id":         "true",
+				"X-No-Enterprise-Id":   "true",
+				"X-No-Department-Info": "true",
+			},
+			// 该步必带 Authorization，故不声明 X-No-Authorization
+			absent: []string{"X-No-Authorization"},
+		},
+	}
+
+	for _, step := range steps {
+		t.Run(step.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, prof.Base+"/v2/plugin/x", nil)
+			step.headers(req)
+			for k, v := range controlOnly {
+				if got := getHeaderExact(req.Header, k); got != v {
+					t.Errorf("%s = %q, want %q", k, got, v)
+				}
+			}
+			for k, v := range step.want {
+				if got := getHeaderExact(req.Header, k); got != v {
+					t.Errorf("%s = %q, want %q", k, got, v)
+				}
+			}
+			for _, k := range append(mustBeAbsent, step.absent...) {
+				if v := getHeaderExact(req.Header, k); v != "" {
+					t.Errorf("%s must be absent, got %q", k, v)
+				}
+			}
+			// 链路传播头：traceSpan.requestHeaders 的六项，且组内自洽。
+			// X-Request-ID 由 injectRequestIdHeader 取 X-Trace-ID，故两者恒等。
+			trace := getHeaderExact(req.Header, "X-Trace-ID")
+			if len(trace) != 32 || !isHexLen(trace, 32) {
+				t.Errorf("X-Trace-ID = %q, want 32-hex trace id", trace)
+			}
+			if got := getHeaderExact(req.Header, "X-Request-ID"); got != trace {
+				t.Errorf("X-Request-ID = %q, want X-Trace-ID %q (injectRequestIdHeader 取 trace id)", got, trace)
+			}
+			span := getHeaderExact(req.Header, "X-B3-SpanId")
+			if len(span) != 16 || !isHexLen(span, 16) {
+				t.Errorf("X-B3-SpanId = %q, want 16-hex span id", span)
+			}
+			if got := getHeaderExact(req.Header, "X-B3-TraceId"); got != trace {
+				t.Errorf("X-B3-TraceId = %q, want %q", got, trace)
+			}
+			// 无父 span 的控制面请求：b3 末段为空、X-B3-ParentSpanId 为空值
+			if got, want := getHeaderExact(req.Header, "b3"), trace+"-"+span+"-1-"; got != want {
+				t.Errorf("b3 = %q, want %q", got, want)
+			}
+			if v, ok := req.Header["X-B3-ParentSpanId"]; !ok || len(v) != 1 || v[0] != "" {
+				t.Errorf("X-B3-ParentSpanId must be present and empty, got %v", req.Header["X-B3-ParentSpanId"])
+			}
+			if got := getHeaderExact(req.Header, "X-B3-Sampled"); got != "1" {
+				t.Errorf("X-B3-Sampled = %q, want \"1\"", got)
+			}
+		})
+	}
+}
+
+// x-codebuddy-request 是客户端对模型请求恒发送的头（抓包实测，含非回环目标），故网关必须
+// 合成；客户端真带上时以客户端值为准。同时下游客户端的 User-Agent / x-stainless-* 不得透传
+// —— 那是第三方 SDK 的身份（如 claude-cli），会与 WorkBuddy IDE 头形成矛盾组合。
 func TestClientPassthroughAndSynthesisBoundary(t *testing.T) {
 	sa := &StoredAuth{
 		Auth:    StoredTokens{AccessToken: "tok", Domain: "www.workbuddy.ai"},
 		Account: StoredAccount{UID: "u"},
 	}
 
-	// 未携带时不合成
+	// 未携带时也必须合成（客户端恒发该头，缺失即偏差）
 	req, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
 	backendHeaders(req, sa, &profileINTL, nil, sessionScope{})
-	if v := getHeaderExact(req.Header, "x-codebuddy-request"); v != "" {
-		t.Errorf("gateway must not synthesize x-codebuddy-request, got %q", v)
+	if v := getHeaderExact(req.Header, "x-codebuddy-request"); v != "1" {
+		t.Errorf("gateway must synthesize x-codebuddy-request=1, got %q", v)
 	}
 
-	// 携带时透传，且优先于合成值
+	// 客户端携带时透传，且身份头优先于合成值
 	in := http.Header{}
 	in.Set("x-codebuddy-request", "1")
 	in.Set("X-Conversation-ID", "11111111-2222-3333-4444-555555555555")
 	in.Set("X-Agent-Intent", "ask")
-	in.Set("User-Agent", "custom/1.0")
+	in.Set("X-IDE-Version", "9.9.9")
+	in.Set("User-Agent", "claude-cli/2.0.0 (external, cli)")
+	in.Set("x-stainless-package-version", "0.60.0")
+	in.Set("x-stainless-runtime-version", "v24.11.1")
 	req2, _ := http.NewRequest(http.MethodPost, profileINTL.chatURL(), nil)
 	backendHeaders(req2, sa, &profileINTL, in, sessionScope{})
 	if v := getHeaderExact(req2.Header, "x-codebuddy-request"); v != "1" {
@@ -2031,8 +2221,18 @@ func TestClientPassthroughAndSynthesisBoundary(t *testing.T) {
 	if v := getHeaderExact(req2.Header, "X-Agent-Intent"); v != "ask" {
 		t.Errorf("client-provided X-Agent-Intent must win, got %q", v)
 	}
-	if v := getHeaderExact(req2.Header, "User-Agent"); v != "custom/1.0" {
-		t.Errorf("client-provided User-Agent must win, got %q", v)
+	if v := getHeaderExact(req2.Header, "X-IDE-Version"); v != "9.9.9" {
+		t.Errorf("client-provided X-IDE-Version must win, got %q", v)
+	}
+	// 第三方下游的 SDK 身份必须被合成值覆盖，不得出现在上游
+	if v := getHeaderExact(req2.Header, "User-Agent"); v != "WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0" {
+		t.Errorf("downstream User-Agent must not reach upstream, got %q", v)
+	}
+	if v := getHeaderExact(req2.Header, "x-stainless-package-version"); v != "6.25.0" {
+		t.Errorf("downstream x-stainless-package-version must not reach upstream, got %q", v)
+	}
+	if v := getHeaderExact(req2.Header, "x-stainless-runtime-version"); v != "v22.21.1" {
+		t.Errorf("downstream x-stainless-runtime-version must not reach upstream, got %q", v)
 	}
 }
 
@@ -2059,6 +2259,9 @@ func TestClientCannotOverrideCredentialHeaders(t *testing.T) {
 		"X-Domain":        "www.workbuddy.ai",
 		"X-Product":       "SaaS",
 		"X-Enterprise-Id": "ent",
+		// 客户端 AuthenticationHttpInterceptor 在账号有 enterpriseId 时无条件补 X-Tenant-Id，
+		// 取值与 X-Enterprise-Id 相同；下游不得覆盖。
+		"X-Tenant-Id": "ent",
 	} {
 		if got := getHeaderExact(req.Header, name); got != want {
 			t.Errorf("%s = %q, want %q (must come from account pool)", name, got, want)
@@ -2135,9 +2338,12 @@ func TestModelsListReflectsMergedCatalog(t *testing.T) {
 func TestSmokeEndToEndUpstreamHeaders(t *testing.T) {
 	got := make(chan http.Header, 1)
 	gotPath := make(chan string, 1)
+	gotBody := make(chan []byte, 1)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath <- r.URL.Path
 		got <- r.Header.Clone()
+		raw, _ := io.ReadAll(r.Body)
+		gotBody <- raw
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
@@ -2226,15 +2432,35 @@ func TestSmokeEndToEndUpstreamHeaders(t *testing.T) {
 	if v := getHeaderExact(h, "X-Domain"); v != "www.workbuddy.ai" {
 		t.Errorf("X-Domain = %q", v)
 	}
-	// 合成指纹头存在
-	if v := getHeaderExact(h, "User-Agent"); v != "CLI/2.137.1 WorkBuddy AI/2.137.1" {
+	// 合成指纹头存在（国际站 = 桌面宿主 5.7.6 + bundled CLI 2.156.0）
+	if v := getHeaderExact(h, "User-Agent"); v != "WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0" {
 		t.Errorf("User-Agent = %q", v)
 	}
 	if v := getHeaderExact(h, "x-stainless-runtime"); v != "node" {
 		t.Errorf("X-Stainless-Runtime = %q", v)
 	}
-	if v := getHeaderExact(h, "x-codebuddy-request"); v != "" {
-		t.Errorf("must not synthesize x-codebuddy-request, got %q", v)
+	if v := getHeaderExact(h, "x-codebuddy-request"); v != "1" {
+		t.Errorf("x-codebuddy-request = %q, want \"1\"", v)
+	}
+	// 模型请求体按国际站 product.json 的 RequestBodyGzip 压缩
+	if v := getHeaderExact(h, "Content-Encoding"); v != "gzip" {
+		t.Errorf("Content-Encoding = %q, want gzip", v)
+	}
+	select {
+	case raw := <-gotBody:
+		zr, err := gzip.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("upstream body is not gzip: %v", err)
+		}
+		plain, err := io.ReadAll(zr)
+		if err != nil {
+			t.Fatalf("gunzip: %v", err)
+		}
+		if !bytes.Contains(plain, []byte(`"model":"default-model"`)) {
+			t.Errorf("decompressed upstream body = %s", plain)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no upstream body captured")
 	}
 	// 浏览器语义头不得出现
 	if v := h.Get("Origin"); v != "" {
@@ -2492,8 +2718,6 @@ func TestDebugLoggingDoesNotRewriteUpstreamTraceHeaders(t *testing.T) {
 	}
 }
 
-
-
 // 下游只带链路 ID 的一部分时，网关必须按客户端不变量补齐同组伙伴，
 // 而不能让其余头另生成值 —— 后者会产出客户端不可能产生的组合（比缺失更显眼）。
 func TestPartialLinkHeadersAreCompletedCoherently(t *testing.T) {
@@ -2581,6 +2805,34 @@ func TestPartialLinkHeadersAreCompletedCoherently(t *testing.T) {
 //
 // 用裸 TCP 监听而非 httptest.Server：后者会用 net/http 的解析器重新规范化键名，
 // 无法反映真正写到线上的字节。
+// readWireRequest 从一个连接读满一个 HTTP 请求的原始字节（含 body，按 Content-Length）。
+func readWireRequest(conn net.Conn) string {
+	var buf []byte
+	tmp := make([]byte, 4096)
+	for {
+		n, err := conn.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			if idx := bytes.Index(buf, []byte("\r\n\r\n")); idx >= 0 {
+				head := string(buf[:idx])
+				cl := 0
+				for _, line := range strings.Split(head, "\r\n") {
+					if v, ok := strings.CutPrefix(strings.ToLower(line), "content-length:"); ok {
+						cl, _ = strconv.Atoi(strings.TrimSpace(v))
+					}
+				}
+				if len(buf) >= idx+4+cl {
+					break
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	return string(buf)
+}
+
 func captureUpstreamWire(t *testing.T, body string) string {
 	t.Helper()
 
@@ -2597,31 +2849,7 @@ func captureUpstreamWire(t *testing.T, body string) string {
 			return
 		}
 		defer conn.Close()
-		// 读到 Header 结束标记后再按 Content-Length 读满 body
-		var buf []byte
-		tmp := make([]byte, 4096)
-		for {
-			n, err := conn.Read(tmp)
-			if n > 0 {
-				buf = append(buf, tmp[:n]...)
-				if idx := bytes.Index(buf, []byte("\r\n\r\n")); idx >= 0 {
-					head := string(buf[:idx])
-					cl := 0
-					for _, line := range strings.Split(head, "\r\n") {
-						if v, ok := strings.CutPrefix(strings.ToLower(line), "content-length:"); ok {
-							cl, _ = strconv.Atoi(strings.TrimSpace(v))
-						}
-					}
-					if len(buf) >= idx+4+cl {
-						break
-					}
-				}
-			}
-			if err != nil {
-				break
-			}
-		}
-		rawCh <- string(buf)
+		rawCh <- readWireRequest(conn)
 		resp := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n" +
 			"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n" +
 			"data: [DONE]\n\n"
@@ -2723,7 +2951,9 @@ func TestUpstreamWireHeaderCasingMatchesClient(t *testing.T) {
 		"X-User-Id",
 		"X-Domain",
 		"X-Product",
+		"Content-Encoding",
 		"x-requested-with",
+		"x-codebuddy-request",
 		"x-stainless-arch",
 		"x-stainless-lang",
 		"x-stainless-os",
@@ -2758,11 +2988,28 @@ func TestUpstreamWireHeaderCasingMatchesClient(t *testing.T) {
 //
 // 网关此前用 map[string]any 中转再 json.Marshal，导致：键序变字典序（messages 跑到
 // model 之前）、`<` 被转义成 `\u003c`。两者都是无需解析语义、比对字节即可判定的机器特征。
+//
+// 国际站请求体按 product.json 的 RequestBodyGzip 压缩（客户端 GzipRequestProcessor 同款），
+// 故先按 Content-Encoding 还原再比对正文。
 func TestUpstreamWireBodyMatchesClientEncoding(t *testing.T) {
 	// 含 HTML 敏感字符的 system prompt，贴近客户端真实 harness 正文
 	body := `{"model":"deepseek-v3-2-volc","messages":[{"role":"system","content":"a <user_query> b & c > d"},{"role":"user","content":"hi"}]}`
 	raw := captureUpstreamWire(t, body)
 	got := wireBody(t, raw)
+
+	if strings.Contains(raw, "\r\nContent-Encoding: gzip\r\n") {
+		zr, err := gzip.NewReader(strings.NewReader(got))
+		if err != nil {
+			t.Fatalf("body declared gzip but is not: %v", err)
+		}
+		plain, err := io.ReadAll(zr)
+		if err != nil {
+			t.Fatalf("gunzip wire body: %v", err)
+		}
+		got = string(plain)
+	} else {
+		t.Error("intl model request body must declare Content-Encoding: gzip")
+	}
 
 	// 1. model 必须在首位（客户端 JSON.stringify 的插入顺序）
 	if !strings.HasPrefix(got, `{"model":"deepseek-v3-2-volc"`) {
@@ -2791,6 +3038,105 @@ func TestUpstreamWireBodyMatchesClientEncoding(t *testing.T) {
 		t.Errorf("body must not carry a trailing newline")
 	}
 	t.Logf("wire body: %s", truncateForLog(got))
+}
+
+// 登录链路第一步（auth/state）的线上字节必须与客户端逐字一致：键名大小写、必需头、
+// 以及「控制面不该出现的头」（traceparent / X-IDE-* / x-stainless-* / 会话链路头）。
+// 这一跳的差异同样只在比对线上字节时可见，故用原始 TCP 监听器而非 httptest。
+func TestLoginWireHeadersMatchClient(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	rawCh := make(chan string, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		rawCh <- readWireRequest(conn)
+		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 52\r\n\r\n" +
+			`{"code":0,"data":{"state":"s","authUrl":"http://x"}}`))
+	}()
+
+	origBase, origPortal := profileINTL.Base, profileINTL.PortalOrigin
+	profileINTL.Base, profileINTL.PortalOrigin = "http://"+ln.Addr().String(), "http://"+ln.Addr().String()
+	defer func() { profileINTL.Base, profileINTL.PortalOrigin = origBase, origPortal }()
+	origClient := cfg.HttpClient
+	initHTTPClient() // 走生产 transport（DisableCompression 等指纹相关设置）
+	defer func() { cfg.HttpClient = origClient }()
+
+	if _, _, err := doJSON(cfg.HttpClient, http.MethodPost, profileINTL.authStateURL(),
+		loginStateHeaders(&profileINTL), bytes.NewReader([]byte("{}"))); err != nil {
+		t.Fatalf("auth/state: %v", err)
+	}
+
+	var raw string
+	select {
+	case raw = <-rawCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream never received request")
+	}
+
+	if got, want := strings.SplitN(raw, "\r\n", 2)[0],
+		"POST /v2/plugin/auth/state?platform=workbuddy-ai HTTP/1.1"; got != want {
+		t.Errorf("request line = %q, want %q", got, want)
+	}
+	// 客户端实测逐字大小写：axios 族头保持规范化形态，trace 族与 X-Domain 亦然。
+	for _, name := range []string{
+		"Accept", "Content-Type", "Accept-Encoding", "User-Agent", "X-Product",
+		"X-Requested-With", "X-Domain",
+		"X-No-Authorization", "X-No-User-Id", "X-No-Enterprise-Id", "X-No-Department-Info",
+		"X-Trace-ID", "X-Request-ID", "b3", "X-B3-TraceId", "X-B3-ParentSpanId",
+		"X-B3-SpanId", "X-B3-Sampled",
+	} {
+		if !strings.Contains(raw, "\r\n"+name+": ") {
+			t.Errorf("wire is missing header with exact casing %q", name)
+		}
+	}
+	for _, bad := range []string{
+		"traceparent", "X-IDE-Type", "X-Ide-Type", "X-Agent-Intent", "X-Private-Data",
+		"x-codebuddy-request", "X-Codebuddy-Request", "X-Conversation-ID",
+		"X-Conversation-Id", "x-stainless-runtime", "X-Stainless-Runtime",
+		"X-Requested-With-", "X-Domain-",
+	} {
+		if strings.Contains(raw, "\r\n"+bad+": ") {
+			t.Errorf("control-plane wire must not carry %q", bad)
+		}
+	}
+	// 无父 span：b3 末段为空、X-B3-ParentSpanId 为空值
+	if b3 := wireHeader(t, raw, "b3"); !strings.HasSuffix(b3, "-1-") {
+		t.Errorf("b3 = %q, want 4 segments with empty parent", b3)
+	}
+	if p, ok := wireHeaderOK(raw, "X-B3-ParentSpanId"); !ok || p != "" {
+		t.Errorf("X-B3-ParentSpanId = %q (present=%v), want empty value", p, ok)
+	}
+	// X-Request-ID 由 injectRequestIdHeader 取 X-Trace-ID
+	if tid, rid := wireHeader(t, raw, "X-Trace-ID"), wireHeader(t, raw, "X-Request-ID"); tid != rid {
+		t.Errorf("X-Request-ID %q != X-Trace-ID %q", rid, tid)
+	}
+	t.Logf("login wire request line: %s", strings.SplitN(raw, "\r\n", 2)[0])
+}
+
+// wireHeader 取出线上原始头的值（键名区分大小写）。
+func wireHeader(t *testing.T, raw, name string) string {
+	t.Helper()
+	v, ok := wireHeaderOK(raw, name)
+	if !ok {
+		t.Fatalf("wire is missing header %q", name)
+	}
+	return v
+}
+
+func wireHeaderOK(raw, name string) (string, bool) {
+	for _, line := range strings.Split(raw, "\r\n") {
+		if v, ok := strings.CutPrefix(line, name+": "); ok {
+			return v, true
+		}
+	}
+	return "", false
 }
 
 func truncateForLog(s string) string {

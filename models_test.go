@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -111,6 +113,28 @@ func TestFetchLiveCatalogFromServer(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer tok" {
 			t.Errorf("missing auth header")
 		}
+		// 守护进程头家族：undici 自动头 + 身份头，且不带模型请求专有头。
+		for name, want := range map[string]string{
+			"Accept":          "application/json",
+			"User-Agent":      "node",
+			"Accept-Encoding": "gzip, deflate",
+			"Accept-Language": "*",
+			"Sec-Fetch-Mode":  "cors",
+			"X-Trace-Id":      r.Header.Get("X-Request-ID"),
+		} {
+			if got := r.Header.Get(name); got != want {
+				t.Errorf("%s = %q, want %q", name, got, want)
+			}
+		}
+		if r.Header.Get("Content-Type") != "" {
+			t.Errorf("守护进程 GET 不得带 Content-Type，got %q", r.Header.Get("Content-Type"))
+		}
+		for _, name := range []string{"X-IDE-Type", "X-Agent-Type", "x-stainless-runtime",
+			"X-Product", "traceparent", "X-Conversation-ID", "X-Codebuddy-Request"} {
+			if v := r.Header.Get(name); v != "" {
+				t.Errorf("守护进程请求不得携带 %s=%q", name, v)
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{"models":[{"id":"hy3","credits":"x0.20 credits"}],"modelPromotions":[]}}`))
 	}))
@@ -144,6 +168,96 @@ func TestFetchLiveCatalogFromServer(t *testing.T) {
 	if len(models) != 1 || models[0].ID != "hy3" {
 		t.Fatalf("unexpected models: %+v", models)
 	}
+}
+
+// 守护进程头家族的线上字节：键名大小写（`X-Request-ID` / `b3` / `user-agent` 等）
+// 与 `b3` 的段数只在原始 TCP 字节层面可见，经 http.Header 比对必被规范化掩盖。
+func TestCatalogWireHeadersMatchDaemonFetch(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	rawCh := make(chan string, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		rawCh <- readWireRequest(conn)
+		body := `{"code":0,"msg":"OK","data":{"models":[{"id":"hy3","credits":"x0.20 credits"}],"modelPromotions":[]}}`
+		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+			strconv.Itoa(len(body)) + "\r\n\r\n" + body))
+	}()
+
+	accountMu.Lock()
+	prev := accounts
+	accounts = []*Account{{Path: "cn.json", Auth: &StoredAuth{
+		Edition: "cn",
+		Auth:    StoredTokens{AccessToken: "tok", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+		Account: StoredAccount{UID: "u1", EnterpriseID: "ent1"},
+	}}}
+	accountMu.Unlock()
+	oldBase, oldClient := profileCN.Base, cfg.HttpClient
+	profileCN.Base = "http://" + ln.Addr().String()
+	initHTTPClient() // 走生产 transport（DisableCompression 等指纹相关设置）
+	defer func() {
+		accountMu.Lock()
+		accounts = prev
+		accountMu.Unlock()
+		profileCN.Base, cfg.HttpClient = oldBase, oldClient
+	}()
+
+	if _, _, err := fetchLiveCatalog("cn"); err != nil {
+		t.Fatalf("fetchLiveCatalog: %v", err)
+	}
+	var raw string
+	select {
+	case raw = <-rawCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream never received request")
+	}
+
+	if got, want := strings.SplitN(raw, "\r\n", 2)[0], "GET "+modelsPath+" HTTP/1.1"; got != want {
+		t.Errorf("request line = %q, want %q", got, want)
+	}
+	// undici 自动头为全小写，显式头沿用客户端源码的原始大小写。
+	for _, name := range []string{
+		"accept-encoding", "accept-language", "sec-fetch-mode", "user-agent", "Connection",
+		"Accept", "Authorization", "X-User-Id", "X-Enterprise-Id", "X-Tenant-Id",
+		"X-Trace-Id", "X-Request-ID", "X-B3-TraceId", "X-B3-SpanId", "X-B3-Sampled", "b3",
+	} {
+		if !strings.Contains(raw, "\r\n"+name+": ") {
+			t.Errorf("wire is missing header with exact casing %q", name)
+		}
+	}
+	// 模型请求与 axios 控制面的头都不该出现，含被规范化后的形态。
+	for _, bad := range []string{
+		"X-IDE-Type", "X-Ide-Type", "X-Agent-Type", "X-Product", "x-codebuddy-request",
+		"X-Codebuddy-Request", "x-stainless-runtime", "X-Stainless-Runtime", "traceparent",
+		"X-Conversation-ID", "X-Conversation-Id", "X-Requested-With", "B3", "User-Agent",
+		"Content-Type", "Tracestate", "X-Trace-ID",
+	} {
+		if strings.Contains(raw, "\r\n"+bad+": ") {
+			t.Errorf("daemon-fetch wire must not carry %q", bad)
+		}
+	}
+	// b3 三段（与 axios 侧的四段 `${trace}-${span}-1-` 不同），且 X-Request-ID == X-Trace-Id
+	b3 := wireHeader(t, raw, "b3")
+	if parts := strings.Split(b3, "-"); len(parts) != 3 || parts[2] != "1" {
+		t.Errorf("b3 = %q, want 3 segments ending in 1", b3)
+	}
+	if tid, rid := wireHeader(t, raw, "X-Trace-Id"), wireHeader(t, raw, "X-Request-ID"); tid != rid {
+		t.Errorf("X-Request-ID %q != X-Trace-Id %q", rid, tid)
+	}
+	if got := wireHeader(t, raw, "user-agent"); got != "node" {
+		t.Errorf("user-agent = %q, want node", got)
+	}
+	if got := wireHeader(t, raw, "accept-encoding"); got != "gzip, deflate" {
+		t.Errorf("accept-encoding = %q, want gzip, deflate", got)
+	}
+	t.Logf("daemon-fetch wire: %q", strings.Split(raw, "\r\n\r\n")[0])
 }
 
 func TestModelsCacheRoundTripAndMerge(t *testing.T) {

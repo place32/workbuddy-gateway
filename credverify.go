@@ -88,13 +88,24 @@ func verifyAccountUsable(ctx context.Context, auth StoredAuth) (bool, error) {
 		return false, fmt.Errorf("HTTP 客户端未就绪，无法校验")
 	}
 	prof := profileForEdition(auth.Edition)
+	// 校验接口是控制台计费接口（客户端经 axios `RestOperations` 调用），故走控制面头集合；
+	// 旧实现混用模型请求头集合并自造 `X-Client-Platform: web`（客户端全量安装目录 0 命中）。
 	headers := func(r *http.Request) {
-		commonHeaders(r, prof)
-		r.Header.Set("Authorization", "Bearer "+auth.Auth.AccessToken)
-		r.Header.Set("X-Client-Platform", "web")
-		if auth.Account.EnterpriseID != "" {
-			r.Header.Set("X-Enterprise-Id", auth.Account.EnterpriseID)
+		controlHeaders(r, prof)
+		setHeaderExact(r.Header, "Authorization", "Bearer "+auth.Auth.AccessToken)
+		if auth.Account.UID != "" {
+			setHeaderExact(r.Header, "X-User-Id", auth.Account.UID)
 		}
+		if auth.Account.EnterpriseID != "" {
+			setHeaderExact(r.Header, "X-Enterprise-Id", auth.Account.EnterpriseID)
+			setHeaderExact(r.Header, "X-Tenant-Id", auth.Account.EnterpriseID)
+		}
+		if auth.Auth.Domain != "" {
+			setHeaderExact(r.Header, "X-Domain", auth.Auth.Domain)
+		} else {
+			setHeaderExact(r.Header, "X-Domain", prof.domain())
+		}
+		setControlTraceHeadersWithID(r, traceID, newSpanID())
 	}
 	_, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, prof.quotaSummaryURL(), headers, strings.NewReader("{}"))
 	if err != nil {

@@ -249,6 +249,28 @@ func TestQuotaRefreshSeparatesQuotaAndPlanFailures(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer private-test-token" {
 			t.Error("missing authorization")
 		}
+		// 额度与套餐都是控制面接口（客户端经 axios `RestOperations` 调用），
+		// 头集合必须是控制面集合：带 axios 族头，不带模型请求专有头与已移除的自造头。
+		for name, want := range map[string]string{
+			"X-Requested-With": "XMLHttpRequest",
+			"Accept":           "application/json, text/plain, */*",
+			"X-Product":        "SaaS",
+			"User-Agent":       "WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0",
+			"X-Domain":         "www.workbuddy.ai",
+		} {
+			if got := r.Header.Get(name); got != want {
+				t.Errorf("%s = %q, want %q", name, got, want)
+			}
+		}
+		if r.Header.Get("X-Request-ID") != r.Header.Get("X-Trace-ID") {
+			t.Error("控制面 X-Request-ID 必须等于 X-Trace-ID")
+		}
+		for _, name := range []string{"X-Client-Platform", "X-IDE-Type", "x-stainless-runtime",
+			"x-codebuddy-request", "traceparent", "X-Conversation-ID"} {
+			if v := r.Header.Get(name); v != "" {
+				t.Errorf("控制面请求不得携带 %s=%q", name, v)
+			}
+		}
 		if r.URL.Path == "/billing/meter/get-user-resource-summary" {
 			if mode == "summary-fail" {
 				http.Error(w, "failed", 502)

@@ -9,7 +9,9 @@
 
 **v1.14.1**：网页凭据页已移除，新增只读定时任务时间页；执行记录来自现有后端日志，无新增调度模块。高频任务日志按分钟汇总，状态变化即时记录。
 
-**v1.14.2（本 fork）**：合并上游 v1.14.0 / v1.14.1（配置热生效、网页账号/模型/凭据/日志管理、定时任务页、9 目标构建矩阵）与上游 v1.13.17 的 `max_tokens` 输出预算修复，并保留全部 fork 私有能力（思考等级归一化、客户端指纹与字节级对齐、保序 JSON、会话作用域链路 ID、SSE 心跳保真、反审查净化、单账号串行化）。升级本 fork 前的版本时请注意：`config.json` 改为约 1 秒热生效，网页控制台可写（不再只读）。
+**v1.14.2**：合并上游 v1.14.0 / v1.14.1（配置热生效、网页账号/模型/凭据/日志管理、定时任务页、9 目标构建矩阵）与上游 v1.13.17 的 `max_tokens` 输出预算修复，并保留全部 fork 私有能力（思考等级归一化、客户端指纹与字节级对齐、保序 JSON、会话作用域链路 ID、SSE 心跳保真、反审查净化、单账号串行化）。升级本 fork 前的版本时请注意：`config.json` 改为约 1 秒热生效，网页控制台可写（不再只读）。
+
+**v1.14.3（本 fork）**：国际站 Profile 对齐本机安装的桌面客户端 **WorkBuddyAI 5.7.6**（bundled CLI 2.156.0），请求头按**三套家族**拆分（模型请求 / 控制面 axios / 守护进程 undici），并新增**请求头线上顺序对齐**（`wireorder.go`，含 `Connection: keep-alive`）。无配置变化，升级即生效；配置 `-proxy` 时顺序复刻不生效（详见[客户端指纹对齐](#客户端指纹对齐)）。
 
 **同时支持两个上游站点**（同一套 `/v2/plugin/*` 协议，凭据按站点隔离，账号池可混挂轮询）：
 
@@ -1070,31 +1072,88 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 
 网关向上游发起请求时，会按账号所属站点逐项对齐官方客户端的请求头，避免因自造字段或缺失字段形成可静态识别的机器特征。
 
-两套基线来自同一次安装（WorkBuddyAI desktop **5.5.2**，内置 CLI 包版本 **2.137.1**）：
+两套基线来自两次安装抓包：
 
-- **国内站**：桌面宿主。`X-IDE-*` 为 `CodeBuddy` / `5.5.2`，UA 为 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1`。
-- **国际站**：同一安装内置 CLI 直连 `www.workbuddy.ai` 的抓包。`product.json` 的 `platform` 为 `CLI`，`X-IDE-Type` / `X-IDE-Name` / `X-IDE-Version` 均为 `CLI` / `CLI` / `2.137.1`，UA 为 `CLI/2.137.1 WorkBuddy AI/2.137.1`（无桌面三段尾部的 `CLI/`）。
+- **国内站**：桌面宿主 **5.5.2**（内置 CLI 包版本 **2.137.1**）。`X-IDE-*` 为 `CodeBuddy` / `5.5.2`，UA 为 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1`。
+- **国际站**：桌面宿主 **5.7.6**（内置 CLI 包版本 **2.156.0**）驱动其 bundled CLI 直连 `www.workbuddy.ai` 的抓包。桌面宿主以 `CLIENT_INFO_*` 环境变量注入身份（`buildWorkbuddyClientInfoEnv`）：`CLIENT_INFO_PLATFORM` / `CLIENT_INFO_IDE_TYPE` 为 `WorkBuddy`，`CLIENT_INFO_PLATFORM_VERSION` / `PRODUCT_VERSION` / `PLUGIN_VERSION` 为 `app.getVersion()`（`5.7.6`），`CLIENT_INFO_USER_AGENT_EXTENSION` 为 `CLI/2.156.0`。故 `X-IDE-Type` / `X-IDE-Name` / `X-IDE-Version` 为 `WorkBuddy` / `WorkBuddy` / `5.7.6`，UA 为 `WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0`。
+
+> 旧版本曾以「CLI 直连」的裸 CLI 身份（`X-IDE-*` = `CLI`、UA = `CLI/2.137.1 WorkBuddy AI/2.137.1`）作为国际站基线。真实国际版客户端是**桌面宿主 + 内置 CLI**，裸 CLI 身份与之不符：宿主不会发送 `CLI/CLI` 的 `X-IDE-*`，而会注入自己的产品标识。
+
+> 运行时版本也随宿主走：宿主以 `ELECTRON_RUN_AS_NODE=1` 用自带 Electron 二进制启动 CLI，故 `x-stainless-runtime-version` 是 Electron 内置 Node 的版本（国际站 5.7.6 → Electron 37.10.3 → `v22.21.1`；国内站 5.5.2 → `v22.22.2`），不是系统 Node 版本。两站各取自己的实测值（`upstreamProfile.NodeVersion`），不共用一个常数。
 
 **对齐基线**：国际站官方客户端发往 `/v2/chat/completions` 的真实请求头（抓包实测，共 38 项，含传输层头）。
+
+### 三套头集合：模型请求 / 控制面 / 守护进程
+
+客户端用**三套** HTTP 栈，头集合互不相同，照搬任一套去发另一套的请求都会同时产生「多出对方没有的头」与「缺失对方必带的头」两类偏差：
+
+| 家族 | 栈 | 覆盖的请求 |
+|---|---|---|
+| 模型请求 | bundled OpenAI Node SDK + 自建头表（`backendHeaders`） | `/v2/chat/completions` |
+| 控制面 | axios 实例 `RestOperations`（`controlHeaders`） | 登录/续期、账号快照、控制台计费探测 |
+| 守护进程 | Node 全局 fetch = undici（`daemonHeaders`） | `/v2/enterprises/personal/models` |
+
+依据是 bundled CLI 2.156.0 的 `dist/codebuddy-lite-wb.mjs` 源码（登录链路四步逐字提取）+ 桌面客户端对 `GET /v2/plugin/accounts` 的实发请求（抓包）：
+
+| 步骤 | 请求 | 头集合（源码） |
+|---|---|---|
+| `fetchAuthState` | `POST /v2/plugin/auth/state?platform=<authentication.attributes.platform ?? platform>` | `enterpriseHeaders()`（`X-Domain`= `URI.parse(endpoint).authority`）+ `traceSpan.requestHeaders` + `X-No-Authorization` / `X-No-User-Id` / `X-No-Enterprise-Id` / `X-No-Department-Info` |
+| `loopGetToken` | `GET /v2/plugin/auth/token?state=…` | `traceSpan.requestHeaders` + 同上四项 `X-No-*`（**无** `X-Domain`） |
+| `loopGetAccount` | `GET /v2/plugin/login/account?state=…` | `enterpriseHeaders(token)`（`X-Domain`= token 的 `domain`）+ `Authorization: Bearer …` + `traceSpan.requestHeaders` + `X-No-User-Id` / `X-No-Enterprise-Id` / `X-No-Department-Info`（**无** `X-No-Authorization`） |
+| `refreshSession` | `POST /v2/plugin/auth/token/refresh` | `enterpriseHeaders(auth)` + `X-Refresh-Token` + `X-Auth-Refresh-Source: plugin` + `traceSpan.requestHeaders`（再由 `AuthenticationHttpInterceptor` 补 `Authorization` / `X-User-Id` / `X-Enterprise-Id` / `X-Tenant-Id`） |
+
+网关自身的三个**控制台计费探测**（额度摘要 `/billing/meter/get-user-resource-summary`、套餐资源 `/billing/meter/get-user-resource`、每日签到 `/v2/billing/meter/daily-checkin`）同属控制面：客户端由同一 axios 实例发出（`BackendProvider.fetchResourceSummary` / `fetchResourcePackagesPage`、`checkin()` 的 `billingPrefix = /v2`），故一律走 `controlHeaders`。旧实现这三处混用模型请求头集合（`X-IDE-*` / `x-stainless-*` / `x-codebuddy-request` / `X-Agent-*`）并自造 `X-Client-Platform: web` —— 即网关自己造出了官方客户端不可能产生的头组合。签到接口在官方客户端还额外携带 `X-Device-Token`（Turing 设备令牌，来自本地原生风控 SDK），网关无该 SDK，**不臆造该头**。
+
+**守护进程家族**（`/v2/enterprises/personal/models`，网关的实时模型目录来源）：桌面宿主把 `serverFetch = (e,t) => fetch(e,t)` 注入守护进程（`main/index.js`），即走 Node 全局 fetch（undici），头表为 `main/server.js` 的 `buildAuthHeaders`：
+
+```js
+{Accept:"application/json", Authorization:`Bearer ${auth.accessToken}`,
+ X-User-Id, X-Enterprise-Id, X-Tenant-Id, X-Domain,
+ "X-B3-TraceId", "X-B3-SpanId", "X-B3-Sampled":"1", "X-Trace-Id", b3:`${trace}-${span}-1`}
+// 再经 injectRequestId 补 X-Request-ID = X-Trace-Id ?? randomBytes(16).hex
+```
+
+自动化头不是 axios 那套：客户端实际运行时（Electron 37.10.3 / Node 22.21.1 / undici **6.22.0**，以 `ELECTRON_RUN_AS_NODE=1` 直接实测获得的线上头）为 `user-agent: node`、`accept-encoding: gzip, deflate`、`accept-language: *`、`sec-fetch-mode: cors`、`connection: keep-alive`。旧实现复用模型请求头集合，等于往守护进程接口上发了带 `X-IDE-*` / `x-stainless-*` / `traceparent` 的请求。
+
+| | 模型请求 | 控制面请求 | 守护进程请求 |
+|---|---|---|---|
+| `Accept` | `application/json` | `application/json, text/plain, */*`（axios 默认） | `application/json` |
+| `Accept-Encoding` | **不发送** | `gzip, compress, deflate, br` | `gzip, deflate`（undici 自动，全小写键名） |
+| `X-Requested-With` | `XMLHttpRequest`（小写键名 `x-requested-with`） | `X-Requested-With`（规范化大小写） | **不发送** |
+| `X-IDE-*` / `X-Agent-*` / `X-Conversation-*` / `x-stainless-*` | 发送 | **不发送** | **不发送** |
+| `X-Product` | 发送 | 发送（`ProductEndpointHttpInterceptor` 对每个请求注入） | **不发送** |
+| `User-Agent` | 站点 Profile UA（`WorkBuddy/5.7.6 … CLI/2.156.0`） | 同左 | `node`（undici 自动） |
+| `b3` | 四段 `${trace}-${span}-1-` | 四段 `${trace}-${span}-1-` | **三段** `${trace}-${span}-1` |
+| 链路头键名 | `X-Trace-ID` / `X-Request-ID` | `X-Trace-ID` / `X-Request-ID` | `X-Trace-Id` / `X-Request-ID` |
+| 其他传输层头 | `traceparent` + `X-B3-*` + `Connection: keep-alive`（末位） | 无 `traceparent` | `sec-fetch-mode: cors`、`accept-language: *`、`connection: keep-alive` |
+
+`User-Agent` 在小写键名上有个 Go 侧实现细节：`transport` 只在 `Header` 中存在**规范化键** `User-Agent` 时才采用其值，否则回退 `Go-http-client/1.1`；故 `daemonHeaders` 把规范化键置空（transport 视为「显式不发送」）再写入小写 `user-agent`，使线上只剩 `user-agent: node`。
+
+网关据此拆成 `commonHeaders`（两端通用）、`backendHeaders`（模型请求）、`controlHeaders`（控制面）、`daemonHeaders`（守护进程 fetch 家族）。响应侧：因 `transport` 设了 `DisableCompression`（模型请求必须不带 `Accept-Encoding`），控制面自行解压 —— `gzip` / `deflate` 由标准库处理，其余编码明确报错而非静默解析失败（实测 `auth/state` / `auth/token/refresh` / `login/account` 三个端点均返回未压缩响应，241 / 101 / 251 字节）。
 
 ### 关键结论与依据
 
 | 项目 | 处理方式 | 依据 |
 |---|---|---|
 | `X-Client-ID` / `X-Client-Version` | **移除** | 客户端全量安装目录（含 `app.asar`）字节级 0 命中；旧值 `codebuddy-cli` / `2.143.1` 属网关自造 |
+| `X-Client-Platform` | **移除** | 客户端全量安装目录字节级 0 命中（旧值 `web` 属网关自造）；原仅出现在额度与签到两个控制台探测上，与模型请求头集合叠加后形成客户端不可能发出的组合 |
 | `Origin` / `Referer` | **移除** | Node/Electron 运行时无浏览器语义，客户端实测不发送；发送反而是不一致特征 |
 | `Accept` | `application/json`（单一值） | 客户端实测非浏览器默认的 `*/*` 列表 |
-| `User-Agent` | 国际站 `CLI/2.137.1 WorkBuddy AI/2.137.1`；国内站 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1` | CLI 走 `UserAgentHttpInterceptor`：`${platform}/${platformVersion} ${productName}/${productVersion}`。桌面宿主改走 `WorkbuddyUserAgentHttpInterceptor`：`${applicationName}/${productVersion} ${platform}/${platformVersion} CLI/${cliVersion}`，国内站 `applicationName` 与 `platform` 都是 `WorkBuddy`，`productName` 是 `WorkBuddy AI`，版本取 Electron `app.getVersion()` |
-| `X-IDE-Type` / `X-IDE-Name` / `X-IDE-Version` | 国际站 `CLI` / `CLI` / `2.137.1`；国内站 `CodeBuddy` / `CodeBuddy` / `5.5.2` | 客户端取 `telemetryClientInfo`，缺失时回退 `clientInfo.ideType` / `platform` / `platformVersion`。这与 UA 的 `applicationName` 不是同一字段：国内站 UA 是 `WorkBuddy`，`X-IDE-*` 仍是 `CodeBuddy` |
-| `X-Request-ID` | 32 位小写 hex，每请求唯一 | 客户端 `generateUUUID().replace(/-/g,"")` |
+| `User-Agent` | 国际站 `WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0`；国内站 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1` | CLI 走 `UserAgentHttpInterceptor`：`${platform}/${platformVersion} ${productName}/${productVersion}`。桌面宿主改走 `WorkbuddyUserAgentHttpInterceptor`：`${applicationName}/${productVersion} ${platform}/${platformVersion} CLI/${cliVersion}`，两站的 `applicationName` 与 `platform` 都是 `WorkBuddy`，`productName` 是 `WorkBuddy AI`，版本取 Electron `app.getVersion()` |
+| `X-IDE-Type` / `X-IDE-Name` / `X-IDE-Version` | 国际站 `WorkBuddy` / `WorkBuddy` / `5.7.6`；国内站 `CodeBuddy` / `CodeBuddy` / `5.5.2` | 客户端取 `telemetryClientInfo`，缺失时回退 `clientInfo.ideType` / `platform` / `platformVersion`。国内站的 `X-IDE-*` 是宿主注入的 `CodeBuddy`，而国际站宿主注入的是 `WorkBuddy` —— 与 UA 的 `applicationName` 同源 |
+| `X-Request-ID` | 32 位小写 hex，每请求唯一，**UUID v7 形态**（版本位 `7`，前 48 位为毫秒时间戳） | 客户端 `uuidv7().replace(/-/g,"")`（bundled CLI 依赖 `uuidv7@^1.2.1`，源码 `nH: () => uuidv7`） |
 | `X-Trace-ID` | 与 `X-Request-ID` **解耦**，为 OTel traceId（全链路同值） | 实测 `X-Trace-ID` == `traceparent` 的 traceId，且同一 session 内稳定 |
 | `traceparent` / `b3` / `X-B3-*` | 补齐（OTel + B3 双份） | 客户端同时发送两套传播头 |
 | `X-Conversation-*` / `X-Root-Request-ID` / `X-Agent-*` | 补齐 | 客户端会话与 Agent 语义骨架，缺失即特征 |
-| `x-stainless-*` | 合成（7 项，**全小写键名**） | 客户端 chat 请求由 bundled OpenAI Node SDK 发出，上游始终可见该指纹族；网关用 Go `net/http` 发起，不合成即为缺失。SDK 以全小写发出该族头 |
-| `Accept-Encoding` | **不发送** | 客户端实测不发送；Go transport 默认自动补 `gzip`，故设 `DisableCompression: true` |
+| `x-stainless-*` | 合成（6 项固定 + 1 项按站点取值，**全小写键名**），`x-stainless-runtime-version` = 国际站 `v22.21.1` / 国内站 `v22.22.2`（`upstreamProfile.NodeVersion`） | 客户端 chat 请求由 bundled OpenAI Node SDK 发出，上游始终可见该指纹族；网关用 Go `net/http` 发起，不合成即为缺失。SDK 以全小写发出该族头。**不透传下游的 `x-stainless-*` / `User-Agent`**：第三方下游（Claude Code 等）会带自己的 SDK 版本与 UA，与 WorkBuddy 的 IDE 头构成官方客户端不可能产生的组合。`x-stainless-runtime-version` 是**运行 SDK 的 Node 版本**：桌面宿主以 `ELECTRON_RUN_AS_NODE=1` 用自带 Electron 二进制启动 CLI（源码 `buildBaseEnv`），WorkBuddyAI 5.7.6 内置 Electron 37.10.3 → `node 22.21.1`（该 exe 在 `ELECTRON_RUN_AS_NODE` 下实测 `process.versions.node`），故不能用系统 Node 版本或臆造值 |
+| `Accept-Encoding` | 模型请求**不发送**；控制面请求发送 `gzip, compress, deflate, br` | 模型请求实测无该头（Go transport 默认自动补 `gzip`，故设 `DisableCompression: true`）；控制面走 axios 族，实测带完整列表 |
 | `X-No-*` | 仅未鉴权时成组发送，值 `"true"` | 实测两种形态：已鉴权（`Authorization`+`X-User-Id`+`X-Domain`+`X-Product`，无任何 `X-No-*`）；未鉴权仅 `X-No-*` |
 | `X-Refresh-Token` | 仅刷新链路发送，chat 不发送 | 客户端源码中该头只出现在 `auth/token/refresh` 与 `account/switch` 调用 |
-| `x-codebuddy-request` | **不合成**，仅在客户端自带时透传 | 它是客户端**本地网关**安全头（源码 `GatewayLocalServer` 模块 `withSecurityHeader` 注入），语义上非上游必需 |
+| `X-Auth-Refresh-Source` | 刷新链路发送 `plugin` | 旧值 `workbuddy` 属网关自造；客户端 `refreshSession` 实测为 `plugin` |
+| `X-Tenant-Id` | 与 `X-Enterprise-Id` 同值，仅企业账号发送 | `AuthenticationHttpInterceptor` 在账号存在 `enterpriseId` 时无条件补该头（同一分支里 `X-No-Enterprise-Id` 只拦 `X-Enterprise-Id`，不拦 `X-Tenant-Id`） |
+| `x-codebuddy-request` | **合成 `"1"`**，客户端自带时透传 | 客户端对模型请求恒发送该头（源码 `withSecurityHeader` 注入；桌面宿主 `daemon-bootstrap` 的模型请求构造器亦显式 `set`），CLI 直连与桌面宿主两条链路、含非回环目标均携带 |
+| `Content-Encoding` | 国际站模型请求体 gzip 压缩 | 国际站 `product.json` 的 `features.RequestBodyGzip = true`，客户端 `GzipRequestProcessor` 对模型请求体统一压缩（与体积无关）；国内站未观测到该特性，保持不压缩 |
+| `Connection` | 模型请求与守护进程请求发送 `keep-alive` | 客户端由 Node http 模块补齐（模型请求实测恒在头部块末位），Go transport 默认不写；缺失即为可识别偏差 |
 
 ### 字节级对齐（v1.8.4 新增）
 
@@ -1105,10 +1164,33 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 | **键名大小写被规范化** | Go `http.Header.Set` 经 `textproto.CanonicalMIMEHeaderKey` 改写键名：`X-Request-ID`→`X-Request-Id`、`X-IDE-Type`→`X-Ide-Type`、`X-B3-TraceId`→`X-B3-Traceid`、`x-requested-with`→`X-Requested-With` | 新增 `setHeaderExact`/`getHeaderExact` 直接读写 map 键，复刻客户端原始大小写 |
 | **请求体键序被字典序化** | 经 `map[string]any` 中转再 `json.Marshal` 会按键名排序输出，`messages` 跑到 `model` 之前；客户端 `JSON.stringify` 按属性插入顺序输出，`model` 恒在首位 | 新增保序 JSON 层（`jsonorder.go`），解析/修改/序列化全程保持键序 |
 | **`<` `>` `&` 被 HTML 转义** | `json.Marshal` 默认把 `<` 转成 `\u003c`；客户端正文含 `<user_query>` / `<content_policy>` 等标签，`JSON.stringify` 原样输出 | 自实现转义（仅处理 `"` `\` 与控制字符），与 `JSON.stringify` 口径一致 |
+| **请求头物理顺序不同** | Go `net/http` 把 `Host` / `User-Agent` / `Content-Length` 单独前置，其余头部经 `http.Header`（map）按规范化键名字典序写出；客户端按**属性插入顺序**写出 | 新增 `wireorder.go`，在 conn 层按实测顺序重排模型请求头块（见下节） |
+| **缺少 `Connection: keep-alive`** | 客户端由 Node http 模块在头部块末位补齐该头；Go transport 默认不写 | `backendHeaders` / `daemonHeaders` 显式设置（Go 会原样写出，且 HTTP/1.1 默认即长连接，语义不变）｜
 
-**为什么必须保序保真**：这三项都无需解析语义、仅比对字节即可判定，是极强的机器特征。此外保序层用 `json.Number` 保留原始数字字面量，避免超出 2^53 的整数经 `float64` 中转被静默改写。
+**为什么必须保序保真**：这些偏差都无需解析语义、仅比对字节即可判定，是极强的机器特征。此外保序层用 `json.Number` 保留原始数字字面量，避免超出 2^53 的整数经 `float64` 中转被静默改写。
 
-**关于 HTTP/2**：实测客户端走 Node 全局 `fetch`（undici），**默认 HTTP/1.1**（抓包中带 `Host` / `Connection: keep-alive`，这两个头在 HTTP/2 中非法）。故网关**不启用** HTTP/2 —— 启用反而会引入偏差，且 h2 的 HPACK 头压缩会让键名大小写与顺序信息消失。
+**关于 HTTP/2**：实测客户端走 Node 全局 `fetch`（undici），**默认 HTTP/1.1**（抓包中带 `Host` / `Connection: keep-alive`，这两个头在 HTTP/2 中非法）。故网关**不启用** HTTP/2 —— 启用反而会引入偏差，且 h2 的 HPACK 头压缩会让键名大小写与顺序信息消失。直连 https 时网关自建的拨号层亦不设置 ALPN，与客户端同样停在 HTTP/1.1。
+
+### 请求头线上顺序对齐（v1.14.3 新增）
+
+「头部集合与键名大小写一致」仍不等于「字节一致」：`net/http` 会把 `Host` / `User-Agent` / `Content-Length` 单独前置，其余头部经 `http.Header`（map）按**规范化键名字典序**写出，而客户端按**属性插入顺序**写出 —— 两者头部字节序列截然不同，同样无需解析语义即可判定。
+
+`wireorder.go` 在 **conn 层**复刻该顺序（`installWireOrder`）：`net/http` 写头部的位置不可拦截，但其写出的字节必经 `net.Conn.Write`，故把 conn 包一层，在每个请求的头部块写出前按实测顺序重排。顺序基线取自两处互相印证的实测（结构完全一致）：本机 5.7.6 客户端的模型请求抓包，以及一份按**线上字节顺序**记录的 5.5.2 桌面客户端抓包（该抓包同时给出 `Content-Length` / `Host` / `Connection` 三个传输层头的位置：恒在最后三位）。抓包含 Authorization 等凭据，属本地研究产物、不入仓库。成因可在 bundled CLI 源码中逐条定位：
+
+```text
+SDK 默认头 → 应用自建头表（会话/Agent/IDE/隐私标记）→ 处理器链（GzipRequestProcessor 末位，追加 Content-Encoding）
+→ OTel + B3 传播头 → AuthenticationHttpInterceptor（Authorization/X-User-Id/X-Enterprise-Id/X-Department-Info/X-Tenant-Id/X-Domain）
+→ X-Product / User-Agent → Node http 补齐 Content-Length / Host / Connection
+```
+
+因 `Content-Encoding` 由处理器链（`priority=9999`）追加、传播头在其后注入，故 `Content-Encoding` 位于传播头**之前**；`Content-Length` / `Host` / `Connection` 恒为最后三位。
+
+| 项 | 行为 |
+|---|---|
+| 生效范围 | 仅 `/v2/chat/completions`（唯一有逐字节实测顺序基线的一族；控制面 axios 族与守护进程 undici 族各自的头部对象由不同调用点构造，无实测顺序，不重排） |
+| 生效路径 | 直连 https（`Transport.DialTLSContext`，返回的 conn 之上即明文头部）与明文 http（`DialContext`）；配置 `-proxy` 时 Go 自行 CONNECT + TLS，不存在明文层，**顺序复刻不生效**（头部集合与键名大小写仍保持对齐） |
+| 安全前提 | 只重排「能确认是 HTTP/1.1 请求头」的字节；代理 CONNECT、TLS 密文、无法确认的字节流一律原样透传。正文只按 `Content-Length` 计数透传、绝不解析（正文本身可能含 `CRLFCRLF`），因此 keep-alive 复用连接上的后续请求也能被正确重排 |
+| 失败即透传 | 头部块超过 64 KiB、请求行非法、头名非 RFC 9110 token、或规则未命中的头名，均按原顺序写出且字节不变 |
 
 ### 会话作用域对齐（v1.8.5 新增）
 
@@ -1123,8 +1205,8 @@ ey[REQUEST_ID_HEADER]              = ew.messageId              // 每请求
 
 | 头 | 作用域 | 实测不变量（9 条会话 / 19 次请求） |
 |---|---|---|
-| `X-Conversation-ID` | 会话 | 会话内恒定，带连字符 UUID |
-| `X-Conversation-Request-ID` | 会话 | 会话内恒定，32 位 hex |
+| `X-Conversation-ID` | 会话 | 会话内恒定，带连字符 UUID **（v7）** |
+| `X-Conversation-Request-ID` | 会话 | 会话内恒定，32 位 hex **（v7 紧凑形态，前 48 位与 `X-Conversation-ID` 同值）** |
 | `X-Root-Request-ID` | 会话 | 会话内恒定，**等于** `X-Conversation-Request-ID` |
 | `X-Trace-ID` | 会话 | 会话内恒定，**等于** `X-Conversation-Request-ID` |
 | `X-B3-TraceId` | 会话 | 等于 `X-Trace-ID` |
@@ -1141,7 +1223,7 @@ ey[REQUEST_ID_HEADER]              = ew.messageId              // 每请求
 | 随机生成 + map 缓存 | 需要 | 需加锁 | 需上限与过期 | 会话 ID 变化 |
 | **哈希派生（采用）** | **无** | **无竞争** | **不需要** | **稳定** |
 
-派生值取哈希前 16 字节（32 位 hex），与客户端 `X-Conversation-Request-ID` 同形态，且不泄露会话键本身（客户端传入 32 位 hex，网关发出的同样是 32 位 hex）。
+派生值取哈希 16 字节（32 位 hex），与客户端 `X-Conversation-Request-ID` 同形态，且不泄露会话键本身（客户端传入 32 位 hex，网关发出的同样是 32 位 hex）。位域布局沿客户端 2.156.0 的 UUID v7：模板（下游会话 ID）本身是 v7 时，派生值沿用其前 48 位毫秒时间戳并置版本位 `7`，使「会话 ID 与请求 ID 同一次生成」的时序关系成立；模板非 v7（老客户端）时退化为 v4 位域，不产出客户端不会生成的版本位与时间前缀。
 
 **下游未携带会话标识时**（如第三方 OpenAI SDK 直连，只有 `messages` 没有会话头）：不臆造会话关联，会话级 ID 退回每请求新值 —— 与旧行为一致。把无会话语义的请求错误归并到同一条链路，反而会制造出「大量不相关请求共享同一 traceId」的异常模式。
 
@@ -1163,9 +1245,11 @@ ey[REQUEST_ID_HEADER]              = ew.messageId              // 每请求
 
 ### 透传与合成的边界
 
-下游客户端自带的身份头（`X-Agent-Intent`、`X-IDE-*`、`User-Agent` 等）**优先透传**，网关仅在缺失时回退合成值。链路 ID 类头由 `resolveLinkIDs` 单独处理（见上一节）。
+下游客户端自带的**客户端族专有**身份头（`X-Agent-Intent`、`X-Agent-Purpose`、`X-IDE-*`、`X-Private-Data`、`x-codebuddy-request`、`X-B3-Sampled`、`x-requested-with`、`Accept`）优先透传，网关仅在缺失时回退合成值。
 
-鉴权类头（`Authorization`、`X-User-Id`、`X-Enterprise-Id`、`X-Domain`、`X-Product`、`X-Refresh-Token`）**一律由账号池生成，不接受下游覆盖**，以防串号或泄权。
+`User-Agent` 与 `x-stainless-*` **不接受透传**：只有官方客户端会发送这两组头，其取值即等于官方的产品与 SDK 版本；而第三方下游（Claude Code、Cursor 等）会带自己的 UA 与 SDK 版本，透传会让上游看到「WorkBuddy 的 IDE 头 + 别的客户端的 UA」这种官方客户端不可能产生的组合。故这两组一律按站点 Profile 合成。
+
+鉴权类头（`Authorization`、`X-User-Id`、`X-Enterprise-Id`、`X-Tenant-Id`、`X-Domain`、`X-Product`、`X-Refresh-Token`）**一律由账号池生成，不接受下游覆盖**，以防串号或泄权。
 
 ### 回归保障
 
@@ -1182,7 +1266,15 @@ ey[REQUEST_ID_HEADER]              = ew.messageId              // 每请求
 
 - `TestUpstreamWireHeaderCasingMatchesClient` —— 线上键名大小写逐字匹配客户端基线，且规范化形态绝不出现在线上；
 - `TestUpstreamWireBodyMatchesClientEncoding` —— 线上请求体以 `model` 开头、`messages` 在其后、`<` `>` `&` 未转义、无尾随换行；
+- `TestLoginWireHeadersMatchClient` —— 登录链路首跳（`auth/state`）的线上字节：控制面必需头逐字大小写齐全、`b3` 无父 span（末段为空）、`X-Request-ID` == `X-Trace-ID`，且 `traceparent` / `X-IDE-*` / `x-stainless-*` / 会话链路头一律不出现；
+- `TestCatalogWireHeadersMatchDaemonFetch` —— 守护进程接口（实时模型目录）的线上字节：`X-Trace-Id` / `X-Request-ID` / `b3` / `user-agent` / `accept-encoding` 等键名逐字、`b3` 三段、`User-Agent: node`、无 `X-IDE-*` / `x-stainless-*` / `X-Product` / `traceparent` / `Content-Type`；
 - `TestOrderedJSONContract` / `TestResponsesBodyKeyOrder` —— 保序层的键序、转义、数字精度与非法输入边界。
+
+控制面头集合由另外三处断言把守：
+
+- `TestLoginControlPlaneHeadersMatchClient` —— 登录三步（`auth/state` / `auth/token` / `login/account`）的控制面头集合、`X-No-*` 成组语义与模型专有头缺席；
+- `TestQuotaRefreshSeparatesQuotaAndPlanFailures` —— 额度摘要与套餐资源两个控制台接口走控制面集合（axios 族头在、`X-Client-Platform` 与模型专有头不在、`X-Request-ID` == `X-Trace-ID`），两个请求共用同一 traceId 且逐请求换 span；
+- `TestCheckinAccountCNAndSkipIntl` —— 签到走控制面集合（国际站仍跳过）。
 
 ## 安全提示
 

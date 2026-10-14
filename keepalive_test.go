@@ -139,6 +139,27 @@ func refreshTestServer(t *testing.T, handler func(call int) (int, string)) *http
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 覆盖前的只读校验会打到同一个站点，返回「可用」让测试聚焦刷新逻辑本身。
 		if r.URL.Path == "/billing/meter/get-user-resource-summary" {
+			// 只读校验走控制台计费接口 → 必须是控制面头集合，
+			// 不得出现模型请求专有头或已移除的自造头 X-Client-Platform。
+			for name, want := range map[string]string{
+				"X-Requested-With": "XMLHttpRequest",
+				"Accept":           "application/json, text/plain, */*",
+				"X-Product":        "SaaS",
+				"User-Agent":       "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1",
+			} {
+				if got := r.Header.Get(name); got != want {
+					t.Errorf("只读校验 %s = %q, want %q", name, got, want)
+				}
+			}
+			if r.Header.Get("X-Request-ID") != r.Header.Get("X-Trace-ID") {
+				t.Error("只读校验 X-Request-ID 必须等于 X-Trace-ID")
+			}
+			for _, name := range []string{"X-Client-Platform", "X-IDE-Type", "x-stainless-runtime",
+				"x-codebuddy-request", "traceparent", "X-Conversation-ID"} {
+				if v := r.Header.Get(name); v != "" {
+					t.Errorf("只读校验不得携带 %s=%q", name, v)
+				}
+			}
 			_, _ = w.Write([]byte(`{"code":0,"data":{"Packages":[]}}`))
 			return
 		}
@@ -152,7 +173,7 @@ func refreshTestServer(t *testing.T, handler func(call int) (int, string)) *http
 		if r.Header.Get("X-Refresh-Token") == "" {
 			t.Error("缺少 X-Refresh-Token")
 		}
-		if got := r.Header.Get("X-Auth-Refresh-Source"); got != "workbuddy" {
+		if got := r.Header.Get("X-Auth-Refresh-Source"); got != "plugin" {
 			t.Errorf("X-Auth-Refresh-Source=%q", got)
 		}
 		status, body := handler(calls)
