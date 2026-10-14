@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"encoding/json"
 	"io"
@@ -17,6 +18,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/andybalholm/brotli"
 )
 
 // TestMain 将整个测试进程切到临时工作目录，确保任何写状态/缓存/日志的测试
@@ -1865,6 +1868,10 @@ func TestChatCompletionToResponses(t *testing.T) {
 //   - Content-Encoding：由 upstreamBody 在 doUpstreamRequest 里按站点特性写入
 //     （gateway 只在「拼头」阶段比对，压缩在发送阶段，见 TestIntlModelRequestBodyIsGzipped）
 //
+// Accept-Encoding 属应用层基线：值来自 axios 默认头，由 Node http 适配器在传输层补写，
+// 线上字节位于 Content-Length 之后、Host 之前；网关在 backendHeaders 里显式声明同一值
+// （响应侧自行解压，见 TestCompressedUpstreamResponseIsDecoded）。
+//
 // x-codebuddy-request 属应用层基线：客户端对模型请求恒发送该头（withSecurityHeader 注入，
 // 桌面宿主 daemon-bootstrap 的模型请求构造器亦显式 set），且目标为非回环地址时同样携带。
 var realClientChatHeaders = [][2]string{
@@ -1904,6 +1911,7 @@ var realClientChatHeaders = [][2]string{
 	{"X-Domain", "www.workbuddy.ai"},
 	{"X-Product", "SaaS"},
 	{"User-Agent", "WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0"},
+	{"Accept-Encoding", "gzip, compress, deflate, br"},
 }
 
 // nonApplicationHeaders 是不参与应用层对齐的头。
@@ -2074,7 +2082,6 @@ func TestLoginControlPlaneHeadersMatchClient(t *testing.T) {
 	prof := &profileINTL
 	controlOnly := map[string]string{
 		"Accept":           "application/json, text/plain, */*",
-		"Content-Type":     "application/json",
 		"X-Requested-With": "XMLHttpRequest",
 		"User-Agent":       "WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0",
 		"X-Product":        "SaaS",
@@ -2094,14 +2101,20 @@ func TestLoginControlPlaneHeadersMatchClient(t *testing.T) {
 
 	steps := []struct {
 		name    string
+		method  string
+		body    io.Reader
 		headers func(*http.Request)
 		want    map[string]string
 		absent  []string
 	}{
 		{
+			// fetchAuthState: post(`/v2${prefixPath}/auth/state?platform=...`, {})
 			name:    "auth/state",
+			method:  http.MethodPost,
+			body:    bytes.NewReader([]byte("{}")),
 			headers: loginStateHeaders(prof),
 			want: map[string]string{
+				"Content-Type":         "application/json",
 				"X-Domain":             "www.workbuddy.ai",
 				"X-No-Authorization":   "true",
 				"X-No-User-Id":         "true",
@@ -2110,7 +2123,9 @@ func TestLoginControlPlaneHeadersMatchClient(t *testing.T) {
 			},
 		},
 		{
+			// loopGetToken: get(`/v2${prefixPath}/auth/token?state=${state}`)
 			name:    "auth/token",
+			method:  http.MethodGet,
 			headers: loginPollHeaders(prof),
 			want: map[string]string{
 				"X-No-Authorization":   "true",
@@ -2118,11 +2133,13 @@ func TestLoginControlPlaneHeadersMatchClient(t *testing.T) {
 				"X-No-Enterprise-Id":   "true",
 				"X-No-Department-Info": "true",
 			},
-			// loopGetToken 不调 enterpriseHeaders，故不带 X-Domain
-			absent: []string{"X-Domain"},
+			// loopGetToken 不调 enterpriseHeaders，故不带 X-Domain；GET 无 body，故无 Content-Type
+			absent: []string{"X-Domain", "Content-Type"},
 		},
 		{
+			// loopGetAccount: get(`/v2${prefixPath}/login/account?state=${state}`)
 			name:    "login/account",
+			method:  http.MethodGet,
 			headers: loginAccountHeaders(prof, "tok-123", "www.workbuddy.ai"),
 			want: map[string]string{
 				"Authorization":        "Bearer tok-123",
@@ -2131,14 +2148,14 @@ func TestLoginControlPlaneHeadersMatchClient(t *testing.T) {
 				"X-No-Enterprise-Id":   "true",
 				"X-No-Department-Info": "true",
 			},
-			// 该步必带 Authorization，故不声明 X-No-Authorization
-			absent: []string{"X-No-Authorization"},
+			// 该步必带 Authorization，故不声明 X-No-Authorization；GET 无 body，故无 Content-Type
+			absent: []string{"X-No-Authorization", "Content-Type"},
 		},
 	}
 
 	for _, step := range steps {
 		t.Run(step.name, func(t *testing.T) {
-			req, _ := http.NewRequest(http.MethodPost, prof.Base+"/v2/plugin/x", nil)
+			req, _ := http.NewRequest(step.method, prof.Base+"/v2/plugin/x", step.body)
 			step.headers(req)
 			for k, v := range controlOnly {
 				if got := getHeaderExact(req.Header, k); got != v {
@@ -2182,6 +2199,84 @@ func TestLoginControlPlaneHeadersMatchClient(t *testing.T) {
 				t.Errorf("X-B3-Sampled = %q, want \"1\"", got)
 			}
 		})
+	}
+}
+
+// 刷新链路在客户端是 `refreshSession`：`post('/v2${prefixPath}/auth/token/refresh', {})`。
+// axios 因 body 存在而补 Content-Type，线上 Content-Length 为 2。网关此前发空 body，
+// Content-Length(0) 与 Content-Type(缺失) 都与客户端不同 —— 该用例锁住这两项。
+func TestRefreshRequestMatchesClientBody(t *testing.T) {
+	type wire struct {
+		method  string
+		path    string
+		body    string
+		length  int64
+		ctype   string
+		headers http.Header
+	}
+	got := make(chan wire, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		got <- wire{
+			method: r.Method, path: r.URL.Path, body: string(raw),
+			length: r.ContentLength, ctype: r.Header.Get("Content-Type"),
+			headers: r.Header.Clone(),
+		}
+		_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"new-access","refreshToken":"new-refresh","expiresIn":3600}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	oldBase, oldClient := profileINTL.Base, cfg.HttpClient
+	profileINTL.Base, cfg.HttpClient = server.URL, server.Client()
+	t.Cleanup(func() { profileINTL.Base, cfg.HttpClient = oldBase, oldClient })
+
+	sa := &StoredAuth{
+		Edition: "intl",
+		Auth: StoredTokens{
+			AccessToken:  "access-1",
+			RefreshToken: "refresh-1",
+			ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+			Domain:       "www.workbuddy.ai",
+		},
+		Account: StoredAccount{UID: "uid-1"},
+	}
+	if _, err := refreshTokenPayload(sa); err != nil {
+		t.Fatalf("refreshTokenPayload: %v", err)
+	}
+
+	var w wire
+	select {
+	case w = <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("上游未收到刷新请求")
+	}
+	if w.method != http.MethodPost || w.path != "/v2/plugin/auth/token/refresh" {
+		t.Fatalf("刷新请求 = %s %s, want POST /v2/plugin/auth/token/refresh", w.method, w.path)
+	}
+	if w.body != "{}" || w.length != 2 {
+		t.Errorf("body=%q Content-Length=%d, want {} / 2（客户端 post(url, {}) 的线形态）", w.body, w.length)
+	}
+	if w.ctype != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", w.ctype)
+	}
+	for name, want := range map[string]string{
+		"X-Refresh-Token":       "refresh-1",
+		"X-Auth-Refresh-Source": "plugin",
+		"X-Domain":              "www.workbuddy.ai",
+		"Authorization":         "Bearer access-1",
+		"X-User-Id":             "uid-1",
+		"X-Product":             "SaaS",
+		"Accept":                "application/json, text/plain, */*",
+	} {
+		if v := w.headers.Get(name); v != want {
+			t.Errorf("%s = %q, want %q", name, v, want)
+		}
+	}
+	// 控制面族：模型请求专有头一律不得出现
+	for _, name := range []string{"X-IDE-Type", "X-IDE-Version", "x-stainless-lang", "traceparent", "X-Conversation-ID", "X-Agent-Intent", "x-codebuddy-request"} {
+		if v := w.headers.Get(name); v != "" {
+			t.Errorf("%s 不应出现在刷新请求里，got %q", name, v)
+		}
 	}
 }
 
@@ -2332,6 +2427,45 @@ func TestModelsListReflectsMergedCatalog(t *testing.T) {
 	}
 }
 
+// intlAccountForTest 把一份国际站凭据装进账号池供端到端用例使用，返回时自动还原。
+// 走真实凭据加载路径（loadAccountFile），而非手工构造 Account。
+func intlAccountForTest(t *testing.T, token, uid string) {
+	t.Helper()
+
+	credPath := filepath.Join(t.TempDir(), "workbuddy-intl.json")
+	raw, _ := json.Marshal(map[string]any{
+		"auth": map[string]any{
+			"accessToken":  token,
+			"refreshToken": token + "-refresh",
+			"expiresAt":    time.Now().Add(24 * time.Hour).Unix(),
+			"domain":       "www.workbuddy.ai",
+		},
+		"account": map[string]any{"uid": uid},
+		"edition": "intl",
+	})
+	if err := os.WriteFile(credPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	accountMu.Lock()
+	prev := accounts
+	accounts = nil
+	sa, err := loadAccountFile(credPath)
+	if err != nil {
+		accounts = prev
+		accountMu.Unlock()
+		t.Fatalf("loadAccountFile: %v", err)
+	}
+	accounts = append(accounts, &Account{Path: credPath, Auth: sa, Edition: "intl"})
+	accountMu.Unlock()
+
+	t.Cleanup(func() {
+		accountMu.Lock()
+		accounts = prev
+		accountMu.Unlock()
+	})
+}
+
 // 端到端冒烟：驱动真实 handleChatCompletions → upstreamChat → 生产 transport →
 // 本地假上游，抓取实际上线请求头。覆盖单测无法触及的传输层（DisableCompression）
 // 与透传接线。
@@ -2361,39 +2495,7 @@ func TestSmokeEndToEndUpstreamHeaders(t *testing.T) {
 	defer func() { cfg.HttpClient = origClient }()
 
 	// 走真实凭据加载路径
-	dir := t.TempDir()
-	credPath := filepath.Join(dir, "workbuddy-intl.json")
-	cred := map[string]any{
-		"auth": map[string]any{
-			"accessToken":  "smoke-token",
-			"refreshToken": "smoke-refresh",
-			"expiresAt":    time.Now().Add(24 * time.Hour).Unix(),
-			"domain":       "www.workbuddy.ai",
-		},
-		"account": map[string]any{"uid": "8efc9f5d-4289-445e-b503-c8a49eeb52c5", "nickname": "smoke"},
-		"edition": "intl",
-	}
-	raw, _ := json.Marshal(cred)
-	if err := os.WriteFile(credPath, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	accountMu.Lock()
-	prevAccounts := accounts
-	accounts = nil
-	sa, err := loadAccountFile(credPath)
-	if err != nil {
-		accounts = prevAccounts
-		accountMu.Unlock()
-		t.Fatalf("loadAccountFile: %v", err)
-	}
-	accounts = append(accounts, &Account{Path: credPath, Auth: sa, Edition: "intl"})
-	accountMu.Unlock()
-	defer func() {
-		accountMu.Lock()
-		accounts = prevAccounts
-		accountMu.Unlock()
-	}()
+	intlAccountForTest(t, "smoke-token", "8efc9f5d-4289-445e-b503-c8a49eeb52c5")
 
 	body := `{"model":"default-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -2469,9 +2571,11 @@ func TestSmokeEndToEndUpstreamHeaders(t *testing.T) {
 	if v := h.Get("Referer"); v != "" {
 		t.Errorf("Referer must not be sent, got %q", v)
 	}
-	// 真实客户端不发 Accept-Encoding；Go transport 默认会补 gzip，故须禁用自动压缩
-	if v := h.Get("Accept-Encoding"); v != "" {
-		t.Errorf("Accept-Encoding must not be sent, got %q", v)
+	// 压缩协商声明必须与客户端一致（5.7.6 线上字节：Content-Length 之后、Host 之前）。
+	// 值来自 axios 默认头，由 Node http 适配器在传输层补写；网关同样关闭了
+	// Transport 自动压缩，响应解压由 wrapUpstreamDecoding 自行完成。
+	if v := h.Get("Accept-Encoding"); v != "gzip, compress, deflate, br" {
+		t.Errorf("Accept-Encoding = %q, want \"gzip, compress, deflate, br\"", v)
 	}
 	for name := range h {
 		if strings.HasPrefix(name, "X-No-") {
@@ -2480,6 +2584,150 @@ func TestSmokeEndToEndUpstreamHeaders(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "ok") {
 		t.Errorf("client body = %q", rec.Body.String())
+	}
+}
+
+// 上游按我们声明的 `Accept-Encoding: gzip, compress, deflate, br` 压缩响应时，
+// 解压必须由网关完成：production transport 关掉了自动解压（指纹需要），
+// 若不解压则压缩字节会被当成 SSE 明文喂给下游。
+//
+// 断言的是可观察结果：br / gzip / deflate / 不压缩四种情况下，下游都拿到明文 SSE 事件；
+// 未支持的编码必须显式失败，绝不把压缩字节伪装成正常响应。
+func TestCompressedUpstreamResponseIsDecoded(t *testing.T) {
+	const sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	plain := func(in []byte) ([]byte, error) { return in, nil }
+	encoders := map[string]func([]byte) ([]byte, error){
+		"":        plain,
+		"gzip":    compressor(func(w io.Writer) io.WriteCloser { return gzip.NewWriter(w) }),
+		"deflate": compressor(func(w io.Writer) io.WriteCloser { return zlib.NewWriter(w) }),
+		"br":      compressor(func(w io.Writer) io.WriteCloser { return brotli.NewWriter(w) }),
+		// 未支持的编码：载荷无所谓，网关必须在读之前就拒绝
+		"zstd": plain,
+	}
+
+	for encoding, encode := range encoders {
+		name := encoding
+		if name == "" {
+			name = "identity"
+		}
+		t.Run(name, func(t *testing.T) {
+			payload, err := encode([]byte(sse))
+			if err != nil {
+				t.Fatal(err)
+			}
+			seenEncoding := make(chan string, 1)
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seenEncoding <- r.Header.Get("Accept-Encoding")
+				if encoding != "" {
+					w.Header().Set("Content-Encoding", encoding)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(payload)
+			}))
+			defer up.Close()
+
+			origBase := profileINTL.Base
+			profileINTL.Base = up.URL
+			defer func() { profileINTL.Base = origBase }()
+
+			// 生产 transport（DisableCompression）：解压只能由网关自己做
+			origClient := cfg.HttpClient
+			initHTTPClient()
+			defer func() { cfg.HttpClient = origClient }()
+
+			intlAccountForTest(t, "zip-token", "u-zip")
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+				strings.NewReader(`{"model":"default-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+
+			handleChatCompletions(rec, req)
+
+			select {
+			case got := <-seenEncoding:
+				if got != "gzip, compress, deflate, br" {
+					t.Errorf("upstream saw Accept-Encoding = %q, want 客户端值", got)
+				}
+			default:
+				t.Error("upstream never received the request")
+			}
+
+			body := rec.Body.String()
+			if encoding == "zstd" {
+				if rec.Code != http.StatusBadGateway || !strings.Contains(body, "upstream_encoding_unsupported") {
+					t.Errorf("unsupported encoding must fail loudly: status=%d body=%q", rec.Code, body)
+				}
+				return
+			}
+			if !strings.Contains(body, `"ok"`) || !strings.Contains(body, "data: [DONE]") {
+				t.Errorf("downstream did not receive decoded SSE (Content-Encoding %q): status=%d body=%q", encoding, rec.Code, body)
+			}
+		})
+	}
+}
+
+// 上游的**错误**响应同样可能被压缩（我们声明了 br）。限流 / 额度 / 鉴权的判定与日志
+// 都依赖错误正文里的关键字，拿压缩字节去判定会把可识别的上游错误降级成「未知错误」
+// （账号不再被冷却/禁用，下游也拿不到原文）。
+func TestCompressedUpstreamErrorResponseIsDecoded(t *testing.T) {
+	const upstreamBody = `{"code":11140,"msg":"request illegal"}`
+	payload, err := compressor(func(w io.Writer) io.WriteCloser { return gzip.NewWriter(w) })([]byte(upstreamBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write(payload)
+	}))
+	defer up.Close()
+
+	origBase := profileINTL.Base
+	profileINTL.Base = up.URL
+	defer func() { profileINTL.Base = origBase }()
+
+	origClient := cfg.HttpClient
+	initHTTPClient()
+	defer func() { cfg.HttpClient = origClient }()
+
+	intlAccountForTest(t, "err-token", "u-err")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"default-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handleChatCompletions(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want upstream status 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "request illegal") {
+		t.Errorf("downstream must see the decoded upstream error body, got %q", rec.Body.String())
+	}
+}
+
+// compressor 返回一个「压缩入参字节」的编码器。
+// 必须先 Close 再取字节：gzip 的 CRC/长度、zlib 的校验和、brotli 的收尾块都在 Close
+// 时写出，先取字节会得到截断流（解码侧报 unexpected EOF）。
+func compressor(newWriter func(io.Writer) io.WriteCloser) func([]byte) ([]byte, error) {
+	return func(in []byte) ([]byte, error) {
+		var buf bytes.Buffer
+		w := newWriter(&buf)
+		if _, err := w.Write(in); err != nil {
+			return nil, err
+		}
+		if err := w.Close(); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
 	}
 }
 
@@ -2518,36 +2766,7 @@ func upstreamHeadersForSession(t *testing.T, hdrs map[string]string, audit bool)
 	initHTTPClient()
 	defer func() { cfg.HttpClient = origClient }()
 
-	dir := t.TempDir()
-	credPath := filepath.Join(dir, "workbuddy-intl.json")
-	raw, _ := json.Marshal(map[string]any{
-		"auth": map[string]any{
-			"accessToken": "sess-token", "refreshToken": "r",
-			"expiresAt": time.Now().Add(24 * time.Hour).Unix(), "domain": "www.workbuddy.ai",
-		},
-		"account": map[string]any{"uid": "u1"},
-		"edition": "intl",
-	})
-	if err := os.WriteFile(credPath, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	accountMu.Lock()
-	prev := accounts
-	accounts = nil
-	sa, err := loadAccountFile(credPath)
-	if err != nil {
-		accounts = prev
-		accountMu.Unlock()
-		t.Fatalf("loadAccountFile: %v", err)
-	}
-	accounts = append(accounts, &Account{Path: credPath, Auth: sa, Edition: "intl"})
-	accountMu.Unlock()
-	defer func() {
-		accountMu.Lock()
-		accounts = prev
-		accountMu.Unlock()
-	}()
+	intlAccountForTest(t, "sess-token", "u1")
 
 	body := `{"model":"default-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))

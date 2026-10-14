@@ -88,7 +88,11 @@ var modelWireHeaderOrder = []string{
 	// 产品 / UA 拦截器
 	"x-product", "user-agent",
 	// 传输层（Node http 模块最后补齐）
-	"content-length", "host", "connection",
+	// Content-Length → Accept-Encoding → Host → Connection：本机 5.7.6 客户端线上字节
+	// 抓包在该位置有 `Accept-Encoding: gzip, compress, deflate, br`（该值来自 axios 默认头，
+	// 由 Node http 适配器在传输层补齐）。5.5.2 那份抓包未见该头，属抓包层级/版本差异，
+	// 以本机 5.7.6 线上字节为准。
+	"content-length", "accept-encoding", "host", "connection",
 }
 
 // wireOrderForPath 返回该请求路径的客户端头部顺序；无实测基线的路径返回 nil。

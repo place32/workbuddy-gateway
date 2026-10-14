@@ -33,8 +33,11 @@ import (
 //     之后、派发之前注入（源码 injectOtelSpanHeaders）；
 //   - Authorization / X-User-Id / [-Enterprise-Id / -Department-Info / -Tenant-Id] / X-Domain
 //     由 AuthenticationHttpInterceptor 追加，其后是产品 / UA 拦截器的 X-Product / User-Agent；
-//   - Content-Length / Host / Connection 由 Node http 模块最后补齐 —— 位置取自
-//     .client_ref/capture2.jsonl（Python mock 按线上字节顺序记录）。
+//   - Content-Length / Accept-Encoding / Host / Connection 由 Node http 模块最后补齐 ——
+//     位置取自本机 5.7.6 客户端线上字节抓包：`Accept-Encoding: gzip, compress, deflate, br`
+//     位于 Content-Length 之后、Host 之前（该值来自 axios 默认头，由 Node http 适配器
+//     在传输层补写；`.client_ref/capture2.jsonl` 那份 5.5.2 抓包未见该头，属抓包层级差异，
+//     以本机 5.7.6 线上字节为准）。
 //
 // 本用例断言的是**网关 → 上游**这一跳：下游入站头经 net/http 服务端解析后已丢失原始顺序，
 // 该跳的顺序无法用于断言。
@@ -54,7 +57,7 @@ var clientModelHeaderOrder = []string{
 	"X-B3-Sampled", "X-Trace-ID",
 	"Authorization", "X-User-Id", "X-Domain",
 	"X-Product", "User-Agent",
-	"Content-Length", "Host", "Connection",
+	"Content-Length", "Accept-Encoding", "Host", "Connection",
 }
 
 // wireHeaderNames 按线上顺序取出头名。

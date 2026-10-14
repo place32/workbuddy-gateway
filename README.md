@@ -13,6 +13,8 @@
 
 **v1.14.3（本 fork）**：国际站 Profile 对齐本机安装的桌面客户端 **WorkBuddyAI 5.7.6**（bundled CLI 2.156.0），请求头按**三套家族**拆分（模型请求 / 控制面 axios / 守护进程 undici），并新增**请求头线上顺序对齐**（`wireorder.go`，含 `Connection: keep-alive`）。无配置变化，升级即生效；配置 `-proxy` 时顺序复刻不生效（详见[客户端指纹对齐](#客户端指纹对齐)）。
 
+**v1.14.4（本 fork）**：消除模型请求唯一遗留的主动偏差 —— 按客户端线上字节补上 `Accept-Encoding: gzip, compress, deflate, br`（`Content-Length` 与 `Host` 之间），响应侧自行解压（`br` 用纯 Go 依赖，无 CGO）；同时修正控制面请求形状（刷新链路带 body `{}`、GET 不带 `Content-Type`）。无配置变化，升级即生效（详见[客户端指纹对齐](#客户端指纹对齐)）。
+
 **同时支持两个上游站点**（同一套 `/v2/plugin/*` 协议，凭据按站点隔离，账号池可混挂轮询）：
 
 | 站点 | 上游 | 登录方式 | 登录命令 |
@@ -1081,7 +1083,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 
 > 运行时版本也随宿主走：宿主以 `ELECTRON_RUN_AS_NODE=1` 用自带 Electron 二进制启动 CLI，故 `x-stainless-runtime-version` 是 Electron 内置 Node 的版本（国际站 5.7.6 → Electron 37.10.3 → `v22.21.1`；国内站 5.5.2 → `v22.22.2`），不是系统 Node 版本。两站各取自己的实测值（`upstreamProfile.NodeVersion`），不共用一个常数。
 
-**对齐基线**：国际站官方客户端发往 `/v2/chat/completions` 的真实请求头（抓包实测，共 38 项，含传输层头）。
+**对齐基线**：国际站官方客户端发往 `/v2/chat/completions` 的真实请求头（线上字节抓包实测，共 39 项，含传输层头）。
 
 ### 三套头集合：模型请求 / 控制面 / 守护进程
 
@@ -1118,7 +1120,8 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 | | 模型请求 | 控制面请求 | 守护进程请求 |
 |---|---|---|---|
 | `Accept` | `application/json` | `application/json, text/plain, */*`（axios 默认） | `application/json` |
-| `Accept-Encoding` | **不发送** | `gzip, compress, deflate, br` | `gzip, deflate`（undici 自动，全小写键名） |
+| `Content-Type` | `application/json`（请求带 body 才发送） | `application/json`（**仅带 body 的步骤**：`auth/state`、`refreshSession`、额度/套餐/签到探测；`auth/token` 轮询与 `login/account` 是 GET，**不发送**） | **不发送**（`includeJsonContentType: false`） |
+| `Accept-Encoding` | `gzip, compress, deflate, br`（见下「响应解压」） | `gzip, compress, deflate, br` | `gzip, deflate`（undici 自动，全小写键名） |
 | `X-Requested-With` | `XMLHttpRequest`（小写键名 `x-requested-with`） | `X-Requested-With`（规范化大小写） | **不发送** |
 | `X-IDE-*` / `X-Agent-*` / `X-Conversation-*` / `x-stainless-*` | 发送 | **不发送** | **不发送** |
 | `X-Product` | 发送 | 发送（`ProductEndpointHttpInterceptor` 对每个请求注入） | **不发送** |
@@ -1129,7 +1132,17 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 
 `User-Agent` 在小写键名上有个 Go 侧实现细节：`transport` 只在 `Header` 中存在**规范化键** `User-Agent` 时才采用其值，否则回退 `Go-http-client/1.1`；故 `daemonHeaders` 把规范化键置空（transport 视为「显式不发送」）再写入小写 `user-agent`，使线上只剩 `user-agent: node`。
 
-网关据此拆成 `commonHeaders`（两端通用）、`backendHeaders`（模型请求）、`controlHeaders`（控制面）、`daemonHeaders`（守护进程 fetch 家族）。响应侧：因 `transport` 设了 `DisableCompression`（模型请求必须不带 `Accept-Encoding`），控制面自行解压 —— `gzip` / `deflate` 由标准库处理，其余编码明确报错而非静默解析失败（实测 `auth/state` / `auth/token/refresh` / `login/account` 三个端点均返回未压缩响应，241 / 101 / 251 字节）。
+网关据此拆成 `commonHeaders`（两端通用）、`backendHeaders`（模型请求）、`controlHeaders`（控制面）、`daemonHeaders`（守护进程 fetch 家族）。响应侧：三族都显式声明了压缩协商，`transport` 的 `DisableCompression` 保证 Go 不会自行补出值不同的 `Accept-Encoding: gzip` 并接管解压，故解压由网关统一完成（`wrapUpstreamDecoding`）—— `gzip` / `deflate` 用标准库、`br` 用纯 Go 的 `andybalholm/brotli`，其余编码明确报错而非静默解析失败（实测控制面 `auth/state` / `auth/token/refresh` / `login/account` 三个端点均返回未压缩响应，241 / 101 / 251 字节）。
+
+### 响应解压（模型请求声明 `Accept-Encoding`）
+
+上一版本把模型请求的 `Accept-Encoding` 列为**唯一的主动偏差**（客户端发送、网关不发送），本版本消除它。
+
+- **客户端实际行为**：模型请求线上字节带 `Accept-Encoding: gzip, compress, deflate, br`（值来自 axios 默认头，由 Node http 适配器在传输层补写）。依据是仓库内的线上字节抓包：`.client_ref/cap/intl_chat_capture.jsonl`（5 次模型请求）与 `intl_toolturn_capture.jsonl`（72 次模型请求），每条模型请求 39 个头，该头位于第 36 槽（0 基），即 `Content-Length` 与 `Host` 之间。更早的抓包（`.client_ref/capture2.jsonl` 等，模型请求 38 个头）没有该头，因为那批钩在 Node `https.request` / 头部对象层，看不到适配器后补的传输层头；钩子层以上得到的头**集合**与**顺序**结论不受影响。
+- **网关据此声明同一值**：`backendHeaders` 补上该头，`wireorder.go` 的顺序基线相应加入该槽位（`Content-Length → Accept-Encoding → Host → Connection`）。
+- **响应侧自行解压**：`gzip` / `deflate` 用标准库，`br` 用纯 Go 的 `andybalholm/brotli`（新增依赖，无 CGO，不影响 9 目标交叉编译）。多段编码（RFC 9110）按声明**逆序**解码；未支持的编码（如 `zstd`）返回 `502 upstream_encoding_unsupported`，绝不把压缩字节当明文交给下游。解压层包在空闲看门狗**外侧**：卡死判定仍按原始字节的到达节奏，下游与聚合逻辑始终读到明文 SSE。
+- **错误响应一并解压**：上游的非 2xx 响应同样可能被压缩，而 `isQuotaExhausted` / `isRateLimited` / `isAuthFailure` 的判定与日志都依赖正文关键字 —— 拿压缩字节去判定会让限流/额度/鉴权错误降级成「未知错误」。故错误分支改为与成功路径同一套解压（`readDecodedAll`）。
+- 抓包只记录请求侧头部，**上游是否真的以 `br` 压缩模型响应流未获确认**；实现不依赖该假设，四种响应形态都能正确落地。
 
 ### 关键结论与依据
 
@@ -1146,7 +1159,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 | `traceparent` / `b3` / `X-B3-*` | 补齐（OTel + B3 双份） | 客户端同时发送两套传播头 |
 | `X-Conversation-*` / `X-Root-Request-ID` / `X-Agent-*` | 补齐 | 客户端会话与 Agent 语义骨架，缺失即特征 |
 | `x-stainless-*` | 合成（6 项固定 + 1 项按站点取值，**全小写键名**），`x-stainless-runtime-version` = 国际站 `v22.21.1` / 国内站 `v22.22.2`（`upstreamProfile.NodeVersion`） | 客户端 chat 请求由 bundled OpenAI Node SDK 发出，上游始终可见该指纹族；网关用 Go `net/http` 发起，不合成即为缺失。SDK 以全小写发出该族头。**不透传下游的 `x-stainless-*` / `User-Agent`**：第三方下游（Claude Code 等）会带自己的 SDK 版本与 UA，与 WorkBuddy 的 IDE 头构成官方客户端不可能产生的组合。`x-stainless-runtime-version` 是**运行 SDK 的 Node 版本**：桌面宿主以 `ELECTRON_RUN_AS_NODE=1` 用自带 Electron 二进制启动 CLI（源码 `buildBaseEnv`），WorkBuddyAI 5.7.6 内置 Electron 37.10.3 → `node 22.21.1`（该 exe 在 `ELECTRON_RUN_AS_NODE` 下实测 `process.versions.node`），故不能用系统 Node 版本或臆造值 |
-| `Accept-Encoding` | 模型请求**不发送**；控制面请求发送 `gzip, compress, deflate, br` | 模型请求实测无该头（Go transport 默认自动补 `gzip`，故设 `DisableCompression: true`）；控制面走 axios 族，实测带完整列表 |
+| `Accept-Encoding` | 模型请求与控制面请求均发送 `gzip, compress, deflate, br`；响应自行解压（`gzip` / `deflate` 标准库、`br` 纯 Go 解码器） | 模型请求：`.client_ref/cap/intl_chat_capture.jsonl` / `intl_toolturn_capture.jsonl`（5 + 72 次模型请求的线上字节）第 36 槽即该头（`Content-Length` 与 `Host` 之间），值逐字一致；旧结论「不发送」源于只钩到头部对象层、看不到传输层补齐的头。控制面：按「桌面客户端 `GET /v2/plugin/accounts`」实测逐字复刻 |
 | `X-No-*` | 仅未鉴权时成组发送，值 `"true"` | 实测两种形态：已鉴权（`Authorization`+`X-User-Id`+`X-Domain`+`X-Product`，无任何 `X-No-*`）；未鉴权仅 `X-No-*` |
 | `X-Refresh-Token` | 仅刷新链路发送，chat 不发送 | 客户端源码中该头只出现在 `auth/token/refresh` 与 `account/switch` 调用 |
 | `X-Auth-Refresh-Source` | 刷新链路发送 `plugin` | 旧值 `workbuddy` 属网关自造；客户端 `refreshSession` 实测为 `plugin` |
@@ -1171,19 +1184,19 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 
 **关于 HTTP/2**：实测客户端走 Node 全局 `fetch`（undici），**默认 HTTP/1.1**（抓包中带 `Host` / `Connection: keep-alive`，这两个头在 HTTP/2 中非法）。故网关**不启用** HTTP/2 —— 启用反而会引入偏差，且 h2 的 HPACK 头压缩会让键名大小写与顺序信息消失。直连 https 时网关自建的拨号层亦不设置 ALPN，与客户端同样停在 HTTP/1.1。
 
-### 请求头线上顺序对齐（v1.14.3 新增）
+### 请求头线上顺序对齐（v1.14.3 新增，v1.14.4 补 `Accept-Encoding` 槽位）
 
 「头部集合与键名大小写一致」仍不等于「字节一致」：`net/http` 会把 `Host` / `User-Agent` / `Content-Length` 单独前置，其余头部经 `http.Header`（map）按**规范化键名字典序**写出，而客户端按**属性插入顺序**写出 —— 两者头部字节序列截然不同，同样无需解析语义即可判定。
 
-`wireorder.go` 在 **conn 层**复刻该顺序（`installWireOrder`）：`net/http` 写头部的位置不可拦截，但其写出的字节必经 `net.Conn.Write`，故把 conn 包一层，在每个请求的头部块写出前按实测顺序重排。顺序基线取自两处互相印证的实测（结构完全一致）：本机 5.7.6 客户端的模型请求抓包，以及一份按**线上字节顺序**记录的 5.5.2 桌面客户端抓包（该抓包同时给出 `Content-Length` / `Host` / `Connection` 三个传输层头的位置：恒在最后三位）。抓包含 Authorization 等凭据，属本地研究产物、不入仓库。成因可在 bundled CLI 源码中逐条定位：
+`wireorder.go` 在 **conn 层**复刻该顺序（`installWireOrder`）：`net/http` 写头部的位置不可拦截，但其写出的字节必经 `net.Conn.Write`，故把 conn 包一层，在每个请求的头部块写出前按实测顺序重排。顺序基线取自两处实测：本机 5.7.6 客户端的线上字节抓包（`.client_ref/cap/intl_chat_capture.jsonl` / `intl_toolturn_capture.jsonl`，每条模型请求 39 个头），以及一份按**线上字节顺序**记录的 5.5.2 桌面客户端抓包（38 个头）。两者的应用层顺序完全一致；差异只在传输层末尾：5.7.6 的线上字节在 `Content-Length` 与 `Host` 之间还有 `Accept-Encoding`（v1.14.4 已按此对齐），5.5.2 那份抓包未见该头，属抓包层级/版本差异，以本机 5.7.6 的线上字节为准。抓包含 Authorization 等凭据，属本地研究产物、不入仓库。成因可在 bundled CLI 源码中逐条定位：
 
 ```text
 SDK 默认头 → 应用自建头表（会话/Agent/IDE/隐私标记）→ 处理器链（GzipRequestProcessor 末位，追加 Content-Encoding）
 → OTel + B3 传播头 → AuthenticationHttpInterceptor（Authorization/X-User-Id/X-Enterprise-Id/X-Department-Info/X-Tenant-Id/X-Domain）
-→ X-Product / User-Agent → Node http 补齐 Content-Length / Host / Connection
+→ X-Product / User-Agent → Node http 补齐 Content-Length / Accept-Encoding / Host / Connection
 ```
 
-因 `Content-Encoding` 由处理器链（`priority=9999`）追加、传播头在其后注入，故 `Content-Encoding` 位于传播头**之前**；`Content-Length` / `Host` / `Connection` 恒为最后三位。
+因 `Content-Encoding` 由处理器链（`priority=9999`）追加、传播头在其后注入，故 `Content-Encoding` 位于传播头**之前**；`Content-Length` / `Accept-Encoding` / `Host` / `Connection` 恒为最后四位。
 
 | 项 | 行为 |
 |---|---|
@@ -1253,7 +1266,7 @@ ey[REQUEST_ID_HEADER]              = ew.messageId              // 每请求
 
 ### 回归保障
 
-`main_test.go` 中的 `TestUpstreamFingerprintMatchesRealClient` 以真实抓包基线逐项校验（不多、不少、值一致、**键名大小写逐字一致**、链路 ID 形态与作用域自洽）；`TestSmokeEndToEndUpstreamHeaders` 驱动完整请求链路（含生产 transport）抓取实际发出请求头，覆盖单测无法触及的传输层差异。
+`main_test.go` 中的 `TestUpstreamFingerprintMatchesRealClient` 以真实抓包基线逐项校验（不多、不少、值一致、**键名大小写逐字一致**、链路 ID 形态与作用域自洽）；`TestSmokeEndToEndUpstreamHeaders` 驱动完整请求链路（含生产 transport）抓取实际发出请求头，覆盖单测无法触及的传输层差异；`TestCompressedUpstreamResponseIsDecoded` 覆盖响应侧压缩——假上游分别以 `br` / `gzip` / `deflate` / 不压缩四种方式返回同一段 SSE，断言下游收到明文事件与 `[DONE]`，并断言未支持编码（`zstd`）返回 `502 upstream_encoding_unsupported` 而非把压缩字节当明文；`TestCompressedUpstreamErrorResponseIsDecoded` 断言**错误**响应同样被解压（下游收到上游原文而非压缩字节）。
 
 会话作用域与链路 ID 自洽性由四个端到端用例断言（均驱动真实 `handleChatCompletions` → `upstreamChat` → 生产 transport 链路）：
 
@@ -1272,7 +1285,8 @@ ey[REQUEST_ID_HEADER]              = ew.messageId              // 每请求
 
 控制面头集合由另外三处断言把守：
 
-- `TestLoginControlPlaneHeadersMatchClient` —— 登录三步（`auth/state` / `auth/token` / `login/account`）的控制面头集合、`X-No-*` 成组语义与模型专有头缺席；
+- `TestLoginControlPlaneHeadersMatchClient` —— 登录三步（`auth/state` / `auth/token` / `login/account`）按各自**真实方法与 body** 断言控制面头集合、`X-No-*` 成组语义、模型专有头缺席，以及「`Content-Type` 只随 body 出现」（`auth/state` 的 POST 带、两个 GET 不带）；
+- `TestRefreshRequestMatchesClientBody` —— 刷新链路的线上请求形状：`POST /v2/plugin/auth/token/refresh` 带 body `{}`（`Content-Length: 2`）与 `Content-Type: application/json`，控制面族头（`X-Refresh-Token` / `X-Auth-Refresh-Source: plugin` / `X-Domain` / `Authorization` / `X-User-Id` / `X-Product`）齐全，模型专有头一律缺席；
 - `TestQuotaRefreshSeparatesQuotaAndPlanFailures` —— 额度摘要与套餐资源两个控制台接口走控制面集合（axios 族头在、`X-Client-Platform` 与模型专有头不在、`X-Request-ID` == `X-Trace-ID`），两个请求共用同一 traceId 且逐请求换 span；
 - `TestCheckinAccountCNAndSkipIntl` —— 签到走控制面集合（国际站仍跳过）。
 

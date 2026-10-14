@@ -21,3 +21,6 @@ logs/
 *.tmp
 .DS_Store
 Thumbs.db
+
+# 本地研究产物(含客户端源码提取与含凭据的抓包),不入仓库
+.client_ref/

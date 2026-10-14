@@ -35,12 +35,13 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/andybalholm/brotli"
 	"github.com/google/uuid"
 	"github.com/skip2/go-qrcode"
 )
 
 const (
-	version = "1.14.3"
+	version = "1.14.4"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -811,9 +812,10 @@ func initHTTPClient() {
 		IdleConnTimeout:     90 * time.Second,
 		MaxIdleConnsPerHost: 10,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
-		// 真实客户端（Node/Electron + openai SDK）不发送 Accept-Encoding，而 Go transport
-		// 默认会自动补 "Accept-Encoding: gzip"。该差异属可静态识别的指纹偏差，故禁用自动压缩。
-		// 副作用仅为不再自动解压上游响应——上游因未被请求压缩也不会压缩，行为与真实客户端一致。
+		// 压缩协商一律按客户端形状自行写入（模型请求 `gzip, compress, deflate, br`，
+		// 控制面 / 守护进程各自一套，见各 Headers 函数），故关闭 transport 的自动行为：
+		// 否则 Go 会给未声明的请求补上值不同的 `Accept-Encoding: gzip` 并自动解压响应体。
+		// 响应解压由 wrapUpstreamDecoding（模型请求）与 readControlBody（控制面）显式处理。
 		DisableCompression: true,
 		// 只约束到「收到响应头」为止；流式响应体的长时间传输由 upstreamIdleTimeout 的空闲看门狗保护。
 		ResponseHeaderTimeout: headerTimeout,
@@ -1948,7 +1950,9 @@ func refreshTokenPayload(sa *StoredAuth) (int, error) {
 		setHeaderExact(r.Header, "X-Auth-Refresh-Source", "plugin")
 	}
 
-	data, status, err := doJSON(cfg.HttpClient, http.MethodPost, prof.tokenRefreshURL(), headers, nil)
+	// 客户端 refreshSession 是 `post(url, {})`（axios 因此补 Content-Type 并发送 2 字节 body），
+	// 不是空 body：此处必须与之一致，否则 Content-Length / Content-Type 都与客户端不同。
+	data, status, err := doJSON(cfg.HttpClient, http.MethodPost, prof.tokenRefreshURL(), headers, strings.NewReader("{}"))
 	if err != nil {
 		return status, fmt.Errorf("上游刷新拒绝 (HTTP %d): %w", status, err)
 	}
@@ -3620,9 +3624,21 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 
 		// 上游非 200 响应处理
 		if resp.StatusCode >= 400 {
-			errBody, _ := io.ReadAll(resp.Body)
+			// 错误响应同样可能按我们声明的 Accept-Encoding 压缩，故与成功路径一样先解压：
+			// isQuotaExhausted / isRateLimited / isAuthFailure 的判定与日志都依赖响应正文里的
+			// 关键字与 JSON，若拿压缩字节去判定会全部落空（限流/额度/鉴权会被误判成未知错误）。
+			errBody, errRead := readDecodedAll(resp.Body, resp.Header.Get("Content-Encoding"))
 			resp.Body.Close()
 			upstreamCancel()
+			if errRead != nil {
+				debugEvent(r, "error", "upstream_error_body_undecodable", map[string]any{
+					"error_type":      "upstream_error_body_undecodable",
+					"error":           safeDebugError(errRead),
+					"status_code":     resp.StatusCode,
+					"business_impact": "上游错误正文无法解压，按残留字节判定错误类型并原样返回状态码",
+				})
+				log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游错误响应解压 账号=%s 状态码=%d 异常=%v 业务影响=按上游错误返回，但错误正文不可读", traceID, reqID, acc.Path, resp.StatusCode, errRead)
+			}
 			errStr := string(errBody)
 			debugEvent(r, "warn", "upstream_response_rejected", map[string]any{
 				"upstream_host": prof.Base,
@@ -3694,6 +3710,23 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		// 用空闲看门狗包装响应体：持续有数据就永不超时，超过 upstreamIdleTimeout 无数据才中断。
 		// 关闭响应体时会一并取消上游 context，完成清理。
 		resp.Body = newIdleReadCloser(resp.Body, currentIdleTimeout(), upstreamCancel)
+
+		// 上游可能按我们声明的 Accept-Encoding 压缩响应（br / gzip / deflate）。
+		// 解压层包在看门狗**外侧**：卡死判定仍按原始字节的到达节奏，下游与聚合逻辑
+		// 则始终读到明文 SSE。
+		decodedBody, decodeErr := wrapUpstreamDecoding(resp.Body, resp.Header.Get("Content-Encoding"))
+		if decodeErr != nil {
+			resp.Body.Close()
+			debugEvent(r, "error", "upstream_encoding_unsupported", map[string]any{
+				"error_type":      "upstream_encoding_unsupported",
+				"error":           safeDebugError(decodeErr),
+				"business_impact": "无法解压上游响应，已按上游错误返回，未伪造内容",
+			})
+			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游响应解压 账号=%s 异常=%v 业务影响=本次请求失败", traceID, reqID, acc.Path, decodeErr)
+			writeUpstreamError(w, r, http.StatusBadGateway, "upstream_encoding_unsupported", decodeErr.Error())
+			return nil, nil, nil, false
+		}
+		resp.Body = decodedBody
 		return resp, acc, prof, true
 	}
 
@@ -4868,6 +4901,13 @@ func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, in
 
 	setHeaderExact(req.Header, "X-Product", prof.Product)
 
+	// 压缩协商：客户端模型请求由 Node http 适配器在传输层补
+	// `Accept-Encoding: gzip, compress, deflate, br`（值来自 axios 默认头；线上字节抓包
+	// 实测位于 Content-Length 之后、Host 之前）。网关显式写出同名同值头，并按
+	// Content-Encoding 流式解压响应（wrapUpstreamDecoding），因此不需要
+	// 「不声明以免上游压缩」的旧取舍。
+	setHeaderExact(req.Header, "Accept-Encoding", "gzip, compress, deflate, br")
+
 	// 传输层头。客户端（Node http 模块）对模型请求恒发送 `Connection: keep-alive`，
 	// 位置在头部块末位（见 .client_ref/capture2.jsonl 实测：Content-Length / Host /
 	// Connection 恒为最后三位）。Go transport 默认不写该头，缺失即为可识别偏差；
@@ -4956,11 +4996,20 @@ func daemonHeaders(req *http.Request, sa *StoredAuth) {
 //   - `X-Requested-With` 为规范化大小写（axios 侧经规范化；模型请求是小写 x-requested-with）
 //   - 不携带 X-IDE-* / X-Agent-* / X-Conversation-* / x-stainless-*（这些只出现在模型请求）
 //   - X-Product 由 ProductEndpointHttpInterceptor 对**每个**请求注入（值取 deploymentType，回退 SaaS）
+//   - Content-Type 只在**带 body** 时出现：axios 仅在 `post(url, data)` 时补该头，
+//     `get(url)` 不带（实测 CLI 2.156.0 的 `GET /v2/plugin/accounts`：Accept /
+//     X-Requested-With / X-Domain / Authorization / 链路头 / X-Product / User-Agent /
+//     X-User-Id / Accept-Encoding，**无** Content-Type、无 Content-Length）。
+//     故这里以「请求是否带 body」判定，与客户端的 axios 语义一致：
+//     auth/state、auth/token/refresh、额度/签到等 POST 带 Content-Type，
+//     auth/token 轮询、login/account、模型目录等 GET 不带。
 //
 // 照搬模型请求的头表会同时产生「多出官方控制面请求没有的头」与「缺失官方控制面请求
 // 必带的头」两类偏差，故控制面必须走这一套。
 func controlHeaders(req *http.Request, prof *upstreamProfile) {
-	setHeaderExact(req.Header, "Content-Type", "application/json")
+	if req.Body != nil {
+		setHeaderExact(req.Header, "Content-Type", "application/json")
+	}
 	setHeaderExact(req.Header, "Accept", "application/json, text/plain, */*")
 	setHeaderExact(req.Header, "X-Requested-With", "XMLHttpRequest")
 	setHeaderExact(req.Header, "User-Agent", buildUserAgent(prof))
@@ -5042,32 +5091,81 @@ func controlNoAuth(req *http.Request, noAuthorization bool) {
 	setHeaderExact(req.Header, "X-No-Department-Info", "true")
 }
 
+// wrapUpstreamDecoding 按上游响应的 Content-Encoding 包装响应体，使调用方只看到明文。
+//
+// 网关向各上游端点都声明了压缩协商（模型请求 `gzip, compress, deflate, br`，控制面与
+// 守护进程各一套，见 backendHeaders / controlHeaders / daemonHeaders），且 transport
+// 关闭了自动压缩（DisableCompression），故响应解压必须由网关自己做，且必须与声明一致：
+// gzip / deflate 用标准库，br 用纯 Go 的 brotli 解码器（无 CGO）。
+//
+// Content-Encoding 可能是逗号分隔的多段（RFC 9110：按声明顺序依次施加），故按逆序解码。
+// 未支持的编码显式报错，绝不把压缩字节当明文交给下游或 JSON 解析。
+//
+// 失败时**不**关闭 body：所有权始终在调用方（上游响应体的关闭与连接归还由调用点负责）。
+func wrapUpstreamDecoding(body io.ReadCloser, encoding string) (io.ReadCloser, error) {
+	names := strings.Split(strings.ToLower(strings.TrimSpace(encoding)), ",")
+	for i := len(names) - 1; i >= 0; i-- {
+		switch name := strings.TrimSpace(names[i]); name {
+		case "", "identity":
+			continue
+		case "gzip", "x-gzip":
+			zr, err := gzip.NewReader(body)
+			if err != nil {
+				return nil, fmt.Errorf("解压上游 gzip 响应失败: %w", err)
+			}
+			body = &decodedBody{Reader: zr, inner: body, decoder: zr}
+		case "deflate":
+			zr, err := zlib.NewReader(body)
+			if err != nil {
+				return nil, fmt.Errorf("解压上游 deflate 响应失败: %w", err)
+			}
+			body = &decodedBody{Reader: zr, inner: body, decoder: zr}
+		case "br":
+			body = &decodedBody{Reader: brotli.NewReader(body), inner: body}
+		default:
+			return nil, fmt.Errorf("上游响应使用了网关不支持的压缩编码 %q", name)
+		}
+	}
+	return body, nil
+}
+
+// decodedBody 把解压读取器与上游响应体配对。
+//
+// gzip/zlib 的 Close 只校验校验和、不关闭底层流，故 Close 必须两层都关，
+// 否则上游连接不会归还连接池。
+type decodedBody struct {
+	io.Reader
+	inner   io.Closer
+	decoder io.Closer
+}
+
+func (b *decodedBody) Close() error {
+	if b.decoder != nil {
+		_ = b.decoder.Close()
+	}
+	return b.inner.Close()
+}
+
+// readDecodedAll 读完响应体并按 Content-Encoding 解压。
+//
+// 成功路径（模型响应流）不经过这里 —— 它需要流式读取；本函数用于把响应体整体读入内存的
+// 场合：控制面 JSON 响应，以及模型请求的**错误响应**（其正文要参与 isQuotaExhausted /
+// isRateLimited / isAuthFailure 的关键字判定与日志）。
+func readDecodedAll(body io.ReadCloser, encoding string) ([]byte, error) {
+	decoded, err := wrapUpstreamDecoding(body, encoding)
+	if err != nil {
+		return nil, err
+	}
+	defer decoded.Close()
+	return io.ReadAll(decoded)
+}
+
 // readControlBody 读取控制面响应体并按 Content-Encoding 解压。
 //
 // 上游对控制面响应通常不压缩（241 字节的 auth/state 实测无 Content-Encoding），
 // 但客户端声明了 br，故这里对未知编码显式报错，避免把压缩字节当 JSON 解析。
 func readControlBody(resp *http.Response) ([]byte, error) {
-	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
-	switch enc {
-	case "", "identity":
-		return io.ReadAll(resp.Body)
-	case "gzip", "x-gzip":
-		zr, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("解压上游 gzip 响应失败: %w", err)
-		}
-		defer zr.Close()
-		return io.ReadAll(zr)
-	case "deflate":
-		zr, err := zlib.NewReader(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("解压上游 deflate 响应失败: %w", err)
-		}
-		defer zr.Close()
-		return io.ReadAll(zr)
-	default:
-		return nil, fmt.Errorf("上游响应使用了网关不支持的压缩编码 %q", enc)
-	}
+	return readDecodedAll(resp.Body, resp.Header.Get("Content-Encoding"))
 }
 
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
