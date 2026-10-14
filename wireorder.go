@@ -45,11 +45,14 @@ const (
 // modelWireHeaderOrder 是官方客户端发往 /v2/chat/completions 的头部**线上顺序**
 // （此处为小写匹配键，实际写出的键名大小写由 setHeaderExact 决定）。
 //
-// 基线取自两处实测，二者结构完全一致、互相印证：
-//  1. 本机安装的桌面客户端（WorkBuddyAI 5.7.6 + bundled CLI 2.156.0）模型请求抓包；
+// 基线取自三处实测，三者结构完全一致、互相印证：
+//  1. 本机安装的桌面客户端（WorkBuddyAI 5.7.6 + bundled CLI 2.156.0）国际站模型请求抓包；
 //  2. 一份按线上字节顺序记录的 5.5.2 桌面客户端模型请求抓包（含凭据，本地研究产物、
 //     不入仓库；该抓包同时给出 Content-Length / Host / Connection 三个传输层头的位置：
-//     恒在最后三位）。
+//     恒在最后三位）；
+//  3. 本机 5.5.3 客户端（WorkBuddy desktop + bundled CLI 2.137.1）国内站链路的模型请求
+//     抓包（`.client_ref/cap/cn_chat_capture.jsonl`，38 头，尾部即 Content-Length → Host
+//     → Connection）。
 //
 // 该顺序的成因（客户端源码逐条可定位，见 bundled CLI 的 dist/codebuddy-lite-wb.mjs）：
 //   - 头部对象按属性插入顺序写出：SDK 默认头 → 应用自建头表（会话 / Agent / IDE /
@@ -88,10 +91,11 @@ var modelWireHeaderOrder = []string{
 	// 产品 / UA 拦截器
 	"x-product", "user-agent",
 	// 传输层（Node http 模块最后补齐）
-	// Content-Length → Accept-Encoding → Host → Connection：本机 5.7.6 客户端线上字节
+	// Content-Length → [Accept-Encoding] → Host → Connection：本机 5.7.6 客户端线上字节
 	// 抓包在该位置有 `Accept-Encoding: gzip, compress, deflate, br`（该值来自 axios 默认头，
-	// 由 Node http 适配器在传输层补齐）。5.5.2 那份抓包未见该头，属抓包层级/版本差异，
-	// 以本机 5.7.6 线上字节为准。
+	// 由 Node http 适配器在传输层补齐）；本机 5.5.3 国内站链路抓包在该位置**没有**该头，
+	// 尾部直接是 Content-Length → Host → Connection。顺序表按头名匹配，缺席的头自然不写出，
+	// 故一张表同时覆盖两站（国际站多一个槽位、国内站少一个）。
 	"content-length", "accept-encoding", "host", "connection",
 }
 
