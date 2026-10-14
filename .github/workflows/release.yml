@@ -1,0 +1,108 @@
+name: Release
+
+# 打 tag（v*）即自动构建 9 目标二进制并发布 Release。
+# 也可用 workflow_dispatch 对已推送的旧标签补发（输入标签名，如 v1.14.3）。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已推送到远端的标签名（如 v1.14.3）；留空则使用触发 ref'
+        required: false
+        type: string
+
+# 创建 Release 需要写权限；其余权限不申请。
+permissions:
+  contents: write
+
+# 同一标签的发布串行执行，避免两次运行同时创建 Release / 互相覆盖资产。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 构建并发布 ${{ github.ref_name }}
+    runs-on: windows-latest
+    steps:
+      - name: 解析标签与版本
+        id: tag
+        shell: pwsh
+        run: |
+          $tag = '${{ inputs.tag }}'.Trim()
+          if (-not $tag) { $tag = '${{ github.ref_name }}' }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "标签必须形如 v1.2.3，实际：'$tag'（workflow_dispatch 请显式传入标签名）"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$($tag.Substring(1))" >> $env:GITHUB_OUTPUT
+
+      - name: 检出
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 1
+
+      - name: 安装 Go（版本取自 go.mod）
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 标签与二进制内嵌版本必须一致：build-manifest.json 的 version 取 main.go 常量，
+      # 若二者不一致，产物文件名/内容与标签会对不上，此处直接失败而不是发出错包。
+      - name: 校验标签与 main.go 版本一致
+        shell: pwsh
+        run: |
+          $match = Select-String -LiteralPath main.go -Pattern 'version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw '无法从 main.go 读取版本号' }
+          $code = $match.Matches[0].Groups[1].Value
+          $tag = '${{ steps.tag.outputs.version }}'
+          if ($code -ne $tag) { throw "标签 $tag 与 main.go 版本 $code 不一致，请先同步版本号再打标签" }
+          Write-Host "版本校验通过：$tag"
+
+      # 复用仓库内的构建脚本：go vet + go test + 9 目标交叉编译（纯 Go / CGO 关闭），
+      # 输出 dist/ 下 9 个二进制、SHA256SUMS、build-manifest.json、config.example.json。
+      - name: 构建（vet + test + 交叉编译）
+        shell: pwsh
+        run: ./build.ps1
+
+      # build.ps1 不生成 fork 既有的 SHA256SUMS.txt（仅 9 个二进制的 <hash>  <文件名> 列表，
+      # 供沿用旧校验脚本的用户使用），此处按同一格式补出。
+      - name: 生成 SHA256SUMS.txt（fork 既有格式）
+        shell: pwsh
+        run: |
+          $manifest = Get-Content -LiteralPath dist/build-manifest.json -Raw | ConvertFrom-Json
+          $lines = @($manifest.artifacts | Sort-Object name | ForEach-Object { "$($_.sha256)  $($_.name)" })
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          [IO.File]::WriteAllText((Join-Path $PWD 'dist/SHA256SUMS.txt'), (($lines -join "`n") + "`n"), $utf8)
+          $lines
+
+      - name: 上传工作流产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: workbuddy-gateway-${{ steps.tag.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+
+      # 幂等：Release 已存在则覆盖上传资产（重跑失败任务不会报「已存在」错误）；
+      # 不存在则用仓库内的 release_notes_<tag>.md 作为说明，缺失时回退自动生成。
+      - name: 发布 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ steps.tag.outputs.tag }}'
+          $files = @(Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName })
+          if ($files.Count -eq 0) { throw 'dist/ 下没有产物，拒绝发布空 Release' }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag 已存在，覆盖上传 $($files.Count) 个资产"
+            gh release upload $tag @files --clobber
+          } else {
+            $notesFile = "release_notes_$tag.md"
+            $notesArgs = if (Test-Path -LiteralPath $notesFile) { @('--notes-file', $notesFile) } else { @('--generate-notes') }
+            gh release create $tag @files --verify-tag --title "WorkBuddy Local Gateway $tag" @notesArgs
+          }

@@ -1343,6 +1343,25 @@ PowerShell 一键构建：
 - 默认输出到 `dist/`，同时生成 `SHA256SUMS`、`build-manifest.json` 与空密钥的 `config.example.json`；校验和覆盖二进制、清单与示例配置。
 - `-OutputDir` 必须是项目内的独立子目录；`-Clean` 仅清理已知构建文件，不递归删除目录、配置凭据或其他文件。构建日志写入 `logs/build-YYYY-MM-DD.jsonl`。
 
+### 自动发布（GitHub Actions）
+
+`.github/workflows/release.yml` 在**推送 `v*` 标签**时自动构建并发布，无需本地跑构建：
+
+```bash
+# 版本号先与 main.go 的 version 常量一致，再打标签推送
+git tag -a v1.14.4 -m "v1.14.4: …"
+git push origin main --follow-tags
+```
+
+流程（`windows-latest`，复用 `build.ps1`，保证与本地发布口径一致）：
+
+1. 校验标签与 `main.go` 的 `version` 常量一致，不一致直接失败（避免发出与标签不符的包）；
+2. `go vet` + `go test` + 9 目标交叉编译 → `dist/`；
+3. 按 fork 既有格式补出只含 9 个二进制的 `SHA256SUMS.txt`；
+4. 上传工作流产物，并创建/更新 Release：资产为 9 个二进制 + `SHA256SUMS` + `SHA256SUMS.txt` + `build-manifest.json` + `config.example.json`，说明取自 `release_notes_<tag>.md`（缺失时用 GitHub 自动生成）。Release 已存在时覆盖上传资产，便于重跑失败任务。
+
+也可在 Actions 页面用 `workflow_dispatch` 对**已推送的旧标签**补发包（输入标签名，如 `v1.14.3`）。
+
 ---
 
 ## 免责声明
