@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -41,7 +42,7 @@ import (
 )
 
 const (
-	version = "1.14.5"
+	version = "1.14.20"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -169,6 +170,7 @@ func upstreamBody(prof *upstreamProfile, raw []byte) ([]byte, bool) {
 //
 // 返回的 cancel 用于在流式读取结束后取消上游 context（调用方负责）。
 func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, upstreamBytes []byte, reqID uint64, traceID string, sess sessionScope) (*http.Response, context.CancelFunc, error) {
+	prepareConversationContext(r, nil)
 	var lastErr error
 	_, _, retries := upstreamSettings()
 	// 请求体压缩在重试循环外只做一次：客户端 GzipRequestProcessor 对每个模型请求体
@@ -297,7 +299,7 @@ const (
 var (
 	profileCN = upstreamProfile{
 		Key: "cn", Label: "国内站",
-		Base:     "https://copilot.tencent.com",
+		Base: "https://copilot.tencent.com",
 		// auth/state 的 platform 取 product.json authentication.attributes.platform：国内站
 		// `workbuddy`（CLI 源码 `configuration.authentication?.attributes?.platform ?? configuration.platform`）。
 		Platform: "workbuddy",
@@ -386,6 +388,12 @@ func (p *upstreamProfile) chatURL() string { return p.Base + "/v2/chat/completio
 
 func (p *upstreamProfile) quotaSummaryURL() string {
 	return p.PortalOrigin + "/billing/meter/get-user-resource-summary"
+}
+
+func (p *upstreamProfile) enterpriseUsageURL() string {
+	// 外部项目的企业号实测表明，get-user-resource* 对 enterpriseId 返回空包，
+	// 必须改问分配额度：credit=本周期已用，limitNum=分配额度。
+	return p.PortalOrigin + "/v2/billing/meter/get-enterprise-user-usage"
 }
 
 func (p *upstreamProfile) dailyCheckinURL() string {
@@ -512,6 +520,7 @@ type Account struct {
 	PlanStale      bool                          // 最近查询失败，展示时标记旧结果
 	QuotaKnown     bool                          // 是否已成功获取过额度
 	QuotaExhausted bool                          // 已确认额度为 0；额度扫描发现恢复后自动解除
+	QuotaUnlimited bool                          // 企业版 limitNum=-1：分配额度不限，禁止按 0 余额阻断
 	ModelStates    map[string]*modelRuntimeState // 按模型隔离的成本、限流和额度阻断状态
 	fingerprint    string                        // 凭据文件变更指纹（mtime+size，凭据热加载用）
 	lock           sync.Mutex                    // 单账号串行锁（防止同账号并发触发 11128）
@@ -1098,6 +1107,7 @@ func loadAccounts() error {
 	// 恢复持久化的失效账号标记（凭据文件已删除，仅供控制台提示重新登录）
 	loadDisabledMarkers()
 	restoreAccountRuntimeStateLocked()
+	restoreStatsAccountStatesLocked()
 
 	if len(accounts) == 0 {
 		return fmt.Errorf("未找到有效凭据，请先执行 login 命令扫码登录")
@@ -1107,7 +1117,7 @@ func loadAccounts() error {
 
 // restoreAccountRuntimeStateLocked 从 monitor 快照恢复额度与模型级账本；调用方持有 accountMu。
 func restoreAccountRuntimeStateLocked() {
-	data, err := os.ReadFile(statusSnapshotFile)
+	data, err := readStatusSnapshotFile()
 	if err != nil {
 		return
 	}
@@ -1136,7 +1146,8 @@ func restoreAccountRuntimeStateLocked() {
 			acc.PlanLabel = planUnknown // 不沿用旧版本仅凭试用标记猜出的标签。
 		}
 		acc.QuotaKnown = state.QuotaKnown
-		acc.QuotaExhausted = state.QuotaExhausted
+		acc.QuotaUnlimited = state.QuotaUnlimited
+		acc.QuotaExhausted = state.QuotaExhausted && !state.QuotaUnlimited
 		if len(state.ModelStates) == 0 {
 			continue
 		}
@@ -1281,6 +1292,7 @@ func reloadAccountsResult() (bool, error) {
 		existing.CooldownMsg = ""
 		existing.QuotaKnown = false
 		existing.QuotaExhausted = false
+		existing.QuotaUnlimited = false
 		existing.ModelStates = nil
 		existing.fingerprint = fp
 		clearDisabledMarker(p)
@@ -2047,11 +2059,131 @@ func parseQuotaSummary(data []byte) (total, used, remaining float64, paid bool, 
 	return total, used, remaining, summary.IsPaidUser, planLabelFromSummary(summary), nil
 }
 
+// parseEnterpriseUsage 把企业分配额度换成网关的总额/已用/剩余。
+// credit（或 used_num）是本周期已用，和个人口径的「剩余」相反；
+// limitNum（或 limit_num）是分给这个成员的额度。limitNum=-1 表示不限量。
+func parseEnterpriseUsage(data []byte) (total, used, remaining float64, unlimited bool, err error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return 0, 0, 0, false, fmt.Errorf("企业额度响应为空")
+	}
+	var raw map[string]json.RawMessage
+	if err = json.Unmarshal(trimmed, &raw); err != nil {
+		return 0, 0, 0, false, fmt.Errorf("解析企业额度响应失败: %w", err)
+	}
+	limit, hasLimit, err := firstEnterpriseNumber(raw, "limitNum", "limit_num")
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	if !hasLimit {
+		return 0, 0, 0, false, fmt.Errorf("企业额度响应缺少 limitNum")
+	}
+	used, hasUsed, err := firstEnterpriseNumber(raw, "credit", "used_num", "usedNum")
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	if !hasUsed {
+		return 0, 0, 0, false, fmt.Errorf("企业额度响应缺少 credit/used_num")
+	}
+	if used < 0 || (limit < 0 && limit != -1) {
+		return 0, 0, 0, false, fmt.Errorf("企业额度响应包含无效负数")
+	}
+	if limit == -1 {
+		// 不限量没有「剩余<=0」这回事。总额/剩余用 -1 作哨兵，展示层显示「不限」。
+		return -1, used, -1, true, nil
+	}
+	remaining = limit - used
+	if remaining < 0 {
+		remaining = 0
+	}
+	return limit, used, remaining, false, nil
+}
+
+func firstEnterpriseNumber(raw map[string]json.RawMessage, keys ...string) (float64, bool, error) {
+	var value float64
+	var present bool
+	for _, key := range keys {
+		val, ok := raw[key]
+		if !ok || string(bytes.TrimSpace(val)) == "null" {
+			continue
+		}
+		num, err := parseEnterpriseJSONNumber(val)
+		if err != nil {
+			return 0, true, fmt.Errorf("企业额度字段 %s 无法解析", key)
+		}
+		if present && value != num {
+			return 0, true, fmt.Errorf("企业额度同义字段数值冲突")
+		}
+		value, present = num, true
+	}
+	return value, present, nil
+}
+
+func parseEnterpriseJSONNumber(raw json.RawMessage) (float64, error) {
+	raw = bytes.TrimSpace(raw)
+	var num float64
+	if err := json.Unmarshal(raw, &num); err == nil && !math.IsNaN(num) && !math.IsInf(num, 0) {
+		return num, nil
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		num, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+		if err == nil && !math.IsNaN(num) && !math.IsInf(num, 0) {
+			return num, nil
+		}
+	}
+	return 0, fmt.Errorf("not a number")
+}
+
+// applyQuotaObservation 写入额度并在余额恢复或不限量时解除模型额度阻断。
+// 调用方可以持有账号锁；这里只取账号池锁。
+func applyQuotaObservation(acc *Account, total, used, remaining float64, unlimited, paid bool, plan string, planOK bool, now time.Time) (wasExhausted, exhausted bool, display string) {
+	accountMu.Lock()
+	defer accountMu.Unlock()
+	wasExhausted = acc.QuotaExhausted
+	acc.QuotaTotal = total
+	acc.QuotaUsed = used
+	acc.QuotaRemaining = remaining
+	acc.QuotaUnlimited = unlimited
+	acc.IsPaidUser = paid
+	if planOK {
+		acc.PlanLabel = plan
+		acc.PlanCheckedAt = now.Unix()
+		acc.PlanStale = false
+	} else {
+		if acc.PlanCheckedAt == 0 {
+			acc.PlanLabel = planUnknown
+		}
+		acc.PlanStale = true
+	}
+	display = planDisplayLabel(acc.PlanLabel, acc.PlanStale)
+	acc.QuotaKnown = true
+	exhausted = !unlimited && remaining <= 0
+	acc.QuotaExhausted = exhausted
+	if unlimited || remaining > 0 {
+		for _, state := range acc.ModelStates {
+			if state == nil {
+				continue
+			}
+			state.QuotaBlocked = false
+			state.NextProbeAt = time.Time{}
+		}
+	}
+	return wasExhausted, exhausted, display
+}
+
 func formatQuota(value float64) string {
 	if value > -0.005 && value < 0.005 {
 		value = 0
 	}
 	return strings.TrimRight(strings.TrimRight(strconv.FormatFloat(value, 'f', 2, 64), "0"), ".")
+}
+
+func formatQuotaAmount(unlimited bool, kind string, value float64) string {
+	if unlimited && (kind == "total" || kind == "remaining") {
+		return "不限"
+	}
+	return formatQuota(value)
 }
 
 func usageCredit(usage map[string]any) (float64, bool) {
@@ -2163,18 +2295,19 @@ func observeModelCredit(acc *Account, model string, usage map[string]any, reqID 
 	state.ObservedAt = time.Now()
 	quotaExhausted := acc.QuotaExhausted
 	path := acc.Path
+	site := acc.Profile().Key
 	accountMu.Unlock()
-	recordModelCostClass(model, acc.Profile().Key, credit <= 0)
+	recordModelCostClass(model, site, credit <= 0)
 
 	if credit <= 0 {
 		if oldClass != modelCostFree {
-			log.Printf("[ModelCost] requestId=%d 账号 %s 模型 %s 实测 usage.credit=0，已学习为免费模型", reqID, path, model)
+			log.Printf("[ModelCost] requestId=%d 账号 %s 站点=%s 模型 %s 实测 usage.credit=0，已学习为免费模型", reqID, path, site, model)
 		}
 		if quotaExhausted {
-			log.Printf("[FreeModel] requestId=%d 请求的是免费模型 %s，已明确使用付费余额耗尽账号 %s 完成请求，usage.credit=0", reqID, model, path)
+			log.Printf("[FreeModel] requestId=%d 站点=%s 请求的是免费模型 %s，已明确使用付费余额耗尽账号 %s 完成请求，usage.credit=0", reqID, site, model, path)
 		}
 	} else if oldClass != modelCostPaid {
-		log.Printf("[ModelCost] requestId=%d 账号 %s 模型 %s 实测 usage.credit=%s，已学习为收费模型", reqID, path, model, formatQuota(credit))
+		log.Printf("[ModelCost] requestId=%d 账号 %s 站点=%s 模型 %s 实测 usage.credit=%s，已学习为收费模型", reqID, path, site, model, formatQuota(credit))
 	}
 	writeStatusSnapshot()
 }
@@ -2200,6 +2333,10 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	accountMu.Unlock()
 
 	traceID := newTraceID()
+	enterpriseID := strings.TrimSpace(auth.Account.EnterpriseID)
+	if enterpriseID != "" {
+		return refreshEnterpriseAccountQuota(ctx, acc, auth, path, prof, traceID, enterpriseID)
+	}
 	log.Printf("[Quota] traceId=%s 账号 %s 开始查询额度，站点=%s，接口=%s", traceID, path, prof.Label, prof.quotaSummaryURL())
 	// 该接口由客户端主进程经 axios（RestOperations）调用：
 	//   post(`/billing/meter/get-user-resource-summary`, {}, {headers:{"Accept-Language": locale}})
@@ -2241,44 +2378,68 @@ func refreshAccountQuota(ctx context.Context, acc *Account) error {
 	if planErr == nil {
 		plan, planErr = identifyPlan(prof.Key, summary, resources, now)
 	}
-	accountMu.Lock()
-	wasExhausted := acc.QuotaExhausted
-	acc.QuotaTotal = total
-	acc.QuotaUsed = used
-	acc.QuotaRemaining = remaining
-	acc.IsPaidUser = paid
-	if planErr == nil {
-		acc.PlanLabel = plan
-		acc.PlanCheckedAt = now.Unix()
-		acc.PlanStale = false
-	} else {
-		if acc.PlanCheckedAt == 0 {
-			acc.PlanLabel = planUnknown
-		}
-		acc.PlanStale = true
-	}
-	plan = planDisplayLabel(acc.PlanLabel, acc.PlanStale)
-	acc.QuotaKnown = true
-	acc.QuotaExhausted = remaining <= 0
-	if remaining > 0 {
-		for _, state := range acc.ModelStates {
-			state.QuotaBlocked = false
-			state.NextProbeAt = time.Time{}
-		}
-	}
-	accountMu.Unlock()
+	wasExhausted, exhausted, plan := applyQuotaObservation(acc, total, used, remaining, false, paid, plan, planErr == nil, now)
 	if planErr != nil {
 		log.Printf("[套餐判断] traceId=%s 账号=%s 结果=待确认 原因=%v 显示=%s 业务影响=额度仍更新，不把接口失败误报为免费或试用", traceID, path, planErr, plan)
 	} else {
 		log.Printf("[套餐判断] traceId=%s 账号=%s 有效期校验时间=%s 资源数=%d 显示=%s 结果=完整权益校验成功", traceID, path, now.Format(time.RFC3339), len(resources), plan)
 	}
 	switch {
-	case !wasExhausted && remaining <= 0:
+	case !wasExhausted && exhausted:
 		log.Printf("[Quota] traceId=%s 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s；账号已冻结调度，等待额度恢复", traceID, path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
-	case wasExhausted && remaining > 0:
+	case wasExhausted && !exhausted:
 		log.Printf("[Quota] traceId=%s 账号 %s 额度已恢复，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s；账号已自动解除冻结并恢复调度", traceID, path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
 	default:
 		log.Printf("[Quota] traceId=%s 账号 %s 额度查询成功，总额度=%s，已用=%s，剩余=%s，付费用户=%t，套餐=%s", traceID, path, formatQuota(total), formatQuota(used), formatQuota(remaining), paid, plan)
+	}
+	return nil
+}
+
+// refreshEnterpriseAccountQuota 只查询企业成员被分配的额度。
+// 外部项目实测个人 get-user-resource* 对企业号为空，不能据此把账号判成剩余 0。
+// 调用方已持有 acc.lock。
+func refreshEnterpriseAccountQuota(ctx context.Context, acc *Account, auth StoredAuth, path string, prof *upstreamProfile, traceID, enterpriseID string) error {
+	endpoint := prof.enterpriseUsageURL()
+	log.Printf("[Quota] traceId=%s 账号 %s 开始查询企业分配额度，站点=%s，接口=%s，企业身份=已识别，说明=不请求个人资源包 get-user-resource，避免空包被当成剩余 0", traceID, path, prof.Label, endpoint)
+	headers := func(r *http.Request) {
+		controlHeaders(r, prof)
+		setHeaderExact(r.Header, "Authorization", "Bearer "+auth.Auth.AccessToken)
+		setControlTraceHeadersWithID(r, traceID, newSpanID())
+		setHeaderExact(r.Header, "X-Enterprise-Id", enterpriseID)
+		setHeaderExact(r.Header, "X-Tenant-Id", enterpriseID)
+		if auth.Account.UID != "" {
+			setHeaderExact(r.Header, "X-User-Id", strings.TrimSpace(auth.Account.UID))
+		}
+		if auth.Auth.Domain != "" {
+			setHeaderExact(r.Header, "X-Domain", auth.Auth.Domain)
+		} else {
+			setHeaderExact(r.Header, "X-Domain", prof.domain())
+		}
+	}
+	data, status, err := doJSONContext(ctx, cfg.HttpClient, http.MethodPost, endpoint, headers, strings.NewReader("{}"))
+	if err != nil {
+		markAccountPlanStale(acc)
+		log.Printf("[Quota] traceId=%s 账号 %s 企业额度查询失败，HTTP=%d，保留上一次额度，业务影响=不把失败当成剩余 0，本轮不解除也不新增强制阻断", traceID, path, status)
+		return err
+	}
+	total, used, remaining, unlimited, err := parseEnterpriseUsage(data)
+	if err != nil {
+		markAccountPlanStale(acc)
+		log.Printf("[Quota] traceId=%s 账号 %s 企业额度响应无法解析，保留上一次额度，原因=%v，业务影响=不把坏数据当成剩余 0", traceID, path, err)
+		return err
+	}
+	now := time.Now()
+	wasExhausted, exhausted, plan := applyQuotaObservation(acc, total, used, remaining, unlimited, false, planEnterprise, true, now)
+	log.Printf("[套餐判断] traceId=%s 账号=%s 结果=%s 说明=企业号没有个人套餐资源包，不调用 get-user-resource，显示=%s", traceID, path, planEnterprise, plan)
+	totalText := formatQuotaAmount(unlimited, "total", total)
+	remainText := formatQuotaAmount(unlimited, "remaining", remaining)
+	switch {
+	case !wasExhausted && exhausted:
+		log.Printf("[Quota] traceId=%s 账号 %s 企业额度计算=limitNum %s - credit %s，剩余=%s，不限量=%t，套餐=%s；分配额度已用完，收费模型暂停调度", traceID, path, totalText, formatQuota(used), remainText, unlimited, plan)
+	case wasExhausted && !exhausted:
+		log.Printf("[Quota] traceId=%s 账号 %s 企业额度已恢复，计算=limitNum %s - credit %s，剩余=%s，不限量=%t，套餐=%s；已解除此前因个人空包或 14018 造成的额度阻断", traceID, path, totalText, formatQuota(used), remainText, unlimited, plan)
+	default:
+		log.Printf("[Quota] traceId=%s 账号 %s 企业额度查询成功，计算=limitNum %s - credit %s，剩余=%s，不限量=%t，套餐=%s", traceID, path, totalText, formatQuota(used), remainText, unlimited, plan)
 	}
 	return nil
 }
@@ -2411,6 +2572,12 @@ func checkinAccount(ctx context.Context, acc *Account) (string, error) {
 	if acc.Profile().Key != profileCN.Key {
 		accountMu.Unlock()
 		return "global_skipped", nil
+	}
+	if strings.TrimSpace(acc.Auth.Account.EnterpriseID) != "" {
+		accountPath := acc.Path
+		accountMu.Unlock()
+		log.Printf("[Checkin] traceId=%s 账号 %s 是企业版，不发起个人签到请求；额度仍由企业分配额度接口更新", newTraceID(), accountPath)
+		return "enterprise_skipped", nil
 	}
 	auth := *acc.Auth
 	path := acc.Path
@@ -2591,7 +2758,10 @@ func formatAccountStatus(acc *Account, idx int, now time.Time) string {
 		sb.WriteString("              * 权益查询失败，待刷新；名称可能是上次成功结果。\n")
 	}
 	if acc.QuotaKnown {
-		sb.WriteString(fmt.Sprintf("额度:         总额度 %s / 已用 %s / 剩余 %s\n", formatQuota(acc.QuotaTotal), formatQuota(acc.QuotaUsed), formatQuota(acc.QuotaRemaining)))
+		sb.WriteString(fmt.Sprintf("额度:         总额度 %s / 已用 %s / 剩余 %s\n",
+			formatQuotaAmount(acc.QuotaUnlimited, "total", acc.QuotaTotal),
+			formatQuotaAmount(acc.QuotaUnlimited, "used", acc.QuotaUsed),
+			formatQuotaAmount(acc.QuotaUnlimited, "remaining", acc.QuotaRemaining)))
 	}
 	if acc.CooldownUntil.After(now) {
 		sb.WriteString(fmt.Sprintf("冷却状态:     冷却中 (解封: %s, 剩余 %v)\n",
@@ -2666,30 +2836,32 @@ func runRefresh() {
 
 // accountSnapshot 是写入状态快照文件的单个账号状态。
 type accountSnapshot struct {
-	Path              string  `json:"path"`
-	SchedulingEnabled *bool   `json:"schedulingEnabled,omitempty"`
-	SchedulingReason  string  `json:"schedulingReason,omitempty"`
-	Edition           string  `json:"edition,omitempty"` // 站点标识（cn/intl）
-	Nickname          string  `json:"nickname"`
-	UID               string  `json:"uid"`
-	State             string  `json:"state"` // active | cooldown | paid_exhausted | expired | disabled
-	CooldownUntil     int64   `json:"cooldownUntil,omitempty"`
-	CooldownMsg       string  `json:"cooldownMsg,omitempty"`
-	DisabledReason    string  `json:"disabledReason,omitempty"`
-	TokenExpiresAt    int64   `json:"tokenExpiresAt,omitempty"`
-	QuotaTotal        float64 `json:"quotaTotal,omitempty"`
-	QuotaUsed         float64 `json:"quotaUsed,omitempty"`
-	QuotaRemaining    float64 `json:"quotaRemaining"`
-	IsPaidUser        bool    `json:"isPaidUser"`
-	PlanLabel         string  `json:"planLabel,omitempty"` // 官方套餐名称或已知短名称
-	PlanCheckedAt     int64   `json:"planCheckedAt,omitempty"`
-	PlanStale         bool    `json:"planStale,omitempty"`
+	Alerts            []accountAlertMark `json:"alerts,omitempty"`
+	Path              string             `json:"path"`
+	SchedulingEnabled *bool              `json:"schedulingEnabled,omitempty"`
+	SchedulingReason  string             `json:"schedulingReason,omitempty"`
+	Edition           string             `json:"edition,omitempty"` // 站点标识（cn/intl）
+	Nickname          string             `json:"nickname"`
+	UID               string             `json:"uid"`
+	State             string             `json:"state"` // active | cooldown | paid_exhausted | expired | disabled
+	CooldownUntil     int64              `json:"cooldownUntil,omitempty"`
+	CooldownMsg       string             `json:"cooldownMsg,omitempty"`
+	DisabledReason    string             `json:"disabledReason,omitempty"`
+	TokenExpiresAt    int64              `json:"tokenExpiresAt,omitempty"`
+	QuotaTotal        float64            `json:"quotaTotal,omitempty"`
+	QuotaUsed         float64            `json:"quotaUsed,omitempty"`
+	QuotaRemaining    float64            `json:"quotaRemaining"`
+	IsPaidUser        bool               `json:"isPaidUser"`
+	PlanLabel         string             `json:"planLabel,omitempty"` // 官方套餐名称或已知短名称
+	PlanCheckedAt     int64              `json:"planCheckedAt,omitempty"`
+	PlanStale         bool               `json:"planStale,omitempty"`
 	// 登录续期状态：刷新令牌到期时间与最近成功续期时间，便于提前发现需要重新登录的账号。
 	RefreshExpiresAt int64                         `json:"refreshExpiresAt,omitempty"`
 	LastRefreshTime  int64                         `json:"lastRefreshTime,omitempty"`
 	RefreshFailCount int                           `json:"refreshFailCount,omitempty"`
 	QuotaKnown       bool                          `json:"quotaKnown,omitempty"`
 	QuotaExhausted   bool                          `json:"quotaExhausted,omitempty"`
+	QuotaUnlimited   bool                          `json:"quotaUnlimited,omitempty"`
 	ModelStates      map[string]modelStateSnapshot `json:"modelStates,omitempty"`
 	FreeModels       int                           `json:"freeModels,omitempty"` // 展示值：所属站点模型统计中 0.00x 的模型数，不参与调度
 	ModelCooldowns   int                           `json:"modelCooldowns,omitempty"`
@@ -2706,6 +2878,7 @@ type modelStateSnapshot struct {
 
 // statusSnapshot 是写入 workbuddy-status.json 的完整快照。
 type statusSnapshot struct {
+	AlertSource  string              `json:"alertSource,omitempty"`
 	UpdatedAt    int64               `json:"updatedAt"`
 	Accounts     []accountSnapshot   `json:"accounts"`
 	Models       []modelStatSnapshot `json:"models,omitempty"`
@@ -2742,6 +2915,7 @@ func writeStatusSnapshot() error {
 		}
 		as.QuotaKnown = acc.QuotaKnown
 		as.QuotaExhausted = acc.QuotaExhausted
+		as.QuotaUnlimited = acc.QuotaUnlimited
 		if len(acc.ModelStates) > 0 {
 			as.ModelStates = make(map[string]modelStateSnapshot, len(acc.ModelStates))
 			for model, state := range acc.ModelStates {
@@ -2799,6 +2973,7 @@ func writeStatusSnapshot() error {
 	}
 	annotateAccountPolicies(snap.Accounts)
 	snap.ModelCatalog = buildAllModelStatSnapshots(now, accounts)
+	captureAccountStatsLocked()
 	for _, row := range snap.ModelCatalog {
 		if disabled, _ := modelDisabled(row.ID); !disabled {
 			snap.Models = append(snap.Models, row)
@@ -2820,16 +2995,18 @@ func writeStatusSnapshot() error {
 	}
 	accountMu.Unlock()
 
+	// 告警标记与快照同一次写入，避免出现「快照已异常、日志还没扫到」的时间差。
+	marks := recordAccountAlertMarks(snap.Accounts, snap.UpdatedAt)
+	for i := range snap.Accounts {
+		snap.Accounts[i].Alerts = marks[snap.Accounts[i].Path]
+	}
+	snap.AlertSource = alertSourceSnapshot
+
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return err
 	}
-	// 原子写：先写临时文件再改名，避免 monitor 读到半截内容
-	tmp := statusSnapshotFile + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, statusSnapshotFile)
+	return writeStatusSnapshotFile(data)
 }
 
 func displayWidth(s string) int {
@@ -2903,9 +3080,9 @@ func renderAccountTable(accs []accountSnapshot) string {
 		expires := "-"
 		total, used, remaining, plan := "-", "-", "-", "-"
 		if a.QuotaKnown {
-			total = formatQuota(a.QuotaTotal)
-			used = formatQuota(a.QuotaUsed)
-			remaining = formatQuota(a.QuotaRemaining)
+			total = formatQuotaAmount(a.QuotaUnlimited, "total", a.QuotaTotal)
+			used = formatQuotaAmount(a.QuotaUnlimited, "used", a.QuotaUsed)
+			remaining = formatQuotaAmount(a.QuotaUnlimited, "remaining", a.QuotaRemaining)
 			plan = planDisplayLabel(a.PlanLabel, a.PlanStale)
 		}
 		if a.TokenExpiresAt > 0 {
@@ -3035,7 +3212,7 @@ func runMonitor() {
 		}
 		fmt.Printf("更新时间: %s\n", time.Now().Format("2006-01-02 15:04:05"))
 
-		data, err := os.ReadFile(statusSnapshotFile)
+		data, err := readStatusSnapshotFile()
 		if err != nil {
 			fmt.Printf("未找到状态文件 %s（服务是否在运行？请确认已在服务工作目录执行 monitor）\n", statusSnapshotFile)
 		} else {
@@ -3091,10 +3268,11 @@ func runMonitor() {
 }
 
 func runLogin() {
-	prof := &profileCN
+	site := "cn"
 	if cfg.LoginIntl {
-		prof = &profileINTL
+		site = "intl"
 	}
+	prof := profileForEdition(site)
 
 	fmt.Println("================ WorkBuddy 登录 ================")
 	fmt.Printf("目标站点:     %s (%s)\n", prof.Label, strings.TrimPrefix(prof.Base, "https://"))
@@ -3103,32 +3281,14 @@ func runLogin() {
 	}
 	fmt.Println("正在生成登录凭据与二维码...")
 
-	loginClient := &http.Client{
-		Timeout: 30 * time.Second,
-		Jar:     cfg.HttpClient.Jar,
-	}
-
-	// 三步登录请求的头集合各自对应客户端源码里的一个方法（详见 README「控制面与模型请求」）：
-	// auth/state → fetchAuthState，auth/token 轮询 → loopGetToken，login/account → loopGetAccount。
-	stateHeaders := loginStateHeaders(prof)
-	pollHeaders := loginPollHeaders(prof)
-	siteDomain := prof.domain()
-
-	data, _, err := doJSON(loginClient, http.MethodPost, prof.authStateURL(), stateHeaders, bytes.NewReader([]byte("{}")))
+	// 与网页「添加账号」共用同一条登录流程，避免 CLI 与网页两套实现漂移。
+	s, err := beginAccountLogin(site, cfg.AuthFile)
 	if err != nil {
-		fmt.Printf("获取登录状态失败: %v\n", err)
-		return
-	}
-	var st authStateData
-	_ = json.Unmarshal(data, &st)
-	if st.State == "" || st.AuthURL == "" {
-		fmt.Println("上游返回的登录状态信息异常，请重试。")
+		fmt.Printf("%v\n", err)
 		return
 	}
 
-	// 终端字符二维码
-	qr, err := qrcode.New(st.AuthURL, qrcode.Medium)
-	if err == nil {
+	if qr, qrErr := qrcode.New(s.AuthURL, qrcode.Medium); qrErr == nil {
 		if cfg.LoginIntl {
 			fmt.Println("\n请用手机扫描下方二维码，并在浏览器中完成登录（邮箱 / 验证码 / SSO 等）：")
 		} else {
@@ -3136,71 +3296,36 @@ func runLogin() {
 		}
 		fmt.Println(qr.ToSmallString(false))
 	}
-
 	fmt.Println("如无法扫码，也可在浏览器中直接打开以下链接：")
-	fmt.Printf("%s\n\n", st.AuthURL)
+	fmt.Printf("%s\n\n", s.AuthURL)
 	fmt.Println("等待登录授权完成 (按 Ctrl+C 可取消)...")
 
-	deadline := time.Now().Add(prof.LoginTTL)
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if time.Now().After(deadline) {
-				fmt.Println("\n登录已超时，请重新执行 login 命令。")
-				return
-			}
-			tokRaw, _, errTok := doJSON(loginClient, http.MethodGet, prof.authTokenURL(st.State), pollHeaders, nil)
-			if errTok != nil {
-				continue
-			}
-			var tok tokenData
-			if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
-				continue
-			}
-
-			// 登录成功，拉取账号信息。
-			// 客户端 loopGetAccount：enterpriseHeaders(auth)（X-Domain 取 token 的 domain）+ Authorization
-			// + traceSpan 头 + X-No-User-Id / X-No-Enterprise-Id / X-No-Department-Info。
-			var acct accountData
-			acctDomain := tok.Domain
-			if acctDomain == "" {
-				acctDomain = siteDomain
-			}
-			acctHeaders := loginAccountHeaders(prof, tok.AccessToken, acctDomain)
-			if acctRaw, _, errAcct := doJSON(loginClient, http.MethodGet, prof.loginAcctURL(st.State), acctHeaders, nil); errAcct == nil {
-				_ = json.Unmarshal(acctRaw, &acct)
-			}
-
-			sa := &StoredAuth{
-				Edition: prof.Key,
-				Auth: StoredTokens{
-					AccessToken:  tok.AccessToken,
-					RefreshToken: tok.RefreshToken,
-					ExpiresAt:    time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix(),
-					Domain:       tok.Domain,
-				},
-				Account: StoredAccount{
-					UID:          acct.UID,
-					EnterpriseID: acct.EnterpriseID,
-					Nickname:     acct.Nickname,
-				},
-			}
-
-			if err := saveAuth(sa); err != nil {
-				fmt.Printf("\n登录成功但保存凭据失败: %v\n", err)
-				return
-			}
-
+	for range ticker.C {
+		snap := s.snapshot()
+		switch snap["status"] {
+		case "done":
 			fmt.Println("\n登录成功")
 			fmt.Printf("站点:         %s (%s)\n", prof.Label, strings.TrimPrefix(prof.Base, "https://"))
-			fmt.Printf("欢迎，%s (UID: %s)\n", sa.Account.Nickname, sa.Account.UID)
-			fmt.Printf("凭据已成功保存至: %s\n", cfg.AuthFile)
-			fmt.Printf("令牌有效期至: %s\n", time.Unix(sa.Auth.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
-			fmt.Println("\n现在您可以运行以下命令启动网关服务：")
+			if acct, ok := snap["account"].(map[string]any); ok {
+				fmt.Printf("欢迎，%v (UID: %v)\n", acct["nickname"], acct["uid"])
+				if exp, ok := acct["tokenExpiresAt"].(int64); ok && exp > 0 {
+					fmt.Printf("访问令牌有效期至: %s\n", time.Unix(exp, 0).Format("2006-01-02 15:04:05"))
+				}
+			}
+			fmt.Printf("凭据已成功保存到: %s\n", cfg.AuthFile)
+			fmt.Println("\n现在可以启动网关服务：")
 			fmt.Println("  workbuddy-gateway serve")
+			return
+		case "failed":
+			fmt.Printf("\n%v\n", snap["error"])
+			return
+		case "expired":
+			fmt.Println("\n登录已超时，请重新执行 login 命令。")
+			return
+		case "cancelled":
+			fmt.Println("\n登录已取消。")
 			return
 		}
 	}
@@ -3225,6 +3350,7 @@ func runServe() {
 	configCtx, stopConfigReload := context.WithCancel(context.Background())
 	defer stopConfigReload()
 	loadModelsCache()
+	loadOptionalStats()
 	if err := loadAccounts(); err != nil {
 		fmt.Printf("警告: 未检测到有效凭据 (%v)。\n请先执行: workbuddy-gateway login 扫码登录，或确保凭据文件存在。\n\n", err)
 	} else {
@@ -3255,6 +3381,16 @@ func runServe() {
 
 	// 启动状态快照协程（monitor 命令实时读取展示）
 	go statusSnapshotLoop()
+	statsCtx, stopStats := context.WithCancel(context.Background())
+	statsDone := make(chan struct{})
+	go func() {
+		defer close(statsDone)
+		statsPersistenceLoop(statsCtx)
+	}()
+	defer func() {
+		stopStats()
+		<-statsDone
+	}()
 
 	// 启动凭据热加载协程（新增/更新/删除凭据文件免重启生效）
 	if cfg.ReloadInterval > 0 {
@@ -3451,6 +3587,7 @@ func requestAuditMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Trace-ID", traceID)
 		// 普通落盘审计也需要稳定的 TraceID / requestID；不能依赖可选 JSON 日志。
 		ensureDebugRequestContext(r, traceID, start)
+		r = r.WithContext(context.WithValue(r.Context(), statsRequestContextKey{}, &statsAttempt{}))
 		if debugLoggingEnabled() {
 			debugEvent(r, "info", "request_received", map[string]any{
 				"message": "请求已进入网关，准备执行中间件与路由处理",
@@ -3462,6 +3599,7 @@ func requestAuditMiddleware(next http.Handler) http.Handler {
 		if aw.status == 0 {
 			aw.status = http.StatusOK
 		}
+		statsFinishAttempt(r, aw.status)
 		debugEvent(r, "info", "response_returned", map[string]any{
 			"status_code": aw.status,
 			"result":      http.StatusText(aw.status),
@@ -3534,6 +3672,7 @@ func authMiddleware(next http.Handler) http.Handler {
 // 成功时返回 200 响应（调用方负责关闭 Body）与命中的账号/站点；失败时函数内部已写回
 // 错误响应并返回 ok=false。Chat Completions 与 Responses 两个入口共用此逻辑。
 func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelName string, upstreamBytes []byte, startTime time.Time) (*http.Response, *Account, *upstreamProfile, bool) {
+	prepareConversationContext(r, nil)
 	traceID := w.Header().Get("X-Trace-ID")
 	log.Printf("[业务入口] traceId=%s requestId=%d 业务=上游模型调用 请求体字节数=%d", traceID, reqID, len(upstreamBytes))
 	recordModelRequest(modelName)
@@ -3630,6 +3769,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		// 注入 CodeBuddy 凭据与指纹 Header
 		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控
 		acc.lock.Lock()
+		statsSelectAccount(r, acc, modelName)
 		resp, upstreamCancel, err := doUpstreamRequest(r, acc, prof, upstreamBytes, reqID, traceID, sess)
 		acc.lock.Unlock()
 		if err != nil {
@@ -3647,6 +3787,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 
 		// 上游非 200 响应处理
 		if resp.StatusCode >= 400 {
+			statsFinishAttempt(r, resp.StatusCode)
 			// 错误响应同样可能按我们声明的 Accept-Encoding 压缩，故与成功路径一样先解压：
 			// isQuotaExhausted / isRateLimited / isAuthFailure 的判定与日志都依赖响应正文里的
 			// 关键字与 JSON，若拿压缩字节去判定会全部落空（限流/额度/鉴权会被误判成未知错误）。
@@ -3807,6 +3948,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	isStreamBool, _ := streamRaw.(bool)
 	debugSetModelAndStream(r, modelStr, isStreamBool)
 	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
+	prepareConversationContext(r, reqObj)
 
 	// 模型黑白名单拦截：命中即拒绝，不消耗任何上游账号额度。
 	if disabled, reason := modelDisabled(modelStr); disabled {
@@ -3882,6 +4024,7 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	}
 
 	body := newTTFTReader(resp.Body, startTime)
+	defer finishFirstToken(r, modelName, reqID, body)
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	var usage map[string]any
@@ -3906,6 +4049,7 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		}
 		var chunk map[string]any
 		if json.Unmarshal([]byte(cleanData), &chunk) == nil {
+			observeFirstToken(body, chunk)
 			if u, ok := chunk["usage"].(map[string]any); ok {
 				usage = u
 			}
@@ -3917,6 +4061,7 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		}
 	}
 	scanErr := scanner.Err()
+	completeTokenStream(body, scanErr == nil && finishReason != "")
 	if scanErr != nil {
 		// 流被中断（上游卡死 / 超时 / 客户端取消）时，绝不补发 [DONE]：
 		// 补发等于告诉下游「正常结束」，会让残缺的工具调用被当成完整结果执行。
@@ -3971,11 +4116,11 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		})
 	}
 	observeModelCredit(acc, modelName, usage, reqID)
+	statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
 	recordModelTokens(modelName, usage, reqID)
-	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
 	if scanErr == nil && finishReason != "" {
-		log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 结束原因=%s, 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, finishReason, time.Since(startTime), body.duration())
+		log.Printf("[#%d] 流式输出完成 (账号 %s [%s], 结束原因=%s, 耗时 %v, 首Token(v2) %s)", reqID, acc.Path, prof.Label, finishReason, time.Since(startTime), body.text())
 	}
 }
 
@@ -3983,6 +4128,7 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 func writeChatAggregate(w http.ResponseWriter, r *http.Request, resp *http.Response, modelName string, reqID uint64, acc *Account, prof *upstreamProfile, startTime time.Time) {
 	defer resp.Body.Close()
 	body := newTTFTReader(resp.Body, startTime)
+	defer finishFirstToken(r, modelName, reqID, body)
 	completionJSON, err := aggregateCompletion(body, modelName)
 	if err != nil {
 		debugEvent(r, "error", "aggregate_response_failed", map[string]any{
@@ -3994,9 +4140,9 @@ func writeChatAggregate(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		return
 	}
 	usage := usageFromCompletion(completionJSON)
+	statsObserveUsage(r, usage, true)
 	observeModelCredit(acc, modelName, usage, reqID)
 	recordModelTokens(modelName, usage, reqID)
-	recordModelTTFT(modelName, body.duration())
 	recordModelLatency(modelName, time.Since(startTime))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -4005,7 +4151,7 @@ func writeChatAggregate(w http.ResponseWriter, r *http.Request, resp *http.Respo
 		"status_code":    http.StatusOK,
 		"response_bytes": len(completionJSON),
 	})
-	log.Printf("[#%d] 非流式响应完成 (账号 %s [%s], 耗时 %v, 首字 %v)", reqID, acc.Path, prof.Label, time.Since(startTime), body.duration())
+	log.Printf("[#%d] 非流式响应完成 (账号 %s [%s], 耗时 %v, 首Token(v2) %s)", reqID, acc.Path, prof.Label, time.Since(startTime), body.text())
 }
 
 // -----------------------------------------------------------------------------
@@ -4016,9 +4162,32 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	modelIDs, source := mergedModelIDs()
 	modelsList := make([]map[string]any, 0, len(modelIDs))
 	for _, id := range modelIDs {
-		modelsList = append(modelsList, map[string]any{
+		entry := map[string]any{
 			"id": id, "object": "model", "owned_by": "workbuddy", "permission": []any{},
-		})
+		}
+		// 能力扩展字段：只透传目录里真实存在的值，未知一律省略，不做 1M 之类兜底。
+		// context_length 是模型能力上限，default_context_length 是客户端默认预算，
+		// 两者语义不同，必须分开给，不能合并成一个值。
+		// 这里只补充描述信息，不注入上游请求参数、不截断消息，也不改变输出预算逻辑。
+		if mc, ok := modelCapabilityFor(id); ok {
+			if mc.Ceiling > 0 {
+				entry["context_length"] = mc.Ceiling
+			}
+			if mc.MaxOutput > 0 {
+				entry["max_output_tokens"] = mc.MaxOutput
+			}
+			if mc.Default > 0 {
+				entry["default_context_length"] = mc.Default
+			}
+			if len(mc.Options) >= 2 {
+				entry["context_length_options"] = mc.Options
+			}
+			if len(mc.BySite) > 1 {
+				// 站点之间能力不一致：顶层已留空，明细在此，避免下游按较大值预留。
+				entry["capabilities_by_site"] = mc.BySite
+			}
+		}
+		modelsList = append(modelsList, entry)
 	}
 	resp := map[string]any{
 		"object": "list",
@@ -4852,7 +5021,12 @@ var stainlessFingerprint = map[string]string{
 func backendHeaders(req *http.Request, sa *StoredAuth, prof *upstreamProfile, in http.Header, sess sessionScope) {
 	commonHeaders(req, prof)
 
-	ids := resolveLinkIDs(in, sess)
+	var ids linkIDs
+	if prepared := conversationHeadersFor(req); prepared != nil {
+		ids = prepared.links
+	} else {
+		ids = resolveLinkIDs(in, sess)
+	}
 	setTraceHeaders(req, ids)
 
 	setHeaderExact(req.Header, "X-Conversation-Message-ID", ids.requestID)
@@ -5334,6 +5508,7 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			continue
 		}
+		observeFirstToken(r, chunk)
 		if v, ok := chunk["id"].(string); ok && v != "" {
 			respID = v
 		}
@@ -5372,6 +5547,7 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	if finish == "" {
 		return nil, errStreamClosedWithoutFinish
 	}
+	completeTokenStream(r, true)
 
 	message := map[string]any{"role": ifEmpty(role, "assistant"), "content": content}
 	if reasoning != "" {

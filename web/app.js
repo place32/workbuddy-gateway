@@ -3,11 +3,18 @@
 
   var KEY_STORAGE = "wb_gateway_admin_key";
   var POLL_MS = 3000;
+  var LIST_FILTERS = [
+    {kind: "accounts", id: "onlyUsableAccounts", cookie: "gateway_accounts_only_usable",
+      route: "/admin/api/status", statusID: "accountFilterStatus"},
+    {kind: "models", id: "onlyUsable", cookie: "gateway_models_only_usable",
+      route: "/admin/api/models", statusID: "modelFilterStatus"}
+  ];
 
   var state = {
     apiKey: sessionStorage.getItem(KEY_STORAGE) || "",
     activeTab: "overview",
     lastStatus: null,
+    lastModels: null,
     timer: null,
     refreshPending: false,
     settings: null,
@@ -22,7 +29,24 @@
     configVersion: 0,
     configPreviewVersion: 0,
     configRevision: "",
-    configOriginal: ""
+    configOriginal: "",
+    rateDetails: null,
+    rateDetailsAt: 0,
+    rateDetailsPending: null,
+    openRateKeys: {},
+    openRawLogs: {},
+    statsPending: false,
+    statsVersion: 0,
+    statsLastPoll: 0,
+    lastStats: null,
+    accountAlertsPending: false,
+    accountAlertsLastPoll: 0,
+    accountAlertsGeneration: 0,
+    lastAccountAlerts: null,
+    addAccountId: "",
+    addAccountPoll: 0,
+    statsAccount: "",
+    statsDatesTouched: false
   };
 
   function $(id) { return document.getElementById(id); }
@@ -80,13 +104,15 @@
     return "web-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
   }
 
-  function reportUIEvent(event, path, status, trace) {
+  function reportUIEvent(event, path, status, trace, enabled) {
     if (!state.apiKey || path === "/admin/api/setup") return;
+    var record = {event: event, route: path.split("?")[0], status: status};
+    if (typeof enabled === "boolean") record.enabled = enabled;
     fetch("/admin/api/client-events", {
       method: "POST",
       headers: {"Authorization": "Bearer " + state.apiKey, "Content-Type": "application/json",
         "X-Workbuddy-Admin": "1", "X-Trace-ID": trace},
-      body: JSON.stringify({event: event, route: path.split("?")[0], status: status})
+      body: JSON.stringify(record)
     }).catch(function () { /* 原请求失败仍由服务端审计记录，不递归发送失败事件。 */ });
   }
 
@@ -96,7 +122,34 @@
     $("tabs").classList.add("hidden");
     $("dashboard").classList.add("hidden");
     state.lastStatus = null;
-    ["meta", "summaryCards", "siteSummary", "gatewayInfo", "logBox", "configBox", "tasksInfo"].forEach(function (id) {
+    state.lastModels = null;
+    state.rateDetails = null;
+    state.rateDetailsAt = 0;
+    state.rateDetailsPending = null;
+    state.openRateKeys = {};
+    state.openRawLogs = {};
+    state.statsVersion++;
+    state.statsLastPoll = 0;
+    state.lastStats = null;
+    ["usageSummary", "usageChart", "latencyChart", "statsInfo", "statsRange"].forEach(function (id) {
+      $(id).textContent = "";
+    });
+    if ($("latencyLegend")) $("latencyLegend").textContent = "";
+    $("statsAccount").innerHTML = '<option value="">全局 · 全部账号</option>';
+    $("statsTable").querySelector("tbody").innerHTML = "";
+    $("statsStorage").textContent = "等待统计";
+    state.accountAlertsGeneration++;
+    state.accountAlertsLastPoll = 0;
+    state.lastAccountAlerts = null;
+    state.addAccountId = "";
+    state.addAccountPoll = 0;
+    $("poolHealth").textContent = "—";
+    $("poolHealth").className = "health-value";
+    $("poolHealthBar").style.width = "0%";
+    $("poolHealthStatus").textContent = "等待账号状态";
+    $("accountAlertsInfo").textContent = "登录后读取账号异常日志。";
+    $("accountAlerts").innerHTML = '<p class="stats-empty">等待日志</p>';
+    ["meta", "gatewayInfo", "logBox", "configBox", "tasksInfo"].forEach(function (id) {
       $(id).textContent = "";
     });
     ["accountsTable", "modelsTable", "tasksTable"].forEach(function (id) {
@@ -156,50 +209,363 @@
   }
 
   // ---- 渲染：总览 --------------------------------------------------------
-  var SUMMARY_FIELDS = [
-    ["账号总数", "total", ""],
-    ["可用", "active", "ok"],
-    ["冷却", "cooldown", "warn"],
-    ["付费耗尽", "paidExhausted", "warn"],
-    ["已过期", "expired", "warn"],
-    ["失效", "disabled", "danger"],
-    ["已停用", "paused", "warn"]
-  ];
+  function renderPoolHealth(data) {
+    var h = data.health || {}, p = h.percent;
+    var known = !data.stale && typeof p === "number" && isFinite(p) && p >= 0 && p <= 100;
+    var stateClass = known ? (p === 100 ? "healthy" : (p === 0 ? "unavailable" : "degraded")) : "unknown";
+    $("poolHealth").textContent = known ? p.toLocaleString("zh-CN", {maximumFractionDigits: 1}) + "%" : "—";
+    $("poolHealth").className = "health-value " + stateClass;
+    $("poolHealthBar").style.width = known ? p + "%" : "0%";
+    $("poolHealthBar").className = stateClass;
+    $("poolHealthStatus").textContent = data.stale ? "快照过旧 · 健康度待确认" :
+      h.state === "empty" ? "未加载账号 · 暂无健康度" : !known ? "健康度待确认" :
+      p === 100 ? "账号池全部可用" : p === 0 ? "账号池当前不可用，请查看告警" : "账号池部分受限，请查看告警";
+  }
 
-  function metricCards(s) {
-    return SUMMARY_FIELDS.map(function (c) {
-      var v = s[c[1]];
-      return '<div class="metric ' + c[2] + '"><div class="metric-label">' + esc(c[0]) +
-        '</div><div class="metric-value">' + esc(v === undefined || v === null ? 0 : v) + '</div></div>';
+  function renderAccountAlerts(data) {
+    state.lastAccountAlerts = data;
+    var labels = {urgent: "紧急", important: "重要", warning: "注意", notice: "提示"};
+    var alerts = data.alerts || [];
+    var snapshot = state.lastStatus;
+    // 日志扫描短缓存期间仍用最新账号快照剔除已恢复项，不把历史故障继续当作当前告警。
+    if (snapshot && !snapshot.stale && Array.isArray(snapshot.accounts)) {
+      alerts = alerts.filter(function (a) {
+        return snapshot.accounts.some(function (acc) {
+          return acc.path === a.account && (a.state === "paused" ? acc.schedulingEnabled === false :
+            a.state === (acc.state === "quota_exhausted" ? "paid_exhausted" : acc.state));
+        });
+      });
+    }
+    var notes = ["来源：普通日志 · 只列当前异常，最新告警在上；等级仅区分颜色和标签"];
+    if (data.stale || (snapshot && snapshot.stale)) notes.push("快照过旧，以下为上次确认的异常");
+    if (data.missingLogCount) notes.push("部分异常暂未找到对应日志，可能等待下一次扫描");
+    if (data.scanTruncated || data.listTruncated) notes.push("已达到读取上限，仅显示扫描范围内记录");
+    $("accountAlertsInfo").textContent = notes.join("；") + "。";
+    $("accountAlerts").innerHTML = alerts.length ? alerts.map(function (a) {
+      var level = labels[a.severity] ? a.severity : "notice";
+      return '<article class="account-alert alert-' + level + '"><div class="account-alert-head">' +
+        '<span class="alert-priority">' + esc(labels[level]) + '</span><strong>' + esc(a.label) +
+        '</strong><span class="account-alert-file">' + esc(a.account) + '</span><time>' + esc(fmtTime(a.at)) +
+        '</time></div><p>' + esc(a.message) + '</p></article>';
+    }).join("") : '<p class="stats-empty">' + (data.missingLogCount ? "当前存在异常，但扫描范围内暂未找到对应日志" :
+      data.stale ? "暂无日志记录，账号状态待确认" : "未发现当前账号异常日志") + '</p>';
+  }
+
+  function loadAccountAlerts() {
+    if (!state.apiKey || state.accountAlertsPending || Date.now() - state.accountAlertsLastPoll < 10000) return Promise.resolve();
+    var generation = state.accountAlertsGeneration, key = state.apiKey;
+    state.accountAlertsPending = true;
+    state.accountAlertsLastPoll = Date.now();
+    return api("/admin/api/account-alerts").then(function (data) {
+      if (generation === state.accountAlertsGeneration && key === state.apiKey) renderAccountAlerts(data);
+    }).catch(function () {
+      if (generation === state.accountAlertsGeneration && key === state.apiKey) {
+        $("accountAlertsInfo").textContent = "告警日志读取失败，保留上次结果；这不代表账号池没有异常。";
+      }
+    }).then(function () { state.accountAlertsPending = false; });
+  }
+
+  // 统计事实来自可选 stats.json；所有查询使用管理鉴权和既有前端落盘审计。
+  function statsNumber(v) {
+    return Number(v || 0).toLocaleString("zh-CN", {maximumFractionDigits: 2});
+  }
+
+  function statsCredit(v) {
+    return Number(v || 0).toLocaleString("zh-CN", {maximumFractionDigits: 4});
+  }
+
+  function statsDuration(v) {
+    return v === null || v === undefined ? "—" : (Number(v) / 1000).toFixed(2) + " s";
+  }
+
+  function statsCard(label, value, detail, color) {
+    return '<article class="usage-metric ' + color + '"><div class="usage-label">' + esc(label) +
+      '</div><div class="usage-value">' + esc(value) + '</div><div class="usage-detail">' + esc(detail) + '</div></article>';
+  }
+
+  // 原生 SVG，不访问 CDN。空时间桶及未知耗时断开折线，不伪造连续的零值。
+  // box 决定 viewBox 尺寸。让它贴近容器实际像素（比例≈1:1），
+  // 字号才不会随缩放变小；窄屏用更矮的目标高度。
+  // 原生 SVG，不加载 CDN。折线在时间桶缺样本处断开，不补零；柱形画在下层，折线覆盖在上层。
+  // opts = {lines, bars, title, leftFormat, rightFormat, box}；给了 rightFormat 时柱形改用右轴。
+  function statsComboChart(buckets, opts) {
+    opts = opts || {};
+    var lines = opts.lines || [], bars = opts.bars || [];
+    var title = opts.title || "";
+    var leftFormat = opts.leftFormat || function (v) { return String(v); };
+    var rightFormat = opts.rightFormat || null;
+    var box = opts.box || {w: 900, h: 260};
+    var pick = function (s, b, i) {
+      var v = s.value(b, i);
+      return (v === null || v === undefined || !isFinite(v)) ? null : Number(v);
+    };
+    var gather = function (list) {
+      var out = [];
+      list.forEach(function (s) { buckets.forEach(function (b, i) {
+        var v = pick(s, b, i);
+        if (v !== null) out.push(v);
+      }); });
+      return out;
+    };
+    var lineValues = gather(lines), barValues = gather(bars);
+    if (!lineValues.length && !barValues.length) return '<p class="stats-empty">该时间范围暂无可用样本</p>';
+    var dual = !!rightFormat && barValues.length > 0;
+    var scaleMax = function (values) {
+      var m = values.length ? Math.max.apply(null, values) : 0;
+      if (m <= 0) m = 1;
+      return m * 1.12;
+    };
+    var leftMax = scaleMax(dual ? lineValues : lineValues.concat(barValues));
+    var rightMax = scaleMax(dual ? barValues : []);
+    var width = Math.max(260, Math.round(box.w)), height = Math.max(190, Math.round(box.h));
+    var top = 18, bottom = 40;
+    var leftTicks = [0, 1, 2, 3, 4].map(function (n) { return leftFormat(leftMax * (1 - n / 4)); });
+    var rightTicks = dual ? [0, 1, 2, 3, 4].map(function (n) { return rightFormat(rightMax * (1 - n / 4)); }) : [];
+    var left = Math.min(130, Math.max(52, 14 + Math.max.apply(null, leftTicks.map(function (t) { return t.length; })) * 7));
+    var right = dual ? Math.min(130, Math.max(44, 14 + Math.max.apply(null, rightTicks.map(function (t) { return t.length; })) * 7)) : 16;
+    var plotW = width - left - right, plotH = height - top - bottom;
+    var x = function (i) { return buckets.length < 2 ? left + plotW / 2 : left + i * plotW / (buckets.length - 1); };
+    var yLeft = function (v) { return top + plotH * (1 - v / leftMax); };
+    var yRight = function (v) { return top + plotH * (1 - v / rightMax); };
+    var out = '<svg viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-label="' + esc(title) +
+      '"><title>' + esc(title) + '</title>';
+    for (var n = 0; n <= 4; n++) {
+      var yy = top + plotH * n / 4;
+      out += '<line class="chart-grid" x1="' + left + '" y1="' + yy + '" x2="' + (width - right) + '" y2="' + yy + '"/>' +
+        '<text class="chart-label" text-anchor="end" x="' + (left - 8) + '" y="' + (yy + 4) + '">' + esc(leftTicks[n]) + '</text>';
+      if (dual) {
+        out += '<text class="chart-label" text-anchor="start" x="' + (width - right + 8) + '" y="' + (yy + 4) + '">' + esc(rightTicks[n]) + '</text>';
+      }
+    }
+    // 窄屏把日期缩成 MM-DD；刻度数量按可用宽度反推，避免标签互相重叠。
+    var narrow = width < 520;
+    var tickLabel = function (text) {
+      return narrow && /^\d{4}-\d{2}-\d{2}$/.test(text) ? text.slice(5) : text;
+    };
+    var widest = 0;
+    buckets.forEach(function (b) { widest = Math.max(widest, tickLabel(b.label).length); });
+    var perTick = Math.max(44, widest * 7 + 14);
+    var maxTicks = Math.max(2, Math.floor(plotW / perTick));
+    var every = Math.max(1, Math.ceil(buckets.length / maxTicks));
+    // 首尾标签贴边（居中会溢出 viewBox 被裁），再按像素间距贪心取舍：
+    // 末尾刻度优先级最高，与前一个冲突时挤掉前一个，保证最后一个日期始终可见。
+    var labelW = widest * 6.6;
+    var lastIdx = buckets.length - 1;
+    var candidates = [];
+    for (var ci = 0; ci < buckets.length; ci += every) {
+      candidates.push(ci);
+    }
+    if (candidates[candidates.length - 1] !== lastIdx) {
+      candidates.push(lastIdx);
+    }
+    var geometry = function (i, isLast) {
+      var anchor = i === 0 ? "start" : (isLast ? "end" : "middle");
+      var tx = i === 0 ? left : (isLast ? width - right : x(i));
+      var l = anchor === "start" ? tx : (anchor === "end" ? tx - labelW : tx - labelW / 2);
+      return {i: i, anchor: anchor, tx: tx, left: l, right: l + labelW};
+    };
+    var kept = [];
+    candidates.forEach(function (i) {
+      var isLast = i === lastIdx, geo = geometry(i, isLast);
+      if (isLast) {
+        while (kept.length && geo.left - kept[kept.length - 1].right < 8) {
+          kept.pop();
+        }
+      } else if (kept.length && geo.left - kept[kept.length - 1].right < 8) {
+        return;
+      }
+      kept.push(geo);
+    });
+    kept.forEach(function (t) {
+      out += '<text class="chart-label" text-anchor="' + t.anchor + '" x="' + t.tx + '" y="' + (height - 12) + '">' +
+        esc(tickLabel(buckets[t.i].label)) + '</text>';
+    });
+    if (bars.length) {
+      // 柱组必须居中在该桶折线点的时间位置上，否则柱会比线偏半个桶位；
+      // 只做 SVG 边界保护，正常尺寸下不会触发。
+      var slot = plotW / Math.max(1, buckets.length);
+      var groupW = Math.min(slot * 0.7, 24);
+      var barW = Math.max(1, groupW / bars.length);
+      var baseY = top + plotH;
+      buckets.forEach(function (b, i) {
+        var groupX = Math.min(Math.max(x(i) - groupW / 2, 0), width - groupW);
+        bars.forEach(function (s, j) {
+          var value = pick(s, b, i);
+          if (value === null) return;
+          var yy = (dual ? yRight : yLeft)(value);
+          var h = Math.max(1, baseY - yy);
+          out += '<rect class="chart-bar series-' + s.color + '" x="' + (groupX + j * barW).toFixed(2) +
+            '" y="' + yy.toFixed(2) + '" width="' + Math.max(1, barW - 1).toFixed(2) + '" height="' + h.toFixed(2) + '">' +
+            '<title>' + esc(b.label + " · " + s.label + " " + (dual ? rightFormat : leftFormat)(value)) + '</title></rect>';
+        });
+      });
+    }
+    lines.forEach(function (s) {
+      var points = [], paths = [];
+      buckets.forEach(function (b, i) {
+        var value = pick(s, b, i);
+        if (value === null) {
+          if (points.length) paths.push(points.join(" "));
+          points = [];
+          return;
+        }
+        var xx = x(i), yy = yLeft(value);
+        points.push((points.length ? "L" : "M") + xx.toFixed(2) + "," + yy.toFixed(2));
+        out += '<circle class="series-' + s.color + '" cx="' + xx + '" cy="' + yy + '" r="' + (buckets.length > 80 ? 1.8 : 3.2) +
+          '"><title>' + esc(b.label + " · " + s.label + " " + leftFormat(value)) + '</title></circle>';
+      });
+      if (points.length) paths.push(points.join(" "));
+      paths.forEach(function (p) { out += '<path class="chart-line series-' + s.color + '" d="' + p + '"/>'; });
+    });
+    return out + "</svg>";
+  }
+
+  function statsLineChart(buckets, series, title, format, box) {
+    return statsComboChart(buckets, {lines: series, bars: [], title: title, leftFormat: format, box: box});
+  }
+
+  function renderStats(data) {
+    state.lastStats = data;
+    var s = data.summary || {}, rows = data.buckets || [], store = data.storage || {};
+    var currentTTFT = data.ttftMetric === "first_token_v2";
+    var tokenTime = function (row) { return currentTTFT ? row.avgTtftMs : null; };
+    $("statsStorage").textContent = store.mode === "file" ? "stats.json · 已落盘" :
+      (store.mode === "memory" ? "仅内存 · 未落盘" : "等待首次落盘");
+    $("statsStorage").className = "badge " + (store.mode === "memory" ? "warn" : "");
+    var started = data.startedAt ? new Date(data.startedAt).toLocaleString("zh-CN", {hour12: false}) : "尚未采集";
+    $("statsInfo").textContent = "自 " + started + " 起采集；UTC+8，周从周一开始。按实际上游账号调用统计，失败重试分开记。 " +
+      (store.message || "缺失的 usage 不当作零消耗；缓存读取包含在输入 Token 中，不重复相加。") +
+      " 首Token按有效内容增量计时，仅完整步骤参与平均；旧首响应体样本不混入（排除 " + (s.legacyTtftSamples || 0) + " 条）。不等同于 dsh 当前会话范围。";
+    $("statsStart").value = data.start;
+    $("statsEnd").value = data.end;
+    var choice = state.statsAccount || data.account || "";
+    var siteScope = choice === "site:cn" || choice === "site:intl";
+    var scopeOption = function (value, label) {
+      return '<option value="' + esc(value) + '"' + (value === choice ? " selected" : "") + '>' + esc(label) + "</option>";
+    };
+    $("statsAccount").innerHTML = scopeOption("", "全局 · 全部账号") +
+      scopeOption("site:intl", "国际站 · 全部国际账号") + scopeOption("site:cn", "国内站 · 全部国内账号") +
+      (data.accounts || []).map(function (a) {
+        return scopeOption(a.id, a.file + " · " + (a.edition === "intl" ? "国际" : "国内") + " · " + a.id.slice(0, 6));
+      }).join("");
+    if (!siteScope && !(data.accounts || []).some(function (a) { return a.id === choice; })) choice = "";
+    $("statsAccount").value = choice;
+    state.statsAccount = choice;
+    var coverage = (s.tokenSamples || 0) + "/" + (s.requests || 0) + " 请求有 Token";
+    $("usageSummary").innerHTML =
+      statsCard("总消耗 Token", s.tokenSamples ? statsNumber(s.tokens) : "—", "输入 " + statsNumber(s.inputTokens) +
+        " · 输出 " + statsNumber(s.outputTokens) + " · 缓存读取 " + statsNumber(s.cachedTokens), "token") +
+      statsCard("总消耗积分", s.creditSamples ? statsCredit(s.credits) : "—", (s.creditSamples || 0) + "/" + (s.requests || 0) + " 请求有积分 · 仅计 usage.credit", "credit") +
+      statsCard("账号调用次数", statsNumber(s.requests), "完整 " + statsNumber(s.success) + " · 失败 / 不完整 " + statsNumber(s.failed), "neutral") +
+      statsCard("平均总耗时", statsDuration(s.avgLatencyMs), coverage, "token") +
+      statsCard("平均首Token (TTFT)", statsDuration(tokenTime(s)), (currentTTFT ? (s.ttftSamples || 0) : 0) + "/" + (s.requests || 0) + " 请求有新口径有效样本", "first");
+    var chartBox = function (id) {
+      var el = $(id), w = el && el.clientWidth ? el.clientWidth : 900;
+      return {w: w, h: w < 520 ? 230 : 280};
+    };
+    $("usageChart").innerHTML = statsComboChart(rows, {
+      lines: [{label: "总 Token", color: "token", value: function (b) { return b.tokenSamples ? b.tokens : null; }}],
+      bars: [{label: "积分", color: "credit", value: function (b) { return b.creditSamples ? b.credits : null; }}],
+      title: "总 Token（折线，左轴）与积分（柱形，右轴）消耗趋势",
+      leftFormat: function (v) { return v >= 1000000 ? (v / 1000000).toFixed(2) + "M" : statsNumber(v); },
+      rightFormat: statsCredit,
+      box: chartBox("usageChart")
+    });
+    var latencyRows = data.modelLatency || [];
+    var latencyLines = [], latencyBars = [];
+    latencyRows.forEach(function (row, index) {
+      var color = "m" + (index % 8), label = row.model || "未命名模型";
+      latencyLines.push({label: label, color: color, value: function (_bucket, i) {
+        var points = row.avgLatencyMs || [];
+        return i < points.length ? points[i] : null;
+      }});
+      latencyBars.push({label: label, color: color, value: function (_bucket, i) {
+        var points = row.avgTtftMs || [];
+        return i < points.length ? points[i] : null;
+      }});
+    });
+    $("latencyLegend").innerHTML = latencyLines.map(function (s) {
+      return '<i class="series-dot ' + s.color + '"></i><span>' + esc(s.label) + "</span>";
     }).join("");
+    $("latencyChart").innerHTML = statsComboChart(rows, {
+      lines: latencyLines, bars: latencyBars,
+      title: "各模型请求耗时：柱形=首Token，折线=总耗时。按当前时间和账号分别计算",
+      leftFormat: statsDuration,
+      box: chartBox("latencyChart")
+    });
+    // 明细改为按模型排名，跟随同一时间范围与账号筛选；服务端已按用量排序并剔除无调用模型。
+    var ranked = data.models || [];
+    $("statsRange").textContent = data.start + " → " + data.end + " · " + ranked.length + " 个模型有调用";
+    $("statsTable").querySelector("tbody").innerHTML = ranked.length ? ranked.map(function (m, i) {
+      return "<tr><td>" + (i + 1) + "</td><td class='mono'>" + esc(m.model) + "</td><td>" + esc(statsNumber(m.requests)) + "</td><td>" +
+        esc(m.success + " / " + m.failed) + "</td><td>" + esc(m.tokenSamples ? statsNumber(m.tokens) : "—") + "</td><td>" +
+        esc(m.tokenSamples ? statsNumber(m.inputTokens) + " / " + statsNumber(m.outputTokens) : "—") + "</td><td>" +
+        esc(m.tokenSamples ? statsNumber(m.cachedTokens) : "—") + "</td><td>" +
+        esc(m.creditSamples ? statsCredit(m.credits) : "—") + "</td><td>" + esc(statsDuration(m.avgLatencyMs)) + "</td><td>" +
+        esc(statsDuration(tokenTime(m))) + "</td><td class='hint'>" + esc("Token " + m.tokenSamples + "/" + m.requests +
+          " · 积分 " + m.creditSamples + "/" + m.requests + " · TTFT " + (currentTTFT ? m.ttftSamples : 0) + "/" + m.requests) + "</td></tr>";
+    }).join("") : '<tr><td colspan="11" class="empty">所选范围没有模型调用记录</td></tr>';
+  }
+
+  function loadStats(force) {
+    if (!state.apiKey || state.statsPending || (!force && Date.now() - state.statsLastPoll < 10000)) return Promise.resolve();
+    state.statsPending = true;
+    var version = state.statsVersion, key = state.apiKey;
+    var params = ["period=" + encodeURIComponent($("statsPeriod").value || "day")];
+    var scope = state.statsAccount || "";
+    if (scope.indexOf("site:") === 0) params.push("site=" + encodeURIComponent(scope.slice(5)));
+    else if (scope) params.push("account=" + encodeURIComponent(scope));
+    ["start", "end"].forEach(function (field) {
+      var value = $(field === "start" ? "statsStart" : "statsEnd").value;
+      if (value) params.push(field + "=" + encodeURIComponent(value));
+    });
+    $("statsInfo").textContent = "正在读取统计；图表与表格保持上次数据…";
+    return api("/admin/api/stats?" + params.join("&")).then(function (data) {
+      if (version !== state.statsVersion || key !== state.apiKey) return;
+      renderStats(data);
+      state.statsLastPoll = Date.now();
+    }).catch(function (err) {
+      if (err && err.status === 400 && state.statsAccount) {
+        // 上次记住的账号已被删除时，退回全局查询而不是一直报错。
+        state.statsAccount = "";
+        rememberStatsFilter();
+        state.statsVersion++;
+        return;
+      }
+      if (version === state.statsVersion && key === state.apiKey) $("statsInfo").textContent = "统计读取失败，图表保留上次结果；请检查筛选日期或稍后重试。";
+    }).then(function () {
+      state.statsPending = false;
+      if (version !== state.statsVersion && state.apiKey) return loadStats(true);
+    });
+  }
+
+  function changeStatsFilter(resetDates) {
+    state.statsVersion++;
+    state.statsLastPoll = 0;
+    if (resetDates) {
+      $("statsStart").value = "";
+      $("statsEnd").value = "";
+      state.statsDatesTouched = false;
+    }
+    state.statsAccount = $("statsAccount").value || "";
+    rememberStatsFilter();
+    return loadStats(true);
   }
 
   var SITE_LABEL = { cn: "国内站", intl: "国际站" };
-
-  // renderSiteSummary 按站点分别展示同样的数量指标，便于一眼看出国内/国际各自的负荷。
-  function renderSiteSummary(bySite) {
-    var box = $("siteSummary");
-    if (!box) return;
-    bySite = bySite || {};
-    box.innerHTML = ["cn", "intl"].map(function (site) {
-      return '<div class="site-block">' +
-        '<div class="site-head">' + esc(SITE_LABEL[site]) + '</div>' +
-        '<div class="cards">' + metricCards(bySite[site] || {}) + '</div>' +
-        '</div>';
-    }).join("");
-  }
 
   function renderStatus(data) {
     state.lastStatus = data;
     var g = data.gateway || {};
     $("meta").innerHTML =
-      '<span class="chip">v' + esc(g.version) + '</span>' +
+      '<a class="chip chip-link" href="https://github.com/CangShui/workbuddy-gateway"' +
+      ' target="_blank" rel="noreferrer" title="在新标签页打开项目地址">v' + esc(g.version) + '</a>' +
       '<span class="chip">' + esc(g.listen) + '</span>' +
       '<span class="chip">模型源 ' + esc(g.modelSource || "unavailable") + '</span>' +
       '<span class="chip">更新 ' + esc(fmtTime(data.updatedAt)) + '</span>';
 
-    $("summaryCards").innerHTML = metricCards(data.summary || {});
-    renderSiteSummary(data.siteSummary);
+    renderPoolHealth(data);
+    if (state.lastAccountAlerts) renderAccountAlerts(state.lastAccountAlerts);
 
     $("gatewayInfo").innerHTML = kvRow("版本", g.version) +
       kvRow("监听地址", g.listen) +
@@ -225,11 +591,244 @@
     quota_exhausted: "warn", expired: "warn", disabled: "danger"
   };
 
+  // Cookie 仅保存两个显示偏好，不包含管理 Key、凭据、配置或账号信息。
+  // 统计筛选（粒度/范围/起止日期）记在 Cookie 里，退出登录或重新打开页面都能恢复。
+  // 只保存用户真正改过的日期：没动过就留空，继续用默认的滚动区间，避免把默认区间冻结住。
+  var STATS_FILTER_COOKIE = "gateway_stats_filter";
+
+  function readCookieRaw(name) {
+    try {
+      var cookies = String(document.cookie || "").split(";");
+      for (var i = 0; i < cookies.length; i++) {
+        var pair = cookies[i].trim();
+        if (pair.indexOf(name + "=") === 0) return decodeURIComponent(pair.slice(name.length + 1));
+      }
+    } catch (_) { /* Cookie 被禁用时按默认值渲染，不影响登录与查询 */ }
+    return "";
+  }
+
+  function writeCookieRaw(name, value) {
+    try {
+      document.cookie = name + "=" + encodeURIComponent(value) +
+        "; Path=/ui; Max-Age=31536000; SameSite=Lax" +
+        (window.location.protocol === "https:" ? "; Secure" : "");
+      return readCookieRaw(name) === value;
+    } catch (_) { return false; }
+  }
+
+  function readStatsFilterCookie() {
+    var raw = readCookieRaw(STATS_FILTER_COOKIE);
+    if (!raw) return null;
+    try {
+      var saved = JSON.parse(raw);
+      if (!saved || typeof saved !== "object") return null;
+      var periods = ["hour", "day", "week", "month"];
+      return {
+        period: periods.indexOf(saved.period) > -1 ? saved.period : "",
+        account: typeof saved.account === "string" ? saved.account : "",
+        start: typeof saved.start === "string" ? saved.start : "",
+        end: typeof saved.end === "string" ? saved.end : ""
+      };
+    } catch (_) { return null; }
+  }
+
+  function writeStatsFilterCookie() {
+    return writeCookieRaw(STATS_FILTER_COOKIE, JSON.stringify({
+      period: $("statsPeriod").value || "day",
+      account: state.statsAccount || "",
+      start: state.statsDatesTouched ? ($("statsStart").value || "") : "",
+      end: state.statsDatesTouched ? ($("statsEnd").value || "") : ""
+    }));
+  }
+
+  function initStatsFilter() {
+    var saved = readStatsFilterCookie();
+    if (!saved) return;
+    if (saved.period) $("statsPeriod").value = saved.period;
+    state.statsAccount = saved.account;
+    if (saved.start || saved.end) {
+      $("statsStart").value = saved.start;
+      $("statsEnd").value = saved.end;
+      state.statsDatesTouched = true;
+    }
+    var hint = $("statsFilterStatus");
+    if (hint) {
+      hint.textContent = "已恢复上次的统计筛选；改完点「查询」即可生效。";
+      hint.classList.remove("hidden");
+    }
+  }
+
+  function rememberStatsFilter() {
+    var remembered = writeStatsFilterCookie();
+    var hint = $("statsFilterStatus");
+    if (hint) {
+      hint.textContent = remembered ? "" : "统计筛选已应用，但浏览器没能保存 Cookie，刷新后可能记不住这次选择。";
+      hint.classList.toggle("hidden", remembered);
+    }
+    return remembered;
+  }
+
+  function readListFilterCookie(name) {
+    try {
+      var cookies = String(document.cookie || "").split(";");
+      for (var i = 0; i < cookies.length; i++) {
+        var pair = cookies[i].trim();
+        if (pair.indexOf(name + "=") !== 0) continue;
+        var value = pair.slice(name.length + 1);
+        return value === "1" ? true : value === "0" ? false : null;
+      }
+    } catch (_) { /* Cookie 被禁用时回落到显示全部，不影响管理登录。 */ }
+    return null;
+  }
+
+  function writeListFilterCookie(name, enabled) {
+    try {
+      document.cookie = name + "=" + (enabled ? "1" : "0") +
+        "; Path=/ui; Max-Age=31536000; SameSite=Lax" +
+        (window.location.protocol === "https:" ? "; Secure" : "");
+      return readListFilterCookie(name) === enabled;
+    } catch (_) { return false; }
+  }
+
+  function initListFilters() {
+    LIST_FILTERS.forEach(function (filter) {
+      $(filter.id).checked = readListFilterCookie(filter.cookie) === true;
+      $(filter.id).addEventListener("change", function () { changeListFilter(filter.kind); });
+    });
+  }
+
+  function reportRestoredListFilters() {
+    LIST_FILTERS.forEach(function (filter) {
+      reportUIEvent("list_filter_restored", filter.route, 0, traceID(), $(filter.id).checked);
+    });
+  }
+
+  function changeListFilter(kind) {
+    var filter = LIST_FILTERS.find(function (item) { return item.kind === kind; });
+    if (!filter) return;
+    var trace = traceID();
+    var enabled = $(filter.id).checked;
+    var remembered = writeListFilterCookie(filter.cookie, enabled);
+    var hint = $(filter.statusID);
+    hint.textContent = remembered ? "" : "本次筛选已应用，但浏览器未允许保存 Cookie，刷新后可能无法记住状态。";
+    hint.classList.toggle("hidden", remembered);
+    reportUIEvent("list_filter_changed", filter.route, 0, trace, enabled);
+    if (!remembered) reportUIEvent("list_filter_cookie_failed", filter.route, 0, trace, enabled);
+    // 筛选立即作用于已加载的数据；刷新中的响应也按当前勾选状态渲染。
+    if (kind === "accounts") {
+      if (state.lastStatus) renderAccounts(state.lastStatus.accounts || []);
+    } else if (state.lastModels) {
+      renderModels(state.lastModels);
+    }
+  }
+
+  // ---- 账号：网页新增（复用 CLI 登录流程）与删除 ---------------------------
+  function openAddAccount() {
+    $("addAccountPanel").classList.remove("hidden");
+    $("addAccountResult").classList.add("hidden");
+    $("addAccountQr").removeAttribute("src");
+    $("addAccountStatus").textContent = "正在读取默认凭据名…";
+    state.addAccountId = "";
+    state.addAccountPoll = 0;
+    return api("/admin/api/account-add").then(function (data) {
+      $("addFile").value = data.defaultFile || "";
+      $("addAccountStatus").textContent = "";
+    }).catch(function () {
+      $("addAccountStatus").textContent = "读取默认凭据名失败，可手动填写。";
+    });
+  }
+
+  function closeAddAccount() {
+    var id = state.addAccountId;
+    state.addAccountId = "";
+    state.addAccountPoll = 0;
+    $("addAccountPanel").classList.add("hidden");
+    $("addAccountResult").classList.add("hidden");
+    $("addAccountQr").removeAttribute("src");
+    if (id) return api("/admin/api/account-cancel", {method: "POST", body: {id: id}}).catch(function () {});
+    return Promise.resolve();
+  }
+
+  function startAddAccount() {
+    var site = $("addSite").value === "intl" ? "intl" : "cn";
+    var file = ($("addFile").value || "").replace(/^\s+|\s+$/g, "");
+    if (!file) { $("addAccountStatus").textContent = "请先填写凭据名。"; return; }
+    if (state.addAccountId) closeAddAccount();
+    $("addStart").disabled = true;
+    $("addAccountStatus").textContent = "正在获取登录接口…";
+    return api("/admin/api/account-add", {method: "POST", body: {site: site, file: file}}).then(function (data) {
+      state.addAccountId = data.id || "";
+      state.addAccountPoll = 0;
+      $("addAccountResult").classList.remove("hidden");
+      $("addAccountQr").src = data.qrPng || "";
+      $("addAccountLink").href = data.authUrl || "#";
+      $("addAccountLink").textContent = data.authUrl || "";
+      $("addAccountStatus").textContent = "请用手机扫码完成授权；成功后凭据会自动保存并加载，无需重启。";
+      pollAddAccount();
+    }).catch(function (err) {
+      $("addAccountStatus").textContent = "获取登录接口失败：" + ((err && err.detail) || "请稍后重试");
+    }).then(function () { $("addStart").disabled = false; });
+  }
+
+  function pollAddAccount(force) {
+    if (!state.addAccountId || !state.apiKey) return Promise.resolve();
+    if (!force && Date.now() - state.addAccountPoll < 2000) return Promise.resolve();
+    state.addAccountPoll = Date.now();
+    var id = state.addAccountId;
+    return api("/admin/api/account-add?id=" + encodeURIComponent(id)).then(function (data) {
+      if (state.addAccountId !== id) return;
+      var status = data.status || "pending";
+      if (status === "pending") {
+        $("addAccountStatus").textContent = "等待扫码授权…（可继续扫码，超时后需重新获取）";
+        return;
+      }
+      state.addAccountId = "";
+      if (status === "done") {
+        $("addAccountStatus").textContent = "登录成功，凭据已保存为 " + (data.savedAs || "") + "，账号池已自动加载。";
+        showAlert("账号已添加：" + (data.savedAs || ""), true);
+        refreshActive();
+      } else if (status === "expired") {
+        $("addAccountStatus").textContent = "登录已超时，请重新点击「获取登录接口」。";
+      } else if (status === "cancelled") {
+        $("addAccountStatus").textContent = "登录已取消。";
+      } else {
+        $("addAccountStatus").textContent = "登录失败：" + (data.error || "请重试");
+      }
+    }).catch(function () {
+      $("addAccountStatus").textContent = "查询登录进度失败，保留上次结果。";
+    });
+  }
+
+  function accountRowActions(event) {
+    var target = event && event.target;
+    if (!target || typeof target.closest !== "function") return;
+    var btn = target.closest("[data-account-delete]");
+    if (!btn) return;
+    var name = btn.getAttribute("data-account-delete");
+    if (!name) return;
+    if (!window.confirm("确定删除凭据 " + name + " ？\n\n" +
+        "会从账号池移除该账号，并删除运行目录下的对应凭据文件。统计与历史日志保留，操作不可撤销。")) return;
+    state.policyVersion++;
+    api("/admin/api/account-delete", {method: "POST", body: {file: name}}).then(function () {
+      showAlert("已删除凭据 " + name + "，账号池已同步移除。", true);
+      return refreshActive();
+    }).catch(function (err) {
+      showAlert("删除失败：" + ((err && err.detail) || "请稍后重试"), false);
+    });
+  }
+
   function renderAccounts(list) {
+    var onlyUsable = $("onlyUsableAccounts").checked;
+    if (onlyUsable) {
+      list = list.filter(function (account) {
+        return account.state === "active" && account.schedulingEnabled !== false;
+      });
+    }
     var tb = $("accountsTable").querySelector("tbody");
     var focusTarget = focusedPolicyTarget(tb);
     if (!list.length) {
-      tb.innerHTML = '<tr><td colspan="16" class="empty">暂无账号数据（服务是否已写入状态快照？）</td></tr>';
+      tb.innerHTML = '<tr><td colspan="16" class="empty">' +
+        (onlyUsable ? "没有符合条件的可用账号，取消勾选可查看全部账号。" : "暂无账号数据（服务是否已写入状态快照？）") + '</td></tr>';
       return;
     }
     tb.innerHTML = list.map(function (a, i) {
@@ -248,18 +847,26 @@
         "<td>" + esc(site) + "</td>" +
         "<td><span class='badge " + cls + "'>" + esc(st) + "</span></td>" +
         "<td>" + esc(fmtTime(a.tokenExpiresAt)) + "</td>" +
-        "<td>" + esc(a.quotaKnown ? count(a.quotaTotal) : "-") + "</td>" +
-        "<td>" + esc(a.quotaKnown ? count(a.quotaUsed) : "-") + "</td>" +
-        "<td>" + esc(a.quotaKnown ? count(a.quotaRemaining) : "-") + "</td>" +
+        "<td>" + esc(quotaAmount(a, "total")) + "</td>" +
+        "<td>" + esc(quotaAmount(a, "used")) + "</td>" +
+        "<td>" + esc(quotaAmount(a, "remaining")) + "</td>" +
         "<td>" + esc((a.planLabel || "-") + (a.planStale ? "（待刷新）" : "")) + "</td>" +
         "<td>" + esc(count(a.freeModels)) + "</td>" +
         "<td>" + esc(count(a.modelCooldowns)) + "</td>" +
-        "<td>" + esc(fmtTime(a.refreshExpiresAt)) + "</td>" +
         "<td>" + esc(fmtTime(a.lastRefreshTime)) + "</td>" +
         "<td>" + esc(count(a.refreshFailCount)) + "</td>" +
+        "<td><button class=\"ghost danger\" type=\"button\" data-account-delete=\"" +
+        esc(a.path) + "\">删除</button></td>" +
         "</tr>";
     }).join("");
     restorePolicyFocus(tb, focusTarget);
+  }
+
+  function quotaAmount(account, kind) {
+    if (!account.quotaKnown) return "-";
+    if (account.quotaUnlimited && (kind === "total" || kind === "remaining")) return "不限";
+    var value = kind === "total" ? account.quotaTotal : (kind === "used" ? account.quotaUsed : account.quotaRemaining);
+    return count(value);
   }
 
   // ---- 渲染：模型 --------------------------------------------------------
@@ -311,36 +918,156 @@
   }
 
   function renderModels(data) {
+    state.lastModels = data;
     var list = data.models || [];
     var onlyUsable = $("onlyUsable").checked;
     if (onlyUsable) {
-      list = list.filter(function (m) { return (m.availableAccounts || 0) > 0; });
+      list = list.filter(function (m) { return m.enabled !== false && (m.availableAccounts || 0) > 0; });
     }
     var tb = $("modelsTable").querySelector("tbody");
     var focusTarget = focusedPolicyTarget(tb);
     $("modelPolicyHint").textContent = data.policyMode === "allowlist" ?
       "当前使用模型白名单，开关反映白名单规则。首次修改开关会删除 models.allowlist，将当前模型列表的启停状态转为 models.blocklist；以后新增模型默认开启。" :
-      "模型开关写入 models.blocklist 并立即生效；停用模型仍保留在此列表，客户端模型目录会隐藏停用项。";
+      "模型开关写入 models.blocklist 并立即生效；停用模型保留统计记录，取消筛选可查看全部模型，客户端模型目录会隐藏停用项。";
     if (!list.length) {
-      tb.innerHTML = '<tr><td colspan="10" class="empty">暂无模型数据</td></tr>';
+      tb.innerHTML = '<tr><td colspan="10" class="empty">' +
+        (onlyUsable ? "没有符合条件的可用模型，取消勾选可查看全部模型。" : "暂无模型数据") + '</td></tr>';
       return;
     }
     tb.innerHTML = list.map(function (m) {
       return "<tr>" +
         "<td>" + policySwitch("model", m.id, m.enabled !== false, m.policyReason) + "</td>" +
         "<td class='mono'>" + esc(m.id) + "</td>" +
-        "<td>" + esc(m.cnMultiplier || "-") + "</td>" +
-        "<td>" + esc(m.intlMultiplier || "-") + "</td>" +
+        rateCell("cn", m.id, m.cnMultiplier) +
+        rateCell("intl", m.id, m.intlMultiplier) +
         "<td>" + esc(count(m.availableAccounts)) + "</td>" +
         "<td>" + esc(count(m.requests)) + "</td>" +
-        "<td>" + esc(fmtMs(m.avgTtftMs, m.hasTtft)) + "</td>" +
+        "<td>" + esc(fmtMs(m.avgTtftMs, m.hasTtft && m.ttftMetric === "first_token_v2")) + "</td>" +
         "<td>" + esc(fmtMs(m.avgLatencyMs, m.hasLatency)) + "</td>" +
         "<td>" + esc(fmtTokensM(m.tokens)) + "</td>" +
         "<td>" + esc(m.lastStatus || "-") + "</td>" +
         "</tr>";
     }).join("");
     restorePolicyFocus(tb, focusTarget);
+    restoreRateDetails(tb);
     if (data.stale) showAlert("模型统计快照过旧，当前展示的是上次数据。");
+  }
+
+  // ---- 倍率来源：全部取自普通日志，没有记录就显示「没有日志」 -------------------
+  function rateKey(site, model) {
+    return site + "|" + String(model || "").trim().toLowerCase();
+  }
+
+  function rateCell(site, model, text) {
+    var label = site === "cn" ? "国内" : "国际";
+    return "<td class='rate-cell'><div class='rate-line'><span class='rate-value'>" + esc(text || "-") +
+      "</span><button type='button' class='rate-info' data-rate-site='" + esc(site) +
+      "' data-rate-model='" + esc(model) + "' aria-expanded='false' aria-label='查看" + label +
+      "倍率数据来源与更新时间'>!</button></div>" +
+      "<div class='rate-detail hidden' role='region' aria-label='" + label + "倍率来源详情'></div></td>";
+  }
+
+  function ensureRateDetails() {
+    if (state.rateDetails && Date.now() - state.rateDetailsAt < 60000) return Promise.resolve(state.rateDetails);
+    if (state.rateDetailsPending) return state.rateDetailsPending;
+    state.rateDetailsPending = api("/admin/api/rate-detail").then(function (data) {
+      state.rateDetails = data;
+      state.rateDetailsAt = Date.now();
+      state.rateDetailsPending = null;
+      return data;
+    }).catch(function (err) {
+      state.rateDetailsPending = null;
+      throw err;
+    });
+    return state.rateDetailsPending;
+  }
+
+  function rateDetailHTML(payload, site, model) {
+    var info = payload && payload.rates ? payload.rates[rateKey(site, model)] : null;
+    if (!info || !info.hasLog) {
+      return "<p class='rate-none'>没有日志</p><p class='hint'>" +
+        esc(payload && payload.noLogHint || "普通日志中没有该模型的倍率记录。") + "</p>";
+    }
+    // 不再标注「状态：未知」：该结论是实测过的，写「未知」会让人误以为从未检测。
+    var meta = "<div class='rate-meta'><span>来源：" + esc(info.source) + "</span>" +
+      "<span>更新时间：" + esc(fmtTime(info.updatedAt)) + "</span></div>";
+    var html = meta;
+    if (info.explain) html += "<p class='rate-explain'>" + esc(info.explain) + "</p>";
+    if (info.unknown && info.refreshHint) {
+      html += "<p class='rate-refresh'><strong>如何刷新：</strong>" + esc(info.refreshHint) + "</p>";
+    }
+    var others = info.others || [];
+    if (others.length) {
+      html += "<div class='rate-others'><div class='rate-logs-title'>其他记录</div><ul>" +
+        others.map(function (record) {
+          return "<li>" + esc(record.source) + " · " + esc(fmtTime(record.updatedAt)) + " · " +
+            esc(record.explain || record.value || "") + "</li>";
+        }).join("") + "</ul></div>";
+    }
+    var raw = (info.records || []).filter(function (record) { return record.logLine; });
+    if (raw.length) {
+      // 轮询会重建表格，展开状态必须自己记住，否则每次刷新都会被自动折叠。
+      var rawOpen = state.openRawLogs[rateKey(site, model)] === true;
+      html += "<details class='rate-raw'" + (rawOpen ? " open" : "") +
+        "><summary>原始日志（" + raw.length + " 条，默认折叠）</summary><ul>" +
+        raw.map(function (record) { return "<li><code>" + esc(record.logLine) + "</code></li>"; }).join("") +
+        "</ul></details>";
+    }
+    return html;
+  }
+
+  function fillRateDetail(button, panel) {
+    var site = button.getAttribute("data-rate-site");
+    var model = button.getAttribute("data-rate-model");
+    panel.classList.remove("hidden");
+    button.setAttribute("aria-expanded", "true");
+    panel.innerHTML = "<p class='hint'>读取日志中…</p>";
+    ensureRateDetails().then(function (payload) {
+      panel.innerHTML = rateDetailHTML(payload, site, model);
+      // details 的 toggle 事件不冒泡，只能在渲染后逐个绑定，用于记住展开状态。
+      var details = panel.querySelector("details.rate-raw");
+      if (details) {
+        details.addEventListener("toggle", function () {
+          var key = rateKey(site, model);
+          if (details.open) {
+            state.openRawLogs[key] = true;
+          } else {
+            delete state.openRawLogs[key];
+          }
+        });
+      }
+    }).catch(function () {
+      panel.innerHTML = "<p class='hint'>日志读取失败，请稍后重试；没有数据时不猜测来源。</p>";
+    });
+  }
+
+  function toggleRateDetail(event) {
+    var button = event.target.closest("button.rate-info");
+    if (!button) return;
+    var cell = button.closest("td");
+    var panel = cell ? cell.querySelector(".rate-detail") : null;
+    if (!panel) return;
+    var key = rateKey(button.getAttribute("data-rate-site"), button.getAttribute("data-rate-model"));
+    if (button.getAttribute("aria-expanded") === "true") {
+      button.setAttribute("aria-expanded", "false");
+      panel.classList.add("hidden");
+      panel.innerHTML = "";
+      delete state.openRateKeys[key];
+      return;
+    }
+    state.openRateKeys[key] = true;
+    fillRateDetail(button, panel);
+  }
+
+  // 轮询会重建表格，已展开的详情按 key 恢复，避免每次刷新都折叠。
+  function restoreRateDetails(table) {
+    Array.prototype.forEach.call(table.querySelectorAll("button.rate-info"), function (button) {
+      var key = rateKey(button.getAttribute("data-rate-site"), button.getAttribute("data-rate-model"));
+      if (!state.openRateKeys[key]) return;
+      var cell = button.closest("td");
+      var panel = cell ? cell.querySelector(".rate-detail") : null;
+      if (panel) fillRateDetail(button, panel);
+    });
   }
 
   // ---- 渲染：日志 --------------------------------------------------------
@@ -358,12 +1085,11 @@
         if (data.file) sel.value = data.file;
       }
       var box = $("logBox");
-      if (data.error) { box.textContent = "读取日志失败: " + data.error; return; }
-      box.textContent = (data.lines && data.lines.length) ? data.lines.join("\n") : "（暂无日志）";
-      if (data.truncated) showAlert("日志达到管理界面的读取预算，只展示完整尾部行；超长单行被省略。原日志文件未修改。");
+      if (data.error) { box.textContent = "\u8bfb\u53d6\u65e5\u5fd7\u5931\u8d25: " + data.error; return; }
+      box.textContent = (data.lines && data.lines.length) ? data.lines.join("\n") : "\u8be5\u6587\u4ef6\u6682\u65e0\u65e5\u5fd7\u3002";
+      if (data.truncated) showAlert("\u65e5\u5fd7\u8fbe\u5230\u672c\u6b21\u8bfb\u53d6\u9884\u7b97\uff0c\u53ea\u5c55\u793a\u90e8\u5206\u884c\uff1b\u539f\u65e5\u5fd7\u6587\u4ef6\u672a\u4fee\u6539\u3002");
     }).catch(function () {
-      // api 已显示错误，保留上次日志，不把读取失败伪装成空数据。
-      if (!initial && file) return loadLogs(true); // 当前文件被自动清理时重新选择现有日志。
+      if (!initial && file) return loadLogs(true);
     });
   }
 
@@ -603,6 +1329,9 @@
     state.refreshPending = true;
     var policyVersion = state.policyVersion;
     var onErr = function () {
+      if (state.activeTab === "overview") {
+        renderPoolHealth({stale: true});
+      }
       if ($("conn").className.indexOf("danger") === -1) {
         setConn("连接失败", "danger");
       }
@@ -611,7 +1340,14 @@
     if (state.activeTab === "overview" || state.activeTab === "accounts") {
       pending = api("/admin/api/status").then(function (data) {
         if (!state.togglePending && policyVersion === state.policyVersion) renderStatus(data);
-      }).catch(onErr);
+      }).catch(onErr).then(function () {
+        // 统计是附加信息：不并入 refreshActive 的完成链，避免统计变慢时拖住状态轮询。
+        if (state.activeTab === "overview") {
+          loadStats(false);
+          loadAccountAlerts();
+        }
+        if (state.activeTab === "accounts") pollAddAccount();
+      });
     } else if (state.activeTab === "models") {
       pending = api("/admin/api/models").then(function (data) {
         if (!state.togglePending && policyVersion === state.policyVersion) renderModels(data);
@@ -714,6 +1450,7 @@
     setConn("校验中…", "");
     return api("/admin/api/settings").then(function (data) {
       sessionStorage.setItem(KEY_STORAGE, key);
+      reportRestoredListFilters();
       renderSettings(data);
       $("tabs").classList.remove("hidden");
       $("dashboard").classList.remove("hidden");
@@ -778,9 +1515,27 @@
   function init() {
     // 清理旧版同源页面遗留的模型 API Key，不把它误当成管理 Key。
     localStorage.removeItem("wb_gateway_api_key");
+    initListFilters();
+    initStatsFilter();
+    ["statsStart", "statsEnd"].forEach(function (id) {
+      $(id).addEventListener("change", function () { state.statsDatesTouched = true; });
+    });
     $("apiKey").value = state.apiKey;
     initTheme();
     $("saveKey").addEventListener("click", saveKey);
+    $("statsApply").addEventListener("click", function () { changeStatsFilter(false); });
+    $("statsPeriod").addEventListener("change", function () { changeStatsFilter(true); });
+    $("statsAccount").addEventListener("change", function () { changeStatsFilter(false); });
+    // 图表 viewBox 跟随容器宽度，窗口尺寸变化后重绘一次（用 rAF 合并连续事件）。
+    var statsResizePending = false;
+    window.addEventListener("resize", function () {
+      if (!state.lastStats || statsResizePending) return;
+      statsResizePending = true;
+      (window.requestAnimationFrame || function (fn) { fn(); })(function () {
+        statsResizePending = false;
+        if (state.lastStats) renderStats(state.lastStats);
+      });
+    });
     $("logout").addEventListener("click", function () {
       if (state.configMode !== "preview" && !exitConfigEdit()) return;
       resetConfigEditor();
@@ -811,9 +1566,13 @@
     Array.prototype.forEach.call(document.querySelectorAll(".tab"), function (t) {
       t.addEventListener("click", function () { setTab(t.getAttribute("data-tab")); });
     });
-    $("onlyUsable").addEventListener("change", refreshActive);
     $("accountsTable").addEventListener("click", togglePolicy);
+    $("accountsTable").addEventListener("click", accountRowActions);
+    $("addAccountBtn").addEventListener("click", openAddAccount);
+    $("addStart").addEventListener("click", startAddAccount);
+    $("addCancel").addEventListener("click", closeAddAccount);
     $("modelsTable").addEventListener("click", togglePolicy);
+    $("modelsTable").addEventListener("click", toggleRateDetail);
     $("logFile").addEventListener("change", function () { loadLogs(false); });
     $("logLines").addEventListener("change", function () { loadLogs(false); });
 

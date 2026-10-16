@@ -9,6 +9,20 @@ last-*.json
 wb-models-cache.json
 wb-models-cache.json.tmp
 config.json
+stats.json
+.env
+.env.*
+!.env.example
+!.env.sample
+.netrc
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+.ssh/
+backups/
 
 # 本地编译产物
 workbuddy-gateway
@@ -24,3 +38,8 @@ Thumbs.db
 
 # 本地研究产物(含客户端源码提取与含凭据的抓包),不入仓库
 .client_ref/
+# 本地工具缓存、历史材料与可能包含环境信息的报告
+.codex-tmp/
+.playwright-mcp/
+docs/local/
+archive/local/
