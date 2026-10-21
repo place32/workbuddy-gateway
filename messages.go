@@ -95,6 +95,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	readDuration := debugElapsedSince(readStarted)
 	if err != nil {
 		debugBodyReadFailed(r, bodyBytes, readStarted, err)
+		debugFullIncomingBody(r, bodyBytes, false, true)
 		writeAnthropicError(w, http.StatusBadRequest, "api_error", "读取请求体失败")
 		return
 	}
@@ -106,6 +107,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	decodeDuration := time.Since(decodeStarted)
 	if decodeErr != nil {
 		debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, false, decodeErr)
+		debugFullIncomingBody(r, bodyBytes, false, false)
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "无效的 JSON 请求体")
 		return
 	}
@@ -118,6 +120,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	wantThinking := anthropicThinkingOn(msgReq)
 	debugSetModelAndStream(r, modelName, isStream)
 	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
+	debugFullIncomingBody(r, bodyBytes, true, false)
 	prepareConversationContext(r, msgReq)
 
 	// 模型黑白名单拦截：命中即拒绝，不消耗任何上游账号额度。
@@ -141,7 +144,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	chatReq["stream"] = true // 上游强制流式，非流式由网关本地聚合
 
 	applyThinkingRules(chatReq, modelName)
-	sanitizeMessages(chatReq)
+	if modified := sanitizeMessages(chatReq); modified > 0 {
+		logSystemPrefixSanitized(r, reqID, modified)
+	}
 	prepareSystemPromptForUpstream(chatReq, r, reqID, w.Header().Get("X-Trace-ID"))
 	// 输出预算归一化：客户端未声明 max_tokens 时补模型输出上限，
 	// 避免上游默认预留 384000 导致长会话在远未到窗口上限时被 11133 拒绝

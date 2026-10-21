@@ -596,7 +596,7 @@ test("请求进行中切换筛选也会按最新勾选状态渲染，不额外�
   await pending;
   assert(f.element("modelsTable").innerHTML.includes("available"));
   assert(!f.element("modelsTable").innerHTML.includes("empty"));
-  assert.equal(calls.filter(c => c.route === "/admin/api/models").length, 1);
+  assert.equal(calls.filter(c => c.route.split("?")[0] === "/admin/api/models").length, 1);
   audit("在途请求按最新筛选渲染通过", {additional_data_requests: 0});
 });
 

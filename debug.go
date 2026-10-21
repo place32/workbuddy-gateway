@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -69,9 +70,7 @@ type runtimeFileConfig struct {
 		Fallback string `json:"fallback"`
 		Force    string `json:"force"`
 	} `json:"systemPrompt"`
-	Debug struct {
-		Enabled bool `json:"enabled"`
-	} `json:"debug"`
+	Debug debugFileConfig `json:"debug"`
 	Logs struct {
 		RetentionDays int `json:"retentionDays"` // 0 保留全部；正数保留含今天在内的 N 个日历日。
 	} `json:"logs"`
@@ -96,6 +95,53 @@ type runtimeFileConfig struct {
 	} `json:"models"`
 }
 
+
+// debugFileConfig keeps malformed or future debug toggles from blocking startup.
+// Unknown fields are intentionally ignored only within this optional section.
+type debugFileConfig struct {
+	Enabled      bool `json:"enabled"`
+	FullRequests bool `json:"fullRequests"`
+}
+
+func (d *debugFileConfig) UnmarshalJSON(data []byte) error {
+	*d = debugFileConfig{}
+	raw := bytes.TrimSpace(data)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return nil // Non-object values and unknown debug fields must not block startup.
+	}
+	d.Enabled = tolerantConfigBool(object["enabled"])
+	d.FullRequests = tolerantConfigBool(object["fullRequests"])
+	return nil
+}
+
+func tolerantConfigBool(raw json.RawMessage) bool {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) || bytes.Equal(raw, []byte(`""`)) {
+		return false
+	}
+	var value bool
+	if json.Unmarshal(raw, &value) == nil {
+		return value
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		switch strings.ToLower(strings.TrimSpace(text)) {
+		case "true", "1", "yes", "on":
+			return true
+		default:
+			return false
+		}
+	}
+	var number float64
+	if json.Unmarshal(raw, &number) == nil {
+		return number == 1
+	}
+	return false
+}
 type modelAccountFileConfig struct {
 	Allowlist []string `json:"allowlist"`
 	Blocklist []string `json:"blocklist"`

@@ -267,3 +267,134 @@ func TestBeginAccountLoginUsesThreeControlPlaneRequests(t *testing.T) {
 		})
 	}
 }
+
+func TestDeleteAccountCredentialRemovesDisabledPhantom(t *testing.T) {
+	isolatedGatewayConfig(t)
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "workbuddy9.json")
+	marker := disabledMarker{
+		Path: target, Reason: "上游鉴权失败 (HTTP 403)", Nickname: "synthetic-user",
+	}
+	raw, err := json.Marshal(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(markerPath(target), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	accountMu.Lock()
+	old, oldRRIndex := accounts, rrIndex
+	accounts = []*Account{{Path: target, Disabled: true, DisabledReason: marker.Reason, Nickname: marker.Nickname}}
+	accountMu.Unlock()
+	t.Cleanup(func() {
+		accountMu.Lock()
+		accounts, rrIndex = old, oldRRIndex
+		accountMu.Unlock()
+	})
+	if err := writeStatusSnapshot(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := deleteAccountCredential("workbuddy9.json"); err != nil {
+		t.Fatalf("删除失效账号失败: %v", err)
+	}
+	accountMu.Lock()
+	remaining := len(accounts)
+	accountMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("失效账号应从账号池移除，剩余 %d 个", remaining)
+	}
+	if _, err := os.Stat(markerPath(target)); !os.IsNotExist(err) {
+		t.Fatal("失效标记应被清除")
+	}
+	snap, err := readStatusSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, acc := range snap.Accounts {
+		if filepath.Base(acc.Path) == "workbuddy9.json" {
+			t.Fatal("状态快照仍包含已删除的账号，网页会继续显示它")
+		}
+	}
+}
+
+func TestLoginSessionSnapshotReportsRemainingTime(t *testing.T) {
+	s := &loginSession{
+		ID: "login-snapshot-test", Site: "cn", File: "workbuddy1.json",
+		AuthURL: "https://example.test/login", status: "pending",
+		deadline: time.Now().Add(90 * time.Second),
+	}
+	snap := s.snapshot()
+	if snap["status"] != "pending" {
+		t.Fatalf("初始状态应为 pending: %#v", snap)
+	}
+	remaining, ok := snap["remainingSeconds"].(int)
+	if !ok || remaining < 85 || remaining > 90 {
+		t.Fatalf("剩余时间异常: %#v", snap["remainingSeconds"])
+	}
+
+	s.finish("expired", "登录已超时，请重新获取登录接口", nil, "")
+	snap = s.snapshot()
+	if snap["status"] != "expired" {
+		t.Fatalf("结束状态应为 expired: %#v", snap)
+	}
+	if got := snap["remainingSeconds"]; got != 0 {
+		t.Fatalf("结束会话不应再显示剩余时间: %#v", got)
+	}
+}
+
+func TestFinishedLoginSessionRetainedForWebPolling(t *testing.T) {
+	oldRetention := loginSessionRetention
+	loginSessionRetention = 40 * time.Millisecond
+	t.Cleanup(func() { loginSessionRetention = oldRetention })
+
+	s := &loginSession{
+		ID: "login-retention-test", Site: "cn", File: "workbuddy1.json",
+		status: "pending", deadline: time.Now().Add(-time.Second),
+	}
+	loginSessionsMu.Lock()
+	loginSessions[s.ID] = s
+	loginSessionsMu.Unlock()
+	t.Cleanup(func() { forgetLoginSession(s.ID) })
+
+	s.finish("expired", "登录已超时，请重新获取登录接口", nil, "")
+	scheduleForgetLoginSession(s.ID)
+	if findLoginSession(s.ID) == nil {
+		t.Fatal("结束后的会话应立即仍可被网页轮询到终态")
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	if findLoginSession(s.ID) != nil {
+		t.Fatal("超过保留时间后会话应被清理")
+	}
+}
+
+func TestAccountAddEndpointReturnsExpiredStatus(t *testing.T) {
+	isolatedGatewayConfig(t)
+	if err := applyGatewayConfig(gatewayFileConfig{AdminKey: "synthetic-account-admin"}); err != nil {
+		t.Fatal(err)
+	}
+	s := &loginSession{
+		ID: "login-expired-endpoint", Site: "cn", File: "workbuddy1.json",
+		status: "expired", deadline: time.Now().Add(-time.Minute),
+	}
+	loginSessionsMu.Lock()
+	loginSessions[s.ID] = s
+	loginSessionsMu.Unlock()
+	t.Cleanup(func() { forgetLoginSession(s.ID) })
+
+	handler := newWebUIHandler()
+	got := adminRequest(handler, "GET", "/admin/api/account-add?id="+s.ID, "synthetic-account-admin", "")
+	if got.Code != 200 {
+		t.Fatalf("查询已结束会话应返回 200: %d %s", got.Code, got.Body.String())
+	}
+	if !strings.Contains(got.Body.String(), `"status":"expired"`) {
+		t.Fatalf("网页轮询应能读到 expired 终态: %s", got.Body.String())
+	}
+	if !strings.Contains(got.Body.String(), `"remainingSeconds":0`) {
+		t.Fatalf("已结束会话不应返回剩余时间: %s", got.Body.String())
+	}
+}

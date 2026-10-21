@@ -42,7 +42,7 @@ import (
 )
 
 const (
-	version = "1.14.20"
+version = "1.14.21"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -206,7 +206,9 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 				traceID, reqID, acc.Path, try, retries, safeDebugError(lastErr))
 		}
 
+		debugFullUpstreamRequest(r, req, upstreamBytes, try)
 		resp, err := cfg.HttpClient.Do(req)
+		debugFullUpstreamResponse(r, req, resp, try, headersWritten.Load(), bodyWritten.Load(), err)
 		if err == nil {
 			return resp, upstreamCancel, nil
 		}
@@ -3587,6 +3589,7 @@ func requestAuditMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Trace-ID", traceID)
 		// 普通落盘审计也需要稳定的 TraceID / requestID；不能依赖可选 JSON 日志。
 		ensureDebugRequestContext(r, traceID, start)
+		debugFullIncomingHeaders(r)
 		r = r.WithContext(context.WithValue(r.Context(), statsRequestContextKey{}, &statsAttempt{}))
 		if debugLoggingEnabled() {
 			debugEvent(r, "info", "request_received", map[string]any{
@@ -3804,6 +3807,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 				log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游错误响应解压 账号=%s 状态码=%d 异常=%v 业务影响=按上游错误返回，但错误正文不可读", traceID, reqID, acc.Path, resp.StatusCode, errRead)
 			}
 			errStr := string(errBody)
+			debugFullUpstreamError(r, resp, errBody)
 			debugEvent(r, "warn", "upstream_response_rejected", map[string]any{
 				"upstream_host": prof.Base,
 				"status_code":   resp.StatusCode,
@@ -3919,6 +3923,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	readDuration := debugElapsedSince(readStarted)
 	if err != nil {
 		debugBodyReadFailed(r, bodyBytes, readStarted, err)
+		debugFullIncomingBody(r, bodyBytes, false, true)
 		writeOpenAIError(w, http.StatusBadRequest, "read_error", "读取请求体失败")
 		return
 	}
@@ -3931,6 +3936,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	decodeDuration := time.Since(decodeStarted)
 	if decodeErr != nil {
 		debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, false, decodeErr)
+		debugFullIncomingBody(r, bodyBytes, false, false)
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_json", "无效的 JSON 请求体")
 		return
 	}
@@ -3948,6 +3954,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	isStreamBool, _ := streamRaw.(bool)
 	debugSetModelAndStream(r, modelStr, isStreamBool)
 	debugBodyReadCompleted(r, bodyBytes, readDuration, decodeDuration, true, nil)
+	debugFullIncomingBody(r, bodyBytes, true, false)
 	prepareConversationContext(r, reqObj)
 
 	// 模型黑白名单拦截：命中即拒绝，不消耗任何上游账号额度。
@@ -3972,7 +3979,9 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	applyThinkingRules(reqObj)
 
 	// 消息归一化：developer 角色（OpenAI 新版 system 别名）在上游会被拒，统一转 system
-	sanitizeMessages(reqObj)
+	if modified := sanitizeMessages(reqObj); modified > 0 {
+		logSystemPrefixSanitized(r, reqID, modified)
+	}
 
 	// 会话结构归一化：保证首条消息为 system，修复部分非 harness 客户端
 	//（以 assistant / tool 续写或回传工具结果）触发的上游 11128 错误
@@ -4325,33 +4334,40 @@ func applyThinkingRules(obj any, modelName ...string) {
 	}
 }
 
-func sanitizeMessages(obj any) {
+func sanitizeMessages(obj any) int {
 	var arr []any
 	switch o := obj.(type) {
 	case *jsonObject:
 		raw, ok := o.Get("messages")
 		if !ok {
-			return
+			return 0
 		}
 		arr, ok = raw.([]any)
 		if !ok {
-			return
+			return 0
 		}
 	case map[string]any:
 		var ok bool
 		arr, ok = o["messages"].([]any)
 		if !ok {
-			return
+			return 0
 		}
 	}
+	modified := 0
 	for _, m := range arr {
-		// OpenAI 新版 developer 角色（GPT-5 系客户端/Codex）不被腾讯上游接受，
-		// 会返回 11128 "Illegal API invocation from an unapproved channel"，
-		// 统一归一化为 system（语义等价）。
+		// OpenAI developer role is an alias for system and is rejected by the upstream.
 		if roleOfMessage(m) == "developer" {
 			setMessageField(m, "role", "system")
 		}
+		if roleOfMessage(m) == "system" {
+			content, changed := sanitizeSystemMessageContent(messageField(m, "content"))
+			if changed {
+				setMessageField(m, "content", content)
+				modified++
+			}
+		}
 	}
+	return modified
 }
 
 // ensureLeadingSystemMessageOrdered 是 ensureLeadingSystemMessage 的 *jsonObject 适配版。

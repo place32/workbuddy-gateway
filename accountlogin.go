@@ -109,6 +109,12 @@ var (
 	loginSessions   = map[string]*loginSession{}
 )
 
+// loginSessionRetention 让已结束的登录会话在内存中多保留一段时间。
+// CLI 直接持有 *loginSession，不依赖会话表；网页只拿到 id，必须再查一次才能看到
+// expired / failed / done。若结束时立刻删除，前端轮询几乎总是拿到 404，表现为
+// 「链接失效了但控制台还在等」。
+var loginSessionRetention = 2 * time.Minute
+
 func newLoginSessionID() string {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err != nil {
@@ -136,6 +142,15 @@ func (s *loginSession) snapshot() map[string]any {
 	out := map[string]any{
 		"id": s.ID, "site": s.Site, "file": s.File, "authUrl": s.AuthURL,
 		"status": s.status, "expiresAt": s.deadline.Unix(),
+	}
+	if s.status == "pending" {
+		remaining := int(time.Until(s.deadline).Seconds())
+		if remaining < 0 {
+			remaining = 0
+		}
+		out["remainingSeconds"] = remaining
+	} else {
+		out["remainingSeconds"] = 0
 	}
 	if s.errText != "" {
 		out["error"] = s.errText
@@ -167,6 +182,13 @@ func forgetLoginSession(id string) {
 	loginSessionsMu.Unlock()
 }
 
+// scheduleForgetLoginSession 延迟清理已结束的会话，给网页轮询留出读取终态的时间。
+func scheduleForgetLoginSession(id string) {
+	time.AfterFunc(loginSessionRetention, func() {
+		forgetLoginSession(id)
+	})
+}
+
 // beginAccountLogin 复用 CLI login 的同一条流程：先取 state 与二维码，再轮询换取 token 并落地凭据。
 func beginAccountLogin(site, targetPath string) (*loginSession, error) {
 	prof := profileForEdition(site)
@@ -196,7 +218,7 @@ func (s *loginSession) run(ctx context.Context, targetPath string, pollHeaders f
 	trace := newTraceID()
 	log.Printf("[网页登录] traceId=%s 阶段=开始 站点=%s 凭据=%s 说明=已复用 CLI login 同一流程，等待扫码授权",
 		trace, s.Site, filepath.Base(targetPath))
-	defer forgetLoginSession(s.ID)
+	defer scheduleForgetLoginSession(s.ID)
 	defer s.cancel()
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -308,18 +330,46 @@ func deleteAccountCredential(name string) (string, error) {
 		return "", errors.New("凭据名不符合 workbuddy*.json，拒绝删除")
 	}
 	info, err := os.Lstat(target)
-	if err != nil {
+	switch {
+	case err == nil:
+		if !info.Mode().IsRegular() {
+			return "", errors.New("凭据不是普通文件，拒绝删除")
+		}
+		if err := os.Remove(target); err != nil {
+			return "", fmt.Errorf("删除凭据失败：%w", err)
+		}
+	case errors.Is(err, os.ErrNotExist):
+		// 授权失效流程可能已经删掉了凭据文件，只在账号池里留下失效提示项。
+		// 这种条目仍应允许用户从网页显式删除。
+	default:
 		return "", fmt.Errorf("凭据不可读取：%w", err)
 	}
-	if !info.Mode().IsRegular() {
-		return "", errors.New("凭据不是普通文件，拒绝删除")
+	if err := os.Remove(markerPath(target)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("[账号删除] 凭据=%s 失效标记清除失败：%v", filepath.Base(target), err)
 	}
-	if err := os.Remove(target); err != nil {
-		return "", fmt.Errorf("删除凭据失败：%w", err)
+	// 显式删除必须无条件移出账号池：热加载收敛会保留 Disabled 的失效提示项，
+	// 只删除凭据文件无法让网页和 CLI 里的条目消失。
+	accountMu.Lock()
+	kept := make([]*Account, 0, len(accounts))
+	for _, acc := range accounts {
+		if acc.Path == target {
+			continue
+		}
+		kept = append(kept, acc)
 	}
-	_ = os.Remove(markerPath(target))
+	accounts = kept
+	if len(accounts) > 0 {
+		rrIndex %= len(accounts)
+	} else {
+		rrIndex = 0
+	}
+	accountMu.Unlock()
 	reloadAccountsResult()
 	requestQuotaScan()
+	// 立即刷新状态快照，避免网页在下一次 3 秒快照前继续显示已删除账号。
+	if err := writeStatusSnapshot(); err != nil {
+		log.Printf("[账号删除] 凭据=%s 状态快照刷新失败：%v", filepath.Base(target), err)
+	}
 	return target, nil
 }
 

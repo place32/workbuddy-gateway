@@ -4,12 +4,15 @@
 >
 > 本文是完整使用手册。以下源码构建和测试命令均在项目根目录执行，而不是在 `docs/` 内执行。
 
+<img width="2836" height="1858" alt="image" src="https://github.com/user-attachments/assets/ed6a66cf-9e3d-47f9-bfe8-ec4895a10a07" />
+
+
 <img width="917" height="754" alt="image" src="https://github.com/user-attachments/assets/7dcfc461-1357-4991-9565-279047687898" />
 
 
 基于腾讯 **CodeBuddy** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。默认无 Web UI，全部通过命令行（CLI）完成登录、凭据续期与服务控制；可选开启网页管理台（`-webui`，见下文）。
 
-**v1.14.20（place32 fork）**：集成上游 `98056c5` 的用量与性能统计、账号健康度与告警、网页登录及会话键兼容，同时保留下述 fork 参数、指纹、保序 JSON、SSE 心跳、反审查净化与串行化能力。会话标识采用[本 fork 的统一规则](#上游会话请求头v11420)，不混用两套作用域语义。以下 v1.14.0～v1.14.5 条目保留为升级背景，当前完整规则以各专题为准。
+**v1.14.21（place32 fork）**：集成上游 `ceb2ac8`，加入 system 前缀净化、可选完整请求诊断、网页登录超时与会话收敛，并保留下述 fork 参数、指纹、保序 JSON、SSE 心跳、反审查净化与串行化能力。会话标识采用[本 fork 的统一规则](#上游会话请求头v11420)，不混用两套作用域语义。以下 v1.14.0～v1.14.5 条目保留为升级背景，当前完整规则以各专题为准。
 
 **v1.14.0**：新增配置热生效、全局账号与模型网页开关、凭据 JSON 编辑、端口设置及日志保留/清理。旧配置缺省日志保留天数时不自动删除；端口修改仍需重启。请先升级二进制，再添加新增配置字段。
 
@@ -163,10 +166,13 @@ workbuddy-gateway serve -webui -allow-price-probes
 ```json
 {
   "debug": {
-    "enabled": true
+    "enabled": true,
+    "fullRequests": false
   }
 }
 ```
+
+`config.example.json` 和首次部署的默认配置显式写出 `enabled: false`、`fullRequests: false`。缺少 `debug` 段、`debug` 为 `null`/空对象/空字符串，或任一值缺失/为空时均按 `false` 处理；`0/1`、`"true"/"false"` 也会容错解析，未知子字段忽略。
 
 开启后，网关把单行 JSON 写入 `logs/debug-YYYY-MM-DD.jsonl`；普通运行日志仍写入原来的 `logs/gateway-YYYY-MM-DD.log`，两者互不替代。可复制 `config.example.json` 作为起点。
 
@@ -204,7 +210,7 @@ workbuddy-gateway serve -webui -allow-price-probes
 | `fallback` | 继续使用 `You are a helpful assistant.` | **仅在客户端没有任何 system 时**，替换网关注入的保底提示词；已有 system 不变 |
 | `force` | 不启用；请求提示词完全按原规则处理 | **实验功能**：在 Chat、Responses、Anthropic Messages 三个入口的首条 system 内容**末尾追加**配置文本（后置），使其成为位置最靠后、紧贴用户消息的指令；原 system 内容仍完整保留 |
 
-例如 `{"systemPrompt":{"fallback":"你是一个助手。","force":"请用中文回答。"}}`：客户端没有 system 时，发往上游的是 `你是一个助手。\n\n请用中文回答。`；客户端自带 system 时，发往上游的是 `<客户端原 system>\n\n请用中文回答。`。配置值仅支持 JSON 字符串；空串或全空白视为未配置。不会写出或替换客户端的 user、assistant、tool 消息，也不改变账号选择。普通日志和 JSON 调试日志只记录规则分支、位置与字符数，**不记录提示词正文**。
+例如 `{"systemPrompt":{"fallback":"你是一个助手。","force":"请用中文回答。"}}`：客户端没有 system 时，发往上游的是 `你是一个助手。\n\n请用中文回答。`；客户端自带 system 时，发往上游的是 `<客户端原 system>\n\n请用中文回答。`。配置值仅支持 JSON 字符串；空串或全空白视为未配置。不会写出或替换客户端的 user、assistant、tool 消息，也不改变账号选择。普通日志和普通 JSON 调试模式只记录规则分支、位置与字符数；显式开启 `debug.fullRequests` 后，完整请求事件会包含处理前后的提示词正文。
 
 > **实验功能风险自负：** `force` 后置于 system 末尾（紧贴用户消息），因此比客户端自带指令更"新近"，冲突时通常更有影响力——这正是人设类、风格类指令希望达到的效果，但也可能与客户端的 system 指令冲突、改变模型行为、增加 token 消耗，或触发上游内容/参数校验。需要回退时将 `force` 改回 `""` 并保存；建议先在测试会话验证，切勿在配置中写入密码、密钥或个人隐私。`config.json` 已被 Git 忽略，不要将真实配置提交到仓库。
 
@@ -369,7 +375,7 @@ workbuddy-gateway serve -keepalive-hours ""
 |---|---|
 | 模型名单、`models.accounts`（含 `all`） | 热生效，控制后续调度 |
 | `gateway.adminKey` / `apiKeyEnabled` / `apiKey` | 热生效；管理 Key 改变后需使用新 Key 登录 |
-| `systemPrompt` / `debug.enabled` | 热生效 |
+| `systemPrompt` / `debug.enabled` / `debug.fullRequests` | 热生效 |
 | `upstream` 超时、网络重试次数 | 后续上游请求使用新值；已有流式响应保持原空闲超时 |
 | `gateway.apiPort` / `webPort` | 写入配置但**重启后**变更监听；页面仍显示实际监听端口 |
 
@@ -382,7 +388,7 @@ workbuddy-gateway serve -keepalive-hours ""
 
 每条 JSON 调试日志都包含时间、级别、稳定事件名、`trace_id`、`request_id`、服务/实例/版本、路由、方法、模型、账号、流式标记和累计耗时，并记录客户端地址、代理头、协议、TLS、Content-Type、Content-Length、deadline 等请求元数据。客户端传入的 `X-Trace-ID` 会优先作为日志里的 `trace_id`；出站上游的链路头仍只由会话作用域对齐写入，调试开关不会覆盖它们。
 
-请求体只记录以下安全摘要，不记录正文：
+普通调试模式（`debug.fullRequests` 缺省或为 `false`）不记录完整请求体，也不记录明文 `Authorization`、Cookie、API Key、Access Token、Refresh Token。只记录以下安全摘要：
 
 - `declared_body_bytes`、`actual_body_bytes`、`body_read_ms`
 - `body_sha256_prefix`（SHA-256 前 12 位）
@@ -390,7 +396,39 @@ workbuddy-gateway serve -keepalive-hours ""
 - `body_limit_bytes`、`body_limit_exceeded`（当前未设置请求体限制，因此分别为 `0`、`false`）
 - `read_error_type`、脱敏截断后的 `read_error`
 
-调试日志不会记录 `Authorization`、Cookie、API Key、Access Token、Refresh Token 或完整请求体。只记录是否提供 Authorization，以及凭据的不可逆短哈希 `api_key_fingerprint`。
+#### 完整请求对比日志（显式开启）
+
+排查不同客户端或协议转译差异时，合并以下设置到现有配置；不要用此片段覆盖整份配置：
+
+```json
+{
+  "debug": {
+    "enabled": true,
+    "fullRequests": true
+  }
+}
+```
+
+两个开关都开启才生效，约 1 秒热加载，无须重启。关闭 `fullRequests` 即恢复普通调试日志；关闭 `enabled` 则关闭全部 JSON 调试日志。正式功能没有临时采集的 30 分钟或 200 次限制。
+
+记录仍写入 `logs/debug-YYYY-MM-DD.jsonl`，按 `trace_id` 串联：
+
+| 事件 | 内容 |
+|---|---|
+| `full_request_inbound_headers` | 模型 API 入站方法、URL、请求头；此时未读取正文 |
+| `full_request_inbound` | 鉴权通过后读取的完整客户端 JSON 请求体，位于 `body` |
+| `full_request_upstream` | 协议转换、系统提示词规则及历史修复后的完整上游 JSON；包含实际构造的出站请求头 |
+| `full_request_upstream_result` | 每次发送的 HTTP 状态、响应头、请求头/请求体是否写出、网络错误类型 |
+| `full_request_upstream_error` | 已读取的上游错误 JSON，例如 `11128`；不预读成功响应流 |
+
+同一请求的换号通过 `acc` 区分，网络重试通过 `attempt` 区分，具体发送通过 `upstream_request_id` 关联。`user_agent` 顶层字段始终是客户端 UA，实际出站 UA 看 `full_request_upstream.request.headers`，不要混淆两者。
+
+完整 JSON **不截断**，包括所有消息、工具定义和图片数据；JSON 空白/转义可能重新序列化，不是逐字节原始抓包。凭据字段、Cookie、已知密钥及 URL 中的凭据参数会脱敏；请求头敏感字段另有进程内随机密钥生成的 HMAC 摘要，用于同一进程内判断是否相同，重启后不能跨进程比较。不合法或读取不完整的 JSON 标记为省略，避免损坏 JSON 的凭据泄露，不伪装为完整采集。
+
+鉴权/CORS/方法拦截不会为了日志而额外读取正文；相关拒绝原因仍由原有中间件事件记录。管理配置、账号登录及凭据接口不属于完整正文采集范围。
+
+**隐私与磁盘提示：** 完整请求包含真实对话、源代码、工具输入和图片，即使凭据脱敏也仍属敏感日志。无法保证识别正文内所有任意格式的秘密。文件按 `0600` 创建（Windows 还应检查目录 ACL），不要上传或公开分享原始日志。多兆请求会迅速增加磁盘占用和日志写入耗时，建议仅排障期间开启；沿用 `logs.retentionDays` 的既有日志清理策略。网页日志查看器有读取大小限制，完整比对应读取服务器文件。
+
 
 ---
 
@@ -678,7 +716,7 @@ systemctl restart workbuddy-gateway
 | 入口 | `GET /ui/`（独立管理端口，静态外壳不含任何数据） |
 | 数据接口 | `GET /admin/api/status`、`/admin/api/models`、`/admin/api/logs`、`/admin/api/config`、`/admin/api/tasks`，**一律需要 `Authorization: Bearer <adminKey>`** |
 | 写入接口 | `POST /admin/api/setup`（仅本机首次生成管理 Key）、`POST /admin/api/settings`（模型 API 鉴权与端口）、`POST /admin/api/account-toggle` / `model-toggle`（账号/模型开关）、`POST /admin/api/credential-edit`（凭据 JSON）、`POST /admin/api/log-settings` / `log-cleanup`（保留设置与过期清理） |
-| 页面 | 总览（用量趋势、账号池健康度与日志告警）、账号池（全局调度开关）、模型列表（启停开关，含停用模型）、日志（保留天数与清理）、配置（Key 脱敏预览；确认警告后可编辑完整配置，systemPrompt 正文直接展示）、定时任务（只读日志视图）、访问设置（鉴权与端口编辑）。网页不再提供凭据列表或编辑器 |
+| 页面 | 总览（用量趋势、账号池健康度与日志告警）、账号池（全局调度开关）、模型列表（启停开关，含停用模型；请求数、平均首 Token、平均总耗时、总 Token 按 `stats.json` 聚合近 5 小时）、日志（保留天数与清理）、配置（Key 脱敏预览；确认警告后可编辑完整配置，systemPrompt 正文直接展示）、定时任务（只读日志视图）、访问设置（鉴权与端口编辑）。网页不再提供凭据列表或编辑器 |
 | 数据来源 | 复用 `serve` 的状态快照、完整模型目录、`logs/` 日志与本地配置/凭据文件；开关受控写入配置并应用原有调度过滤 |
 | 定时任务 | 周期、启用状态、最近执行、完成时间、执行结果、下次预计执行与日志说明；仅展示、不触发任务或修改调度 |
 
@@ -691,9 +729,9 @@ systemctl restart workbuddy-gateway
 3. 点「获取登录接口」，表单内直接显示**登录链接与二维码**；
 4. 手机扫码授权后，网关自动写入凭据、自动并入账号池并触发额度扫描，**不需要重启服务**。
 
-这条流程与命令行 `workbuddy-gateway login -auth <文件>`（国际站加 `-intl`）**复用同一套登录实现**，行为一致，不会出现两套逻辑漂移。登录会话有时限（国内站 5 分钟、国际站 15 分钟），超时或点「关闭」都会停止轮询，且不写入任何文件。
+这条流程与命令行 `workbuddy-gateway login -auth <文件>`（国际站加 `-intl`）**复用同一套登录实现**，行为一致，不会出现两套逻辑漂移。登录会话有时限（国内站 5 分钟、国际站 15 分钟），页面显示剩余时间；超时后提示登录链接已失效并停止轮询，已结束会话会短暂保留以便网页读取终态，点「关闭」也会停止轮询，两种情况都不写入任何文件。
 
-账号表每行末列有「删除」按钮：确认后删除该账号在运行目录下的凭据文件，并立即从账号池移除。**只删除凭据文件**，历史统计与日志保留。以下情况一律拒绝删除：同名凭据存在多个、文件名不符合 `workbuddy*.json`、目标不是普通文件（目录或符号链接）、账号不存在。
+账号表每行末列有「删除」按钮：确认后删除该账号的凭据文件或残留失效标记，并立即从账号池和状态快照移除。**只删除凭据相关文件**，历史统计与日志保留。以下情况一律拒绝删除：同名凭据存在多个、文件名不符合 `workbuddy*.json`、目标不是普通文件（目录或符号链接）、账号不存在。
 
 #### 只读定时任务与访问设置
 
@@ -1503,7 +1541,7 @@ PowerShell 一键构建：
 
 ### 自动发布（GitHub Actions）
 
-保留 fork 的九目标构建、双校验和、版本校验与 Release 重跑机制。完整流程及安全的显式 `v1.14.20` 标签推送命令见[项目首页的发布说明](../README.md#自动发布github-actions)，不要批量推送本地上游标签。
+保留 fork 的九目标构建、双校验和、版本校验与 Release 重跑机制。完整流程及安全的显式 `v1.14.21` 标签推送命令见[项目首页的发布说明](../README.md#自动发布github-actions)，不要批量推送本地上游标签。
 
 ---
 

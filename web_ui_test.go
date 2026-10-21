@@ -76,9 +76,21 @@ func TestWebUIBrandNeutralLabelsAndBothListFilters(t *testing.T) {
 		t.Fatal("web console static copy still contains the old brand")
 	}
 	for _, text := range []string{"<title>本地网关 · 网页控制台</title>", `id="onlyUsableAccounts"`, `id="onlyUsable"`,
-		"只显示可用账号", "只显示可用模型"} {
+		"只显示可用账号", "只显示可用模型", `id="addAccountCopy"`, "复制链接",
+		"请求(5h)", "平均首Token(5h)", "平均总耗时(5h)", "总Token(M, 5h)",
+		"请求、平均首Token、平均总耗时和总Token 取自 stats.json 的近 5 小时"} {
 		if !bytes.Contains(html, []byte(text)) {
 			t.Errorf("web console missing list control or neutral copy: %s", text)
+		}
+	}
+	js, err := webFS.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{`/admin/api/models?range=5h`, `count(m.requests)`, `fmtMs(m.avgTtftMs`,
+		`fmtMs(m.avgLatencyMs`, `fmtTokensM(m.tokens)`} {
+		if !bytes.Contains(js, []byte(text)) {
+			t.Errorf("model list UI missing 5h statistics behavior: %s", text)
 		}
 	}
 }

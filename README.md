@@ -2,7 +2,7 @@
 
 纯 Go、零 CGO 依赖的跨平台单二进制网关，支持国内站与国际站、多账号调度、OpenAI / Anthropic 协议及可选网页控制台。
 
-**v1.14.20（place32 fork）**：集成上游 `98056c5`，保留本 fork 的思考参数归一化、客户端指纹与保序 JSON、会话链路不变量、SSE 心跳、反审查净化与单账号串行化。新增用量统计、账号告警、网页登录等使用说明及合并后的会话规则见[完整手册](docs/user-guide.md)。
+**v1.14.21（place32 fork）**：集成上游 `ceb2ac8`，保留本 fork 的思考参数归一化、客户端指纹与保序 JSON、会话链路不变量、SSE 心跳、反审查净化与单账号串行化。新增 system 前缀净化、显式启用的完整请求诊断、模型近 5 小时统计及网页登录超时收敛说明见[完整手册](docs/user-guide.md)。
 
 ## 快速开始
 
@@ -58,9 +58,9 @@ Go 单元测试保持与 `package main` 源码同目录，以保留私有函数�
 
 ```bash
 # 版本号先与 main.go 的 version 常量一致，再打标签推送
-git tag -a v1.14.20 -m "v1.14.20: merge upstream 98056c5"
+git tag -a v1.14.21 -m "v1.14.21: merge upstream ceb2ac8"
 git push origin main
-git push origin refs/tags/v1.14.20:refs/tags/v1.14.20
+git push origin refs/tags/v1.14.21:refs/tags/v1.14.21
 ```
 
 只推送本次新建的明确标签；不要使用 `--follow-tags` 或 `--tags`，以免将本地已有的上游标签发布到 fork。
