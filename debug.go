@@ -71,18 +71,25 @@ type runtimeFileConfig struct {
 		Force    string `json:"force"`
 	} `json:"systemPrompt"`
 	Debug debugFileConfig `json:"debug"`
-	Logs struct {
+	Logs  struct {
 		RetentionDays int `json:"retentionDays"` // 0 保留全部；正数保留含今天在内的 N 个日历日。
 	} `json:"logs"`
 	// Upstream 段可选，用于按网络状况调整上游超时（单位秒，<=0 或省略表示用默认值）。
 	Upstream struct {
+		// RequestProfile: legacy（省略/空值）保留旧行为；official 使用已抓取的国内桌面兼容参数。
+		RequestProfile string `json:"requestProfile"`
 		// HeaderTimeoutSeconds：请求发送完成 → 收到响应头的等待上限。
 		HeaderTimeoutSeconds int `json:"headerTimeoutSeconds"`
 		// IdleTimeoutSeconds：流式响应体的空闲读超时（持续有数据则不超时）。
 		IdleTimeoutSeconds int `json:"idleTimeoutSeconds"`
-		// TransientRetries：请求体发送阶段遇到瞬时网络错误的额外重试次数。
+		// TransientRetries：仅请求头尚未写出时，瞬时网络错误的额外重试次数。
 		// 用指针区分「未配置」（用默认值）与「显式设为 0」（禁用重试）。
 		TransientRetries *int `json:"transientRetries"`
+		// StreamKeepaliveSeconds：等待首个有效 SSE data 期间的注释间隔；<=0 或省略用默认值。
+		StreamKeepaliveSeconds int `json:"streamKeepaliveSeconds"`
+		// EnableFirstByteRetry：是否允许首个有效 SSE data 下发前对瞬时网络中断安全重放一次。
+		// 指针区分「未配置」（默认开启）与显式 false（关闭）。
+		EnableFirstByteRetry *bool `json:"enableFirstByteRetry"`
 	} `json:"upstream"`
 	// Models 段可选，用于按模型名做黑白名单控制（大小写不敏感）。
 	Models struct {
@@ -94,7 +101,6 @@ type runtimeFileConfig struct {
 		Accounts map[string]modelAccountFileConfig `json:"accounts"`
 	} `json:"models"`
 }
-
 
 // debugFileConfig keeps malformed or future debug toggles from blocking startup.
 // Unknown fields are intentionally ignored only within this optional section.
@@ -111,7 +117,7 @@ func (d *debugFileConfig) UnmarshalJSON(data []byte) error {
 	}
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &object); err != nil {
-		return nil // Non-object values and unknown debug fields must not block startup.
+		return nil // 非对象值按全 false 处理，不阻断启动；未知字段同样忽略。
 	}
 	d.Enabled = tolerantConfigBool(object["enabled"])
 	d.FullRequests = tolerantConfigBool(object["fullRequests"])
@@ -142,6 +148,7 @@ func tolerantConfigBool(raw json.RawMessage) bool {
 	}
 	return false
 }
+
 type modelAccountFileConfig struct {
 	Allowlist []string `json:"allowlist"`
 	Blocklist []string `json:"blocklist"`
@@ -442,7 +449,6 @@ func ensureDebugRequestContext(r *http.Request, traceID string, start time.Time)
 	return state
 }
 
-
 func debugContextFromRequest(r *http.Request) *debugRequestContext {
 	if r == nil {
 		return nil
@@ -565,8 +571,12 @@ func debugEvent(r *http.Request, level, event string, fields map[string]any) {
 		return
 	}
 	sink.mu.Lock()
-	_, _ = sink.writer.Write(append(data, '\n'))
+	n, writeErr := sink.writer.Write(append(data, '\n'))
 	sink.mu.Unlock()
+	if writeErr != nil || n != len(data)+1 {
+		log.Printf("[调试日志] traceId=%s 事件=%s 结果=写入失败 错误类型=%T 业务影响=本条诊断记录可能不完整，不中断模型请求",
+			traceID, event, writeErr)
+	}
 }
 
 func debugBodyReadStarted(r *http.Request) time.Time {
@@ -596,6 +606,7 @@ func debugBodyReadCompleted(r *http.Request, body []byte, readDuration, decodeDu
 		fields["json_error"] = safeDebugError(decodeErr)
 	}
 	debugEvent(r, level, "request_body_read_completed", fields)
+	debugFullIncomingBody(r, body, decodeErr == nil, false)
 }
 
 func debugBodyReadFailed(r *http.Request, body []byte, readStarted time.Time, readErr error) {
@@ -603,6 +614,7 @@ func debugBodyReadFailed(r *http.Request, body []byte, readStarted time.Time, re
 		return
 	}
 	debugEvent(r, "error", "request_body_read_failed", debugBodyFields(r, body, time.Since(readStarted), 0, false, readErr))
+	debugFullIncomingBody(r, body, false, true)
 }
 
 func debugBodyFields(r *http.Request, body []byte, readDuration, decodeDuration time.Duration, jsonValid bool, readErr error) map[string]any {

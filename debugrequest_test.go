@@ -218,6 +218,13 @@ func TestFullRequestsThreeProtocolChains(t *testing.T) {
 			if !reflect.DeepEqual(events["full_request_upstream"]["body"], actualBody) {
 				t.Fatal("log differs from actual outbound body")
 			}
+			upstream := events["full_request_upstream"]
+			if upstream["content_encoding"] != "gzip" ||
+				upstream["wire_body_bytes"] != float64(len(actual)) ||
+				upstream["body_bytes"] != float64(len(gunzipUpstreamBody(t, actual))) ||
+				upstream["body_representation"] != "decoded_json_before_content_encoding" {
+				t.Fatal("encoded wire body and decoded log metadata not distinguished")
+			}
 			if events["full_request_inbound"]["body"].(map[string]any)["stream"] != false ||
 				events["full_request_upstream"]["body"].(map[string]any)["stream"] != true {
 				t.Fatal("pre/post conversion not distinguished")

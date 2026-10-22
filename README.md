@@ -2,7 +2,7 @@
 
 纯 Go、零 CGO 依赖的跨平台单二进制网关，支持国内站与国际站、多账号调度、OpenAI / Anthropic 协议及可选网页控制台。
 
-**v1.14.21（place32 fork）**：集成上游 `ceb2ac8`，保留本 fork 的思考参数归一化、客户端指纹与保序 JSON、会话链路不变量、SSE 心跳、反审查净化与单账号串行化。新增 system 前缀净化、显式启用的完整请求诊断、模型近 5 小时统计及网页登录超时收敛说明见[完整手册](docs/user-guide.md)。
+**v1.14.24（place32 fork）**：合并上游 `09ed560`，新增可选统一出站兼容、Chat 首字节前 SSE 心跳与最多一次重放，以及 DSH 历史/GUI 提示词兼容。保留本 fork 的思考参数归一化、客户端指纹与保序 JSON、会话链路不变量、反审查净化和单账号串行化。旧配置省略 `upstream.requestProfile` 仍沿用 fork 原行为；重放可能额外消耗一次上游额度，可关闭。详见[完整手册](docs/user-guide.md)及[出站兼容说明](docs/outbound-compatibility.md)。
 
 ## 快速开始
 
@@ -20,6 +20,7 @@ Windows 可使用 `.\workbuddy-gateway.exe`。管理端口默认 `8316`，模型
 - **后台价格探测默认关闭**，只有显式传入 `-allow-price-probes` 才开启；主动生成请求可能消耗积分。
 - 网页配置页支持风险确认后的完整 JSON 编辑；监听端口修改需重启服务。
 - `config.json` 和账号凭据含敏感信息，已由 Git 忽略，不要公开分享。
+- 多 Harness 可使用 `upstream.requestProfile: "official"` 开启统一出站兼容；旧配置省略该项保持原行为。见[出站兼容说明](docs/outbound-compatibility.md)。
 
 ## 文档
 
@@ -29,6 +30,8 @@ Windows 可使用 `.\workbuddy-gateway.exe`。管理端口默认 `8316`，模型
 | 目录职责与命名约定 | [docs/project-layout.md](docs/project-layout.md) |
 | 贡献者及方案署名 | [docs/contributors.md](docs/contributors.md) |
 | 测试入口与说明 | [tests/README.md](tests/README.md) |
+| 多 Harness 出站对齐、协议参数与兼容边界 | [docs/outbound-compatibility.md](docs/outbound-compatibility.md) |
+| DSH 历史回放、GUI 环境句与 11128 兼容说明 | [docs/11128-dsh-history.md](docs/11128-dsh-history.md) |
 
 ## 构建与测试
 
@@ -58,9 +61,9 @@ Go 单元测试保持与 `package main` 源码同目录，以保留私有函数�
 
 ```bash
 # 版本号先与 main.go 的 version 常量一致，再打标签推送
-git tag -a v1.14.21 -m "v1.14.21: merge upstream ceb2ac8"
+git tag -a v1.14.24 -m "v1.14.24: merge upstream 09ed560"
 git push origin main
-git push origin refs/tags/v1.14.21:refs/tags/v1.14.21
+git push origin refs/tags/v1.14.24:refs/tags/v1.14.24
 ```
 
 只推送本次新建的明确标签；不要使用 `--follow-tags` 或 `--tags`，以免将本地已有的上游标签发布到 fork。

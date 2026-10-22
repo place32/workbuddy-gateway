@@ -92,19 +92,8 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	chatReq.Set("stream", true) // 上游强制流式，非流式由网关本地聚合
 
-	applyThinkingRules(chatReq)
-	if modified := sanitizeMessages(chatReq); modified > 0 {
-		logSystemPrefixSanitized(r, reqID, modified)
-	}
-	prepareSystemPromptForUpstream(chatReq, r, reqID, w.Header().Get("X-Trace-ID"))
-	// 输出预算归一化：客户端未声明 max_tokens 时补模型输出上限，
-	// 避免上游默认预留 384000 导致长会话在远未到窗口上限时被 11133 拒绝
-	ensureUpstreamMaxTokens(chatReq, r, reqID, w.Header().Get("X-Trace-ID"), modelName)
-	repairReport := repairToolMessageSequence(chatReq)
-	logToolSequenceRepair(r, w.Header().Get("X-Trace-ID"), reqID, modelName, repairReport)
+	prepareUpstreamChatRequest(chatReq, r, reqID, modelName)
 	logResponsesToolOutputConversion(r, reqID, respReq)
-	// 与 Chat 原生入口共用同一套 DeepSeek 多轮推理历史回填规则。
-	logReasoningHistoryRepair(r, reqID, modelName, repairReasoningHistory(chatReq))
 
 	// 以客户端口径序列化：不转义 < > &，无尾随换行
 	upstreamBytes, err := marshalJSON(chatReq)
@@ -215,6 +204,9 @@ func responsesToChatRequest(respReq *jsonObject, modelName string) (*jsonObject,
 	if v, ok := respReq.Get("top_p"); ok && v != nil {
 		chat.Set("top_p", v)
 	}
+	if v, ok := messageField(respReq, "parallel_tool_calls").(bool); ok {
+		chat.Set("parallel_tool_calls", v)
+	}
 	if v, ok := respReq.Get("max_output_tokens"); ok && v != nil {
 		chat.Set("max_tokens", v)
 	}
@@ -243,12 +235,8 @@ func responsesToChatRequest(respReq *jsonObject, modelName string) (*jsonObject,
 		}
 	}
 	// Responses 的文本详尽度位于 text.verbosity，上游只认顶层扁平 verbosity。
-	if textRaw, _ := respReq.Get("text"); textRaw != nil {
-		if text, ok := textRaw.(*jsonObject); ok {
-			if v, ok := text.Get("verbosity"); ok && v != nil {
-				chat.Set("verbosity", v)
-			}
-		}
+	if verbosity, ok := messageField(messageField(respReq, "text"), "verbosity").(string); ok && verbosity != "" {
+		chat.Set("verbosity", verbosity)
 	}
 	return chat, nil
 }
@@ -294,40 +282,22 @@ func joinReasoningParts(raw any) string {
 	return b.String()
 }
 
-// mergeResponsesAssistant 是 mergeResponsesAssistantItem 的类型适配版。
-// dst 和 item 可以是 *jsonObject 或 map[string]any，修改直接写入 dst。
+// mergeResponsesAssistant combines one reply without flattening ordered objects.
+// Only content and tool_calls change; reasoning stays on the first item.
 func mergeResponsesAssistant(dst, item any) {
-	dstMap := messageToMap(dst)
-	itemMap := messageToMap(item)
-	if dstMap == nil || itemMap == nil {
+	if !isMessage(dst) || !isMessage(item) {
 		return
 	}
-	mergeResponsesAssistantItem(dstMap, itemMap)
-	// 将合并结果写回 dst（对 *jsonObject 需要逐键设置）
-	if dstObj, ok := dst.(*jsonObject); ok {
-		for k, v := range dstMap {
-			dstObj.Set(k, jsonValueToOrdered(v))
+	if assistantMessageHasPayload(item) {
+		if !assistantMessageHasPayload(dst) {
+			setMessageField(dst, "content", messageField(item, "content"))
+		} else {
+			setMessageField(dst, "content", append(responsesChatContentParts(messageField(dst, "content")), responsesChatContentParts(messageField(item, "content"))...))
 		}
 	}
-}
-
-// jsonValueToOrdered 将 map[string]any 递归转为 *jsonObject，保持其他类型不变。
-func jsonValueToOrdered(v any) any {
-	switch t := v.(type) {
-	case map[string]any:
-		obj := newJSONObject()
-		for k, val := range t {
-			obj.Set(k, jsonValueToOrdered(val))
-		}
-		return obj
-	case []any:
-		out := make([]any, len(t))
-		for i, item := range t {
-			out[i] = jsonValueToOrdered(item)
-		}
-		return out
-	default:
-		return v
+	if calls, ok := messageField(item, "tool_calls").([]any); ok && len(calls) > 0 {
+		existing, _ := messageField(dst, "tool_calls").([]any)
+		setMessageField(dst, "tool_calls", append(existing, calls...))
 	}
 }
 
@@ -344,32 +314,13 @@ func messageToMap(v any) map[string]any {
 	}
 }
 
-// mergeResponsesAssistantItem 将一个 Responses 回复的正文与工具调用合成同一条 Chat assistant。
-// reasoning_content 已在第一项上，后续项只补充正文和工具列表，不复制推理。
-func mergeResponsesAssistantItem(dst, item map[string]any) {
-	if assistantMessageHasPayload(item) {
-		if !assistantMessageHasPayload(dst) {
-			dst["content"] = item["content"]
-		} else {
-			dst["content"] = append(responsesChatContentParts(dst["content"]), responsesChatContentParts(item["content"])...)
-		}
-	}
-	if calls, ok := item["tool_calls"].([]any); ok && len(calls) > 0 {
-		if existing, ok := dst["tool_calls"].([]any); ok {
-			dst["tool_calls"] = append(existing, calls...)
-		} else {
-			dst["tool_calls"] = calls
-		}
-	}
-}
-
 func responsesChatContentParts(content any) []any {
 	switch value := content.(type) {
 	case []any:
 		return value
 	case string:
 		if value != "" {
-			return []any{map[string]any{"type": "text", "text": value}}
+			return []any{newObject("type", "text", "text", value)}
 		}
 	}
 	return nil

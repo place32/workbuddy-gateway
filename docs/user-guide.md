@@ -26,6 +26,8 @@
 
 **v1.14.5（本 fork）**：**国内站指纹按本机 5.5.3 客户端重新对齐**（此前基线是 5.5.2 桌面宿主抓包）。国内站 `X-IDE-*` 改为 `WorkBuddy` / `WorkBuddy` / **5.5.3**、UA 改为 `WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1`、`x-stainless-runtime-version` 改为 `v22.21.1`、`auth/state` 的 `platform` 改为 `workbuddy`（取 `product.json` 的 `authentication.attributes.platform`）；国内站模型请求体**改为 gzip 压缩**，且模型请求与控制面请求**一律不再发送** `Accept-Encoding`。依据是本机 5.5.3 国内站客户端链路的线上字节抓包（`.client_ref/cap/cn_chat_capture.jsonl`）与磁盘源码（`.client_ref/cn/main__client-info-env.js`）。国际站不变。无配置变化，升级即生效（详见[客户端指纹对齐](#客户端指纹对齐)）。
 
+**v1.14.24**：Chat 流式响应增加首字节前 SSE 心跳与最多一次安全重放；DSH 身份句和 GUI 环境说明扩展覆盖 assistant 历史、后续文本块及配置注入提示词。默认开启，可通过 `upstream` 配置关闭重放。
+
 **同时支持两个上游站点**（同一套 `/v2/plugin/*` 协议，凭据按站点隔离，账号池可混挂轮询）：
 
 | 站点 | 上游 | 登录方式 | 登录命令 |
@@ -85,6 +87,7 @@
 - **一键重置 (`reset`)**：清空除登录凭据外的全部本地数据（状态快照 / 模型缓存 / 日志 / 失效标记），并立即重新拉取模型目录与倍率。
 - **纯 CLI 控制**：终端内嵌 ASCII 二维码，国内站微信 / 企业微信扫码登录；`status` / `refresh` / `serve` 子命令完成全部管理。
 - **Anthropic 协议原生入口**：`/v1/messages`（SSE 流式 + 非流式聚合）与 `/v1/messages/count_tokens`，Claude Code 等 Anthropic 客户端免外部翻译层直连，鉴权兼容 `x-api-key` 头。
+- **可选官方出站兼容**：`upstream.requestProfile="official"` 让三个协议入口共用参数、指令结构和出站逻辑；国内模型请求使用已采集桌面版本的静态头及 gzip。旧配置缺省为 `legacy`，不提升 user 角色、不强改思考档位、不替换原工具。详见[出站兼容说明](outbound-compatibility.md)。
 
 ---
 
@@ -172,7 +175,9 @@ workbuddy-gateway serve -webui -allow-price-probes
 }
 ```
 
-`config.example.json` 和首次部署的默认配置显式写出 `enabled: false`、`fullRequests: false`。缺少 `debug` 段、`debug` 为 `null`/空对象/空字符串，或任一值缺失/为空时均按 `false` 处理；`0/1`、`"true"/"false"` 也会容错解析，未知子字段忽略。
+`config.example.json` 和首次部署的默认配置都会显式写出 `enabled: false`、`fullRequests: false` 作为占位。
+缺少 `debug` 段、`debug` 为 `null`/空对象/空字符串、或两个值缺失/为空时均按 `false` 处理，
+不会阻断程序启动；`0/1` 和 `"true"/"false"` 也会被容错解析，未知的 debug 子字段会被忽略。
 
 开启后，网关把单行 JSON 写入 `logs/debug-YYYY-MM-DD.jsonl`；普通运行日志仍写入原来的 `logs/gateway-YYYY-MM-DD.log`，两者互不替代。可复制 `config.example.json` 作为起点。
 
@@ -377,6 +382,8 @@ workbuddy-gateway serve -keepalive-hours ""
 | `gateway.adminKey` / `apiKeyEnabled` / `apiKey` | 热生效；管理 Key 改变后需使用新 Key 登录 |
 | `systemPrompt` / `debug.enabled` / `debug.fullRequests` | 热生效 |
 | `upstream` 超时、网络重试次数 | 后续上游请求使用新值；已有流式响应保持原空闲超时 |
+| `upstream.requestProfile` | 约 1 秒热生效；每个逻辑请求固定一次快照，换号和重试沿用原值 |
+| `upstream.streamKeepaliveSeconds` / `enableFirstByteRetry` | 约 1 秒热生效；Chat 流式处理开始时读取，已开始的心跳与重放预算不被修改 |
 | `gateway.apiPort` / `webPort` | 写入配置但**重启后**变更监听；页面仍显示实际监听端口 |
 
 - 配置先整体解析、校验，再应用。运行时遇到半写 JSON、空文件、文件短暂缺失、错误类型或非法账号路径时，**保留上一份有效配置**，错误原因写入 `logs/gateway-YYYY-MM-DD.log`。修正并保存后自动重试；不会把配置读取失败误当作“全部开启”。
@@ -395,6 +402,7 @@ workbuddy-gateway serve -keepalive-hours ""
 - `json_valid`、`json_decode_ms`
 - `body_limit_bytes`、`body_limit_exceeded`（当前未设置请求体限制，因此分别为 `0`、`false`）
 - `read_error_type`、脱敏截断后的 `read_error`
+
 
 #### 完整请求对比日志（显式开启）
 
@@ -421,14 +429,28 @@ workbuddy-gateway serve -keepalive-hours ""
 | `full_request_upstream_result` | 每次发送的 HTTP 状态、响应头、请求头/请求体是否写出、网络错误类型 |
 | `full_request_upstream_error` | 已读取的上游错误 JSON，例如 `11128`；不预读成功响应流 |
 
-同一请求的换号通过 `acc` 区分，网络重试通过 `attempt` 区分，具体发送通过 `upstream_request_id` 关联。`user_agent` 顶层字段始终是客户端 UA，实际出站 UA 看 `full_request_upstream.request.headers`，不要混淆两者。
+同一请求的换号通过 `acc` 区分，网络重试通过 `attempt` 区分，
+具体发送通过 `upstream_request_id` 关联。`user_agent` 顶层字段始终是客户端 UA，
+实际出站 UA 看 `full_request_upstream.request.headers`，不要混淆两者。
 
-完整 JSON **不截断**，包括所有消息、工具定义和图片数据；JSON 空白/转义可能重新序列化，不是逐字节原始抓包。凭据字段、Cookie、已知密钥及 URL 中的凭据参数会脱敏；请求头敏感字段另有进程内随机密钥生成的 HMAC 摘要，用于同一进程内判断是否相同，重启后不能跨进程比较。不合法或读取不完整的 JSON 标记为省略，避免损坏 JSON 的凭据泄露，不伪装为完整采集。
+`full_request_upstream.body` 是内容编码前的脱敏 JSON，不是 gzip 字节；
+`body_representation` 固定为 `decoded_json_before_content_encoding`，`body_bytes` 表示编码前字节数。
+`content_encoding` 记录实际 `Content-Encoding`，`wire_body_bytes` 记录出站请求的 `ContentLength`
+（未知长度时为 `-1`），用于区分压缩前正文与线上正文；日志不会为采集解压或重写请求流。
 
-鉴权/CORS/方法拦截不会为了日志而额外读取正文；相关拒绝原因仍由原有中间件事件记录。管理配置、账号登录及凭据接口不属于完整正文采集范围。
+完整 JSON **不截断**，包括所有消息、工具定义和图片数据；JSON 空白/转义可能重新序列化，
+不是逐字节原始抓包。凭据字段、Cookie、已知密钥及 URL 中的凭据参数会脱敏；
+请求头敏感字段另有进程内随机密钥生成的 HMAC 摘要，用于同一进程内判断是否相同，
+重启后不能跨进程比较。不合法或读取不完整的 JSON 明确标记 `body_capture` 为省略，
+避免损坏 JSON 的凭据泄露，不伪装为完整采集。
 
-**隐私与磁盘提示：** 完整请求包含真实对话、源代码、工具输入和图片，即使凭据脱敏也仍属敏感日志。无法保证识别正文内所有任意格式的秘密。文件按 `0600` 创建（Windows 还应检查目录 ACL），不要上传或公开分享原始日志。多兆请求会迅速增加磁盘占用和日志写入耗时，建议仅排障期间开启；沿用 `logs.retentionDays` 的既有日志清理策略。网页日志查看器有读取大小限制，完整比对应读取服务器文件。
+鉴权/CORS/方法拦截不会为了日志而额外读取正文；相关拒绝原因仍由原有中间件事件记录。
+管理配置、账号登录及凭据接口不属于完整正文采集范围。
 
+**隐私与磁盘提示：** 完整请求包含真实对话、源代码、工具输入和图片，即使凭据脱敏也仍属敏感日志。
+无法保证识别正文内所有任意格式的秘密。文件按 `0600` 创建（Windows 还应检查目录 ACL），
+不要上传或公开分享原始日志。多兆请求会迅速增加磁盘占用和日志写入耗时，建议仅排障期间开启；
+沿用 `logs.retentionDays` 的既有日志清理策略。网页日志查看器有读取大小限制，完整比对应读取服务器文件。
 
 ---
 
@@ -520,12 +542,39 @@ workbuddy-gateway serve -models-refresh 0
 ```json
 {
   "upstream": {
+    "requestProfile": "official",
     "headerTimeoutSeconds": 300,
     "idleTimeoutSeconds": 120,
-    "transientRetries": 2
+    "transientRetries": 2,
+    "streamKeepaliveSeconds": 15,
+    "enableFirstByteRetry": true
   }
 }
 ```
+
+示例显式选择 `requestProfile: "official"`，与 `config.example.json` 一致；**省略、空字符串或
+`null` 则使用 `legacy`**，保留本 fork 原有站点指纹、线上头顺序与国内站 gzip 行为。
+`official` 是可选的共享模型出站兼容配置，使用已采集的国内桌面参数；不修改登录、凭据，
+也不主动注入思考参数。切换约 1 秒热生效，每个逻辑请求（含换号、重试）固定原配置快照。
+
+**流式心跳与首字节前重放（v1.14.24）**
+
+腾讯边缘节点可能在响应头已经返回、但首个有效 token 尚未到达时重置 SSE 连接。
+此时客户端还没有收到任何模型内容。Chat 流式入口提供两层缓解：
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| SSE 心跳 | 15 秒 | `upstream.streamKeepaliveSeconds` 可覆盖；省略或非正数使用默认值。等待首个有效 data 期间发送 `: keepalive` 注释，首个有效 data 后停止 |
+| 首字节前重放 | 开启 | `upstream.enableFirstByteRetry` 可显式设为 `false` 关闭。仅在客户端未收到任何有效 data、错误属于瞬时网络故障或上游空闲超时、且重放预算未用尽时，重新走账号池发一次 |
+| 重放上限 | 1 次 | 已下发任何有效 data、客户端主动取消、扫描器错误或非网络错误一律不重放 |
+
+心跳是标准 SSE 注释，不会产生伪 token。重放可能额外消耗一次上游额度，但不会向客户端
+重复输出已生成的内容。重放与心跳都会写入现有 TraceID 日志；重放失败时沿用已建立的
+SSE 响应，以流内错误事件结束，不伪造 `[DONE]`。
+
+这两个配置约 1 秒热生效，供随后开始的 Chat 流式处理读取；已经启动的心跳和重放预算
+保持原值。`streamKeepaliveSeconds: 0` 不是禁用，仍回退到 15 秒；配置关闭重放请使用
+`enableFirstByteRetry: false`。这组开关不关闭本 fork 原有的其他协议 SSE 注释透传。
 
 **瞬时网络错误重试**
 
@@ -726,7 +775,7 @@ systemctl restart workbuddy-gateway
 
 1. 选择**国内站**或**国际站**；
 2. 填**凭据名**，默认是运行目录下第一个没被占用的 `workbuddyN.json`。只能改文件名，落地目录固定为程序运行目录（设置了 `-auth-dir` 时用该目录），页面不展示绝对路径；
-3. 点「获取登录接口」，表单内直接显示**登录链接与二维码**；
+3. 点「获取登录接口」，表单内直接显示**登录链接与二维码**，链接旁有「复制链接」按钮；
 4. 手机扫码授权后，网关自动写入凭据、自动并入账号池并触发额度扫描，**不需要重启服务**。
 
 这条流程与命令行 `workbuddy-gateway login -auth <文件>`（国际站加 `-intl`）**复用同一套登录实现**，行为一致，不会出现两套逻辑漂移。登录会话有时限（国内站 5 分钟、国际站 15 分钟），页面显示剩余时间；超时后提示登录链接已失效并停止轮询，已结束会话会短暂保留以便网页读取终态，点「关闭」也会停止轮询，两种情况都不写入任何文件。
@@ -1079,13 +1128,24 @@ llm-pi-ai:
   providers:
     workbuddy-local:
       baseURL: http://127.0.0.1:8317/v1
-      apiKeyEnv: LOCAL_API_KEY   # 任意字符串即可
+      apiKeyEnv: LOCAL_API_KEY   # 环境变量名；其值应匹配已启用的模型 API Key，未启用校验时可任意填写
       api: openai-completions
       models:
         - id: hy4-preview
           contextWindow: 1000000
           maxTokens: 128000
 ```
+
+**DSH 历史与 GUI 兼容（v1.14.24）**：三个协议共用出站净化链，处理 system / assistant
+字符串及每个标准 `type: "text"` 块开头的已知 `You are an AI agent powered by DeepSeek Harness`
+身份句；前导空白或正文中段不按身份前缀匹配。`systemPrompt.fallback/force` 注入后再执行
+同一幂等处理，Messages 在文本块合并前也处理，避免后续块的开头因拼接而遗漏。
+
+GUI 规则精确匹配已知两句开头，只将第一句中的 `the DeepSeek Harness Web GUI` 改成
+`a Web GUI`，保留后续页面指代和功能说明，并跳过围栏、缩进及行内代码。用户正文、工具参数、
+工具结果、reasoning 和图片不参与新增规则；日志仅记录规则与命中数，不新增正文日志。
+若上游仍拒绝 `11128`，继续返回原错误，不因渠道拒绝自动重试；这不是通用绕过方案。
+详见 [DSH 历史回放与 GUI 环境说明兼容](11128-dsh-history.md)。
 
 ## 思考等级传参
 

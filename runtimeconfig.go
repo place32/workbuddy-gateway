@@ -63,6 +63,9 @@ func parseRuntimeConfig(data []byte) (runtimeFileConfig, error) {
 	if c.Logs.RetentionDays < 0 || c.Logs.RetentionDays > 36500 {
 		return c, gatewayValidationError("logs.retentionDays 必须为 0～36500 的整数；0 表示不自动清理")
 	}
+	if _, err := normalizeRequestProfile(c.Upstream.RequestProfile); err != nil {
+		return c, err
+	}
 	return c, nil
 }
 
@@ -97,6 +100,10 @@ func loadRuntimeConfig(path string) error {
 
 // 调用前已完整校验。热加载不修改监听端口，不中断正在输出的流。
 func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
+	profile, err := normalizeRequestProfile(c.Upstream.RequestProfile)
+	if err != nil {
+		return err
+	}
 	if hot {
 		if err := switchDebugLogging(c.Debug.Enabled); err != nil {
 			return err // 日志文件不可写时，整份配置仍保留上一版本。
@@ -120,6 +127,11 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	setModelFilter(c.Models.Blocklist, c.Models.Allowlist)
 	_ = setModelAccountFilter(c.Models.Accounts)
 	setSystemPromptConfig(c.SystemPrompt.Fallback, c.SystemPrompt.Force)
+	previousProfile := officialRequests.Load()
+	setRequestProfile(profile)
+	if previousProfile != officialRequests.Load() {
+		log.Printf("[出站兼容配置] traceId=%s profile=%s 结果=已应用 说明=只影响后续模型请求，正在执行的请求沿用原快照，不修改登录和凭据", trace, profile)
+	}
 	logRetentionDays.Store(int64(c.Logs.RetentionDays))
 	header, idle, retries := upstreamHeaderTimeoutDefault, upstreamIdleTimeoutDefault, upstreamTransientRetriesDefault
 	if n := c.Upstream.HeaderTimeoutSeconds; n > 0 {
@@ -131,12 +143,22 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	if n := c.Upstream.TransientRetries; n != nil && *n >= 0 {
 		retries = *n
 	}
+	keepalive := streamKeepaliveDefault
+	if n := c.Upstream.StreamKeepaliveSeconds; n > 0 {
+		keepalive = time.Duration(n) * time.Second
+	}
+	firstByteRetry := enableFirstByteRetryDefault
+	if n := c.Upstream.EnableFirstByteRetry; n != nil {
+		firstByteRetry = *n
+	}
 	upstreamConfigMu.Lock()
 	upstreamHeaderTimeout, upstreamIdleTimeout, upstreamTransientRetries = header, idle, retries
+	streamKeepalive = keepalive
+	enableFirstByteRetry = firstByteRetry
 	upstreamConfigMu.Unlock()
 	if hot {
-		log.Printf("[配置热加载] traceId=%s 结果=成功 模型黑名单=%d 模型白名单=%d 账号规则=%d 调试日志=%t 日志保留天数=%d 响应头超时=%v 流空闲超时=%v 重试次数=%d 说明=后续请求使用新配置，凭据及历史账本保留，端口变更需重启",
-			trace, len(c.Models.Blocklist), len(c.Models.Allowlist), len(c.Models.Accounts), c.Debug.Enabled, c.Logs.RetentionDays, header, idle, retries)
+		log.Printf("[配置热加载] traceId=%s 结果=成功 模型黑名单=%d 模型白名单=%d 账号规则=%d 调试日志=%t 日志保留天数=%d 响应头超时=%v 流空闲超时=%v 重试次数=%d 流心跳=%v 首字节重放=%t 说明=后续请求使用新配置，凭据及历史账本保留，端口变更需重启",
+			trace, len(c.Models.Blocklist), len(c.Models.Allowlist), len(c.Models.Accounts), c.Debug.Enabled, c.Logs.RetentionDays, header, idle, retries, keepalive, firstByteRetry)
 	}
 	return nil
 }
@@ -150,6 +172,20 @@ func upstreamSettings() (time.Duration, time.Duration, int) {
 func currentIdleTimeout() time.Duration {
 	_, idle, _ := upstreamSettings()
 	return idle
+}
+
+// currentStreamKeepalive 返回当前流式心跳间隔（0 表示关闭）。
+func currentStreamKeepalive() time.Duration {
+	upstreamConfigMu.RLock()
+	defer upstreamConfigMu.RUnlock()
+	return streamKeepalive
+}
+
+// currentFirstByteRetry 返回当前首字节前重放开关。
+func currentFirstByteRetry() bool {
+	upstreamConfigMu.RLock()
+	defer upstreamConfigMu.RUnlock()
+	return enableFirstByteRetry
 }
 
 func switchDebugLogging(enabled bool) error {

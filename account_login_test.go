@@ -268,6 +268,7 @@ func TestBeginAccountLoginUsesThreeControlPlaneRequests(t *testing.T) {
 	}
 }
 
+// 授权失效账号删除后必须同时移除账号池条目、失效标记与状态快照。
 func TestDeleteAccountCredentialRemovesDisabledPhantom(t *testing.T) {
 	isolatedGatewayConfig(t)
 	dir, err := filepath.Abs(".")
@@ -320,7 +321,6 @@ func TestDeleteAccountCredentialRemovesDisabledPhantom(t *testing.T) {
 		}
 	}
 }
-
 func TestLoginSessionSnapshotReportsRemainingTime(t *testing.T) {
 	s := &loginSession{
 		ID: "login-snapshot-test", Site: "cn", File: "workbuddy1.json",

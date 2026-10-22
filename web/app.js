@@ -186,9 +186,11 @@
         throw new Error("管理鉴权失败");
       }
       if (!resp.ok) {
-        setConn("请求失败 (" + resp.status + ")", "danger");
-        showAlert("HTTP " + resp.status + "：" + (result.data.error || "请求失败") +
-          (path.split("?")[0] === "/admin/api/config-edit" ? "；操作未完成，已有编辑输入保留。" : "；已有数据保留，未更新为零。"));
+        if (!options.quiet) {
+          setConn("请求失败 (" + resp.status + ")", "danger");
+          showAlert("HTTP " + resp.status + "：" + (result.data.error || "请求失败") +
+            (path.split("?")[0] === "/admin/api/config-edit" ? "；操作未完成，已有编辑输入保留。" : "；已有数据保留，未更新为零。"));
+        }
         var failure = new Error("HTTP " + resp.status);
         failure.status = resp.status;
         failure.detail = result.data.error || "请求失败";
