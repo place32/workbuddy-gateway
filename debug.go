@@ -70,8 +70,11 @@ type runtimeFileConfig struct {
 		Fallback string `json:"fallback"`
 		Force    string `json:"force"`
 	} `json:"systemPrompt"`
-	Debug debugFileConfig `json:"debug"`
-	Logs  struct {
+	// Identity 控制 system/developer/assistant 中的展示身份替换。
+	// 省略时使用本版默认值：已知 Harness 名称替换为 WorkBuddy。
+	Identity runtimeIdentityConfig `json:"identity"`
+	Debug    debugFileConfig       `json:"debug"`
+	Logs     struct {
 		RetentionDays int `json:"retentionDays"` // 0 保留全部；正数保留含今天在内的 N 个日历日。
 	} `json:"logs"`
 	// Upstream 段可选，用于按网络状况调整上游超时（单位秒，<=0 或省略表示用默认值）。

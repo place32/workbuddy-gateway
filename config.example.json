@@ -10,6 +10,17 @@
     "fallback": "",
     "force": ""
   },
+  "identity": {
+    "enabled": true,
+    "target": "WorkBuddy",
+    "replacements": {
+      "Claude Code": "WorkBuddy",
+      "Claude": "WorkBuddy",
+      "DeepSeek Harness": "WorkBuddy",
+      "Codex": "WorkBuddy",
+      "ZCode": "WorkBuddy"
+    }
+  },
   "debug": {
     "enabled": false,
     "fullRequests": false

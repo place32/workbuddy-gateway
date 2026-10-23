@@ -186,7 +186,7 @@ func TestUpstreamProfileURLs(t *testing.T) {
 	if got := cn.authStateURL(); got != "https://copilot.tencent.com/v2/plugin/auth/state?platform=workbuddy" {
 		t.Errorf("cn authStateURL = %s", got)
 	}
-	if got := cn.chatURL(); got != "https://copilot.tencent.com/v2/chat/completions" {
+	if got := cn.chatURL(); got != "https://www.workbuddy.cn/v2/chat/completions" {
 		t.Errorf("cn chatURL = %s", got)
 	}
 	if got := cn.tokenRefreshURL(); got != "https://copilot.tencent.com/v2/plugin/auth/token/refresh" {

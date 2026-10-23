@@ -129,11 +129,11 @@ func TestDSHCompatibilityPreservesOrderedScope(t *testing.T) {
 				wantPrefix = blockedSystemPromptPrefixReplacement + ". keep suffix"
 				wantGUI, wantChanges = testDSHNeutralGUI(), 1
 			}
-			if got := normalizeDSHIdentityPrefixes(obj, "system") + normalizeDSHIdentityPrefixes(obj, "assistant"); got != wantChanges {
-				t.Fatalf("prefix changes=%d want=%d", got, wantChanges)
-			}
 			if got := normalizeDSHGUIContexts(obj); got != wantChanges {
 				t.Fatalf("GUI changes=%d want=%d", got, wantChanges)
+			}
+			if got := normalizeDSHIdentityPrefixes(obj, "system") + normalizeDSHIdentityPrefixes(obj, "assistant"); got != wantChanges {
+				t.Fatalf("prefix changes=%d want=%d", got, wantChanges)
 			}
 			message := messagesOf(obj)[0]
 			parts := messageField(message, "content").([]any)

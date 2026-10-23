@@ -41,5 +41,6 @@ Thumbs.db
 # 本地工具缓存、历史材料与可能包含环境信息的报告
 .codex-tmp/
 .playwright-mcp/
+outputs/
 docs/local/
 archive/local/

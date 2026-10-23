@@ -28,7 +28,7 @@
 - 配置热加载后影响新模型请求，无需重启。
 - 改为 `"legacy"` 可回退。字段省略、空字符串或 null 使用 legacy。
 - 非法值或错误类型会被配置校验拒绝；热加载保留上一份有效配置，不会部分应用。
-- 新示例配置显式使用 official；已有配置不会被程序自动改写。
+- 新配置显式使用 official；旧配置保留 requestProfile 原值，启动时只为缺失 identity 的配置补齐该段。
 - 一次逻辑请求只选择一次 profile，热加载不会改变在飞请求及其重试的压缩和头部策略。
 - 本功能没有自动开启 `debug.fullRequests`。
 
@@ -98,6 +98,11 @@ X-Refresh-Token 和缺省 X-No-* 头。
 响应继续由 fork 显式按 Content-Encoding 解码，不依赖 Go 自动解压；压缩协商、
 支持编码与错误处理沿用站点既有实现，不新增未经支持的编码承诺。
 
+2026-10-22 用真实短请求探测过 `https://copilot.tencent.com/v2/responses`，
+返回 HTTP 404 `Route Not Found`。因此当前仍使用 `/v2/chat/completions`，
+不把尚未支持的 Responses 上游路径切过去。
+
+
 保留 fork 已验证的客户端指纹：x-stainless 家族、按站点设置的 Node 运行时版本、
 Agent 元数据、OTel/B3 传播与会话链路等式；不因上游使用 Go 就删除这些已有字段。
 默认 legacy 完全保留原有头部值、键名大小写和线上顺序；official 仅覆盖列出的
@@ -106,7 +111,59 @@ Agent 元数据、OTel/B3 传播与会话链路等式；不因上游使用 Go �
 
 国际站的 UA、认证头、站点和请求编码保持 legacy，不把国内桌面头复制到国际站。
 official 的正文准备规则仍适用于该请求；未知模型依旧不注入未经验证的采样字段。
-国内模型 URL 当前仍沿用原有账号站点配置，未改成抓包中另一域名，不把近似兼容宣传为完全相同的官方链路。
+国内模型请求改走 `https://www.workbuddy.cn/v2/chat/completions`；认证、刷新和额度仍使用原站点。国际站模型请求仍走 `www.workbuddy.ai`。测试或本地覆盖 Base 时仍使用覆盖地址，不把近似兼容宣传为完全相同的官方链路。
+
+### Responses 工具保真
+
+Responses 的 namespace、custom 和 web_search 工具不再被静默丢弃：
+
+- namespace 子工具以 `namespace__tool` 的扁平 function 名发给 Chat 上游；
+- custom 工具（例如 `apply_patch`）以带单字符串 `input` 的 function 发给上游；
+- web_search 作为可调用的 function 工具保留；
+- 上游返回工具调用时，网关按映射恢复 `namespace`、`custom_tool_call` 及
+  `response.custom_tool_call_input.*` 事件，客户端看到的是原始 Responses 形状；
+- 历史中的 `function_call`、`custom_tool_call` 及其 output 会一并转换，避免续轮丢失。
+
+这不是把 Chat 上游变成完整 OpenAI Responses 实现；工具的实际执行仍由客户端完成。
+
+### 身份展示
+
+system、developer 和 assistant 历史中的展示身份替换可在 `config.json` 的 `identity`
+段配置；省略时使用本版默认目标 `WorkBuddy`。`identity:{}`、空 `target` 或空 `replacements` 也按默认值运行，不会阻断启动。
+
+想更接近官方 WorkBuddy 文案，可把目标设为 `WorkBuddy`：
+
+```json
+{
+  "identity": {
+    "enabled": true,
+    "target": "WorkBuddy"
+  }
+}
+```
+
+需要逐词控制时使用 `replacements`；键是原文，值是替换文本：
+
+```json
+{
+  "identity": {
+    "enabled": true,
+    "target": "WorkBuddy",
+    "replacements": {
+      "Claude Code": "WorkBuddy",
+      "Claude": "WorkBuddy",
+      "DeepSeek Harness": "WorkBuddy",
+      "Codex": "WorkBuddy",
+      "ZCode": "WorkBuddy"
+    }
+  }
+}
+```
+
+`enabled:false` 完全关闭替换。规则只作用于 system/developer/assistant 文本；
+user、tool、reasoning 实测值、工具参数和工具结果不参与。官方版不经过网关，
+所以官方直连请求的原文不会被这套规则改写。
+当前实现是文本级替换，正文中的产品名和技能说明也会被替换；不是只改开头身份句。
 
 ## Codex、dsh、Claude Code 接入建议
 
@@ -116,9 +173,9 @@ official 的正文准备规则仍适用于该请求；未知模型依旧不注�
 - Claude Code 等使用 Messages 时，可以原样提交 system、thinking、output_config 和 Anthropic 工具。
 - 原生 Chat 客户端保留 system/developer 与 user 的区别。
 
-当前 Responses 工具转译支持 function 工具。原生 custom/freeform/namespace、
-托管搜索或其他专用工具协议不因开启此 profile 就自动获得完整支持；
-客户端包含这些工具时，应先确认接入协议和工具封装，不能把本模式当作全量 OpenAI API 等价实现。
+当前 Responses 工具转译支持 function、namespace 子工具、custom 和 web_search
+的请求/响应保真映射。托管搜索的实际搜索结果仍由客户端执行；不能把本模式当作
+全量 OpenAI API 等价实现。
 
 本轮诊断发现过“客户端 max，经 CPA 后到网关已是 high”和“本地 developer，到网关已是 user”。
 网关不能从已经丢失的角色和档位可靠反推出原意：

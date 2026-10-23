@@ -71,7 +71,7 @@ func TestSanitizeMessagesPrefixScopeAndArray(t *testing.T) {
 	if leadingContent != " "+prefix+". Leading space." {
 		t.Fatal("leading space must not be rewritten")
 	}
-	array := messages[5].(map[string]any)["content"].([]any)
+	array := messageField(messages[5], "content").([]any)
 	if array[0].(map[string]any)["type"] != "image_url" {
 		t.Fatal("image block must remain in place")
 	}
@@ -167,5 +167,79 @@ func TestPrefixSanitizeLogIsMetadataOnly(t *testing.T) {
 	raw, _ := os.ReadFile(path)
 	if strings.Contains(string(raw), "DeepSeek Harness. Keep") {
 		t.Fatal("log leaked prompt body")
+	}
+}
+
+func TestAssistantIdentityBrandReplacement(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"您是 Codex，一个在 Codex CLI 中运行的编码代理。", "您是 WorkBuddy，一个在 WorkBuddy CLI 中运行的编码代理。"},
+		{"You are an AI agent powered by DeepSeek Harness. Keep rules.", "You are WorkBuddy. Keep rules."},
+		{"You are Claude Code, Anthropic's official CLI tool for Claude.", "You are WorkBuddy, Anthropic's official CLI tool for WorkBuddy."},
+		{"You are ZCode. Keep rules.", "You are WorkBuddy. Keep rules."},
+	}
+	for _, tc := range cases {
+		got, changed := normalizeAssistantIdentityText(tc.input)
+		if !changed || got != tc.want {
+			t.Fatalf("input=%q got=%q changed=%t want=%q", tc.input, got, changed, tc.want)
+		}
+	}
+}
+
+func TestAssistantIdentityDoesNotTouchUserOrToolText(t *testing.T) {
+	obj := map[string]any{"messages": []any{
+		msg("system", "You are Codex. Keep."),
+		msg("assistant", "You are Claude Code. Keep."),
+		msg("user", "You are Codex. User text."),
+		msg("tool", "You are DeepSeek Harness. Tool text."),
+	}}
+	r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	logDSHPromptCompatibility(r, 1, obj)
+	messages := obj["messages"].([]any)
+	if messageField(messages[0], "content") != "You are WorkBuddy. Keep." ||
+		messageField(messages[1], "content") != "You are WorkBuddy. Keep." {
+		t.Fatalf("assistant identity not normalized: %#v", messages[:2])
+	}
+	if messageField(messages[2], "content") != "You are Codex. User text." ||
+		messageField(messages[3], "content") != "You are DeepSeek Harness. Tool text." {
+		t.Fatal("user or tool text was modified")
+	}
+}
+
+func TestResponsesReasoningSummaryDetailedIsPreserved(t *testing.T) {
+	ordered, _, err := responsesToChatRequestDetailed(decodeCompatOrdered(t, []byte(`{
+		"input":"hi","reasoning":{"effort":"max","summary":"detailed"}
+	}`)), "deepseek-v4.1-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat := ordered.toMap()
+	if chat["reasoning_summary"] != "detailed" {
+		t.Fatalf("summary lost during conversion: %#v", chat)
+	}
+	applyThinkingRules(chat, "deepseek-v4.1-flash")
+	if chat["reasoning_summary"] != "detailed" {
+		t.Fatalf("summary downgraded during outbound preparation: %#v", chat)
+	}
+}
+
+func TestIdentityConfigTargetAndCustomReplacements(t *testing.T) {
+	t.Cleanup(func() { setIdentityConfig(runtimeIdentityConfig{}) })
+	setIdentityConfig(runtimeIdentityConfig{Target: "WorkBuddy"})
+	got, changed := normalizeAssistantIdentityText("You are an AI agent powered by DeepSeek Harness. Codex")
+	if !changed || got != "You are WorkBuddy. WorkBuddy" {
+		t.Fatalf("target override got=%q changed=%t", got, changed)
+	}
+	disabled := false
+	setIdentityConfig(runtimeIdentityConfig{Enabled: &disabled, Target: "WorkBuddy"})
+	got, changed = normalizeAssistantIdentityText("You are Codex. DeepSeek Harness")
+	if changed || got != "You are Codex. DeepSeek Harness" {
+		t.Fatalf("disabled identity still changed=%q", got)
+	}
+	setIdentityConfig(runtimeIdentityConfig{Target: "Assistant", Replacements: map[string]string{
+		"Codex": "Coder", "DeepSeek Harness": "Buddy",
+	}})
+	got, changed = normalizeAssistantIdentityText("You are an AI agent powered by DeepSeek Harness. Codex")
+	if !changed || got != "You are Buddy. Coder" {
+		t.Fatalf("custom replacements got=%q changed=%t", got, changed)
 	}
 }

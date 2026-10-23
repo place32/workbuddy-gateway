@@ -2,7 +2,7 @@
 
 纯 Go、零 CGO 依赖的跨平台单二进制网关，支持国内站与国际站、多账号调度、OpenAI / Anthropic 协议及可选网页控制台。
 
-**v1.14.24（place32 fork）**：合并上游 `09ed560`，新增可选统一出站兼容、Chat 首字节前 SSE 心跳与最多一次重放，以及 DSH 历史/GUI 提示词兼容。保留本 fork 的思考参数归一化、客户端指纹与保序 JSON、会话链路不变量、反审查净化和单账号串行化。旧配置省略 `upstream.requestProfile` 仍沿用 fork 原行为；重放可能额外消耗一次上游额度，可关闭。详见[完整手册](docs/user-guide.md)及[出站兼容说明](docs/outbound-compatibility.md)。
+**v1.14.30（place32 fork）**：合并上游至 `ec34778`（含 v1.14.29 与 Windows RST 修复），新增可配置身份替换、默认配置初始化、Responses namespace/custom 工具保真与国内模型请求分流。保留本 fork 的思考参数归一化、客户端指纹与保序 JSON、gzip、会话链路不变量、反审查净化和单账号串行化。旧配置启动时会补充缺失的 identity 段，默认目标为 WorkBuddy；升级前请备份配置与凭据。详见[发布说明](release_notes_v1.14.30.md)、[完整手册](docs/user-guide.md)及[出站兼容说明](docs/outbound-compatibility.md)。
 
 ## 快速开始
 
@@ -16,7 +16,7 @@ go build -o workbuddy-gateway .
 
 Windows 可使用 `.\workbuddy-gateway.exe`。管理端口默认 `8316`，模型 API 默认 `8317`。
 
-- 首次使用可复制 `config.example.json` 为 `config.json`，并按需要设置管理 Key 和 API 鉴权。
+- 首次启动会在工作目录生成完整的默认 `config.json`；旧配置缺少 `identity` 段时也会自动补充。可按需要设置管理 Key、API 鉴权和身份替换。
 - **后台价格探测默认关闭**，只有显式传入 `-allow-price-probes` 才开启；主动生成请求可能消耗积分。
 - 网页配置页支持风险确认后的完整 JSON 编辑；监听端口修改需重启服务。
 - `config.json` 和账号凭据含敏感信息，已由 Git 忽略，不要公开分享。
@@ -61,9 +61,9 @@ Go 单元测试保持与 `package main` 源码同目录，以保留私有函数�
 
 ```bash
 # 版本号先与 main.go 的 version 常量一致，再打标签推送
-git tag -a v1.14.24 -m "v1.14.24: merge upstream 09ed560"
+git tag -a v1.14.30 -m "v1.14.30: merge upstream ec34778"
 git push origin main
-git push origin refs/tags/v1.14.24:refs/tags/v1.14.24
+git push origin refs/tags/v1.14.30:refs/tags/v1.14.30
 ```
 
 只推送本次新建的明确标签；不要使用 `--follow-tags` 或 `--tags`，以免将本地已有的上游标签发布到 fork。

@@ -12,16 +12,20 @@ var blockedSystemPromptPrefixes = []string{
 	"You are an AI agent powered by DeepSeek Harness",
 }
 
-const blockedSystemPromptPrefixReplacement = "You are an AI agent powered by a large language model"
+const blockedSystemPromptPrefixReplacement = "You are WorkBuddy"
 
 // sanitizeSystemPromptPrefix 返回改写后的文本以及是否命中。匹配忽略大小写，
 // 但只允许从字符串第一个字节开始；前缀后的正文逐字保留。
 func sanitizeSystemPromptPrefix(text string) (string, bool) {
+	settings := identitySnapshot()
+	if !settings.enabled {
+		return text, false
+	}
 	for _, prefix := range blockedSystemPromptPrefixes {
 		if len(text) < len(prefix) || !strings.EqualFold(text[:len(prefix)], prefix) {
 			continue
 		}
-		return blockedSystemPromptPrefixReplacement + text[len(prefix):], true
+		return settings.prefix + text[len(prefix):], true
 	}
 	return text, false
 }
@@ -63,7 +67,7 @@ func normalizeDSHIdentityPrefixes(obj any, role string) int {
 		}
 		switch content := messageField(raw, "content").(type) {
 		case string:
-			if rewritten, changed := sanitizeSystemPromptPrefix(content); changed {
+			if rewritten, changed := normalizeAssistantIdentityText(content); changed {
 				setMessageField(raw, "content", rewritten)
 				modified++
 			}
@@ -73,7 +77,7 @@ func normalizeDSHIdentityPrefixes(obj any, role string) int {
 					continue
 				}
 				if text, ok := messageField(rawPart, "text").(string); ok {
-					if rewritten, changed := sanitizeSystemPromptPrefix(text); changed {
+					if rewritten, changed := normalizeAssistantIdentityText(text); changed {
 						setMessageField(rawPart, "text", rewritten)
 						modified++
 					}
@@ -86,9 +90,10 @@ func normalizeDSHIdentityPrefixes(obj any, role string) int {
 
 // logDSHPromptCompatibility 只记录固定规则和命中数量，不记录提示词正文。
 func logDSHPromptCompatibility(r *http.Request, requestID uint64, obj any) {
+	// Normalize GUI sentences before replacing the brand names they contain.
+	gui := normalizeDSHGUIContexts(obj)
 	system := normalizeDSHIdentityPrefixes(obj, "system")
 	assistant := normalizeDSHIdentityPrefixes(obj, "assistant")
-	gui := normalizeDSHGUIContexts(obj)
 	if system+assistant+gui == 0 {
 		return
 	}

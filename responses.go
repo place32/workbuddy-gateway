@@ -85,11 +85,12 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	chatReq, err := responsesToChatRequest(respReq, modelName)
+	chatReq, toolMap, err := responsesToChatRequestDetailed(respReq, modelName)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	r = withResponsesToolMap(r, toolMap)
 	chatReq.Set("stream", true) // 上游强制流式，非流式由网关本地聚合
 
 	prepareUpstreamChatRequest(chatReq, r, reqID, modelName)
@@ -119,6 +120,12 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 //
 // 键序对齐客户端 JSON.stringify 输出：model 在首位，随后 messages，再是可选参数。
 func responsesToChatRequest(respReq *jsonObject, modelName string) (*jsonObject, error) {
+	chat, _, err := responsesToChatRequestDetailed(respReq, modelName)
+	return chat, err
+}
+
+// Keep ordered request fields while retaining the upstream tool identity mapping.
+func responsesToChatRequestDetailed(respReq *jsonObject, modelName string) (*jsonObject, map[string]responsesToolMeta, error) {
 	chat := newJSONObject()
 	chat.Set("model", modelName)
 
@@ -194,7 +201,7 @@ func responsesToChatRequest(respReq *jsonObject, modelName string) (*jsonObject,
 	}
 
 	if len(messages) == 0 {
-		return nil, fmt.Errorf("input 为空：Responses 请求必须提供 input 或 instructions")
+		return nil, nil, fmt.Errorf("input 为空：Responses 请求必须提供 input 或 instructions")
 	}
 	chat.Set("messages", messages)
 
@@ -210,14 +217,23 @@ func responsesToChatRequest(respReq *jsonObject, modelName string) (*jsonObject,
 	if v, ok := respReq.Get("max_output_tokens"); ok && v != nil {
 		chat.Set("max_tokens", v)
 	}
-	if toolsRaw, _ := respReq.Get("tools"); toolsRaw != nil {
-		if tools := convertResponsesTools(toolsRaw); len(tools) > 0 {
-			chat.Set("tools", tools)
-		}
+	tools, toolMap := convertResponsesToolsDetailed(messageField(respReq, "tools"))
+	if len(tools) > 0 {
+		chat.Set("tools", tools)
 	}
-	if tcRaw, _ := respReq.Get("tool_choice"); tcRaw != nil {
-		if tc := convertResponsesToolChoice(tcRaw); tc != nil {
-			chat.Set("tool_choice", tc)
+	if tc, selected := convertResponsesToolChoiceWithMap(messageField(respReq, "tool_choice"), toolMap); tc != nil {
+		chat.Set("tool_choice", tc)
+		if selected != "" {
+			filtered := make([]any, 0, 1)
+			for _, tool := range tools {
+				if strOf(messageField(messageField(tool, "function"), "name")) == selected {
+					filtered = append(filtered, tool)
+				}
+			}
+			if len(filtered) == 0 {
+				return nil, nil, fmt.Errorf("tool_choice specifies a tool not defined in tools")
+			}
+			chat.Set("tools", filtered)
 		}
 	}
 	if reasoningRaw, _ := respReq.Get("reasoning"); reasoningRaw != nil {
@@ -238,7 +254,7 @@ func responsesToChatRequest(respReq *jsonObject, modelName string) (*jsonObject,
 	if verbosity, ok := messageField(messageField(respReq, "text"), "verbosity").(string); ok && verbosity != "" {
 		chat.Set("verbosity", verbosity)
 	}
-	return chat, nil
+	return chat, toolMap, nil
 }
 
 // reasoningReplayText 取出 DSH 回放的 reasoning 项里的推理正文。
@@ -358,6 +374,9 @@ func convertResponsesInputItem(item *jsonObject) []any {
 		}
 		nameRaw, _ := item.Get("name")
 		name, _ := nameRaw.(string)
+		if namespace, _ := messageField(item, "namespace").(string); namespace != "" {
+			name = flattenNamespaceToolName(namespace, name)
+		}
 		argsRaw, _ := item.Get("arguments")
 		args, _ := argsRaw.(string)
 		return []any{newObject(
@@ -369,7 +388,21 @@ func convertResponsesInputItem(item *jsonObject) []any {
 				"function", newObject("name", name, "arguments", args),
 			)},
 		)}
-	case "function_call_output":
+	case "custom_tool_call":
+		callID, _ := messageField(item, "call_id").(string)
+		if callID == "" {
+			callID, _ = messageField(item, "id").(string)
+		}
+		name, _ := messageField(item, "name").(string)
+		input, _ := messageField(item, "input").(string)
+		return []any{newObject(
+			"role", "assistant", "content", nil,
+			"tool_calls", []any{newObject(
+				"id", ifEmpty(callID, "call_"+compactUUID()), "type", "function",
+				"function", newObject("name", name, "arguments", customToolArguments(input)),
+			)},
+		)}
+	case "function_call_output", "custom_tool_call_output":
 		callIDRaw, _ := item.Get("call_id")
 		callID, _ := callIDRaw.(string)
 		outRaw, _ := item.Get("output")
@@ -574,66 +607,24 @@ func stringifyToolOutput(output any) string {
 	}
 }
 
-// convertResponsesTools 将 Responses 扁平 function 工具转换为 chat 嵌套 function 工具。
-func convertResponsesTools(toolsAny any) []any {
-	arr, ok := toolsAny.([]any)
-	if !ok {
-		return nil
-	}
-	out := make([]any, 0, len(arr))
-	for _, tAny := range arr {
-		t, ok := tAny.(*jsonObject)
-		if !ok {
-			continue
-		}
-		typRaw, _ := t.Get("type")
-		typ, _ := typRaw.(string)
-		if typ != "" && typ != "function" {
-			continue // 仅支持 function 工具
-		}
-		nameRaw, _ := t.Get("name")
-		name, _ := nameRaw.(string)
-		descRaw, _ := t.Get("description")
-		desc, _ := descRaw.(string)
-		params, _ := t.Get("parameters")
-		if name == "" {
-			// 兼容旧式嵌套 {type:"function", function:{...}}
-			if fnRaw, ok := t.Get("function"); ok {
-				if fn, ok := fnRaw.(*jsonObject); ok {
-					fnName, _ := fn.Get("name")
-					name, _ = fnName.(string)
-					fnDesc, _ := fn.Get("description")
-					desc, _ = fnDesc.(string)
-					params, _ = fn.Get("parameters")
-				}
-			}
-		}
-		if name == "" {
-			continue
-		}
-		fn := newJSONObject()
-		fn.Set("name", name)
-		if desc != "" {
-			fn.Set("description", desc)
-		}
-		if params != nil {
-			fn.Set("parameters", params)
-		}
-		out = append(out, newObject("type", "function", "function", fn))
-	}
-	return out
-}
-
 // convertResponsesToolChoice 将 Responses tool_choice 转换为 chat tool_choice。
 func convertResponsesToolChoice(tc any) any {
+	choice, _ := convertResponsesToolChoiceWithMap(tc, nil)
+	return choice
+}
+
+// convertResponsesToolChoiceWithMap 只返回上游接受的字符串枚举；命名工具
+// 同时返回扁平工具名，调用方会据此裁剪 tools。腾讯上游不接受 OpenAI 的
+// function 对象形式。
+func convertResponsesToolChoiceWithMap(tc any, tools map[string]responsesToolMeta) (any, string) {
 	switch v := tc.(type) {
 	case string:
 		if v == "auto" || v == "none" || v == "required" {
-			return v
+			return v, ""
 		}
 	case *jsonObject:
 		typRaw, _ := v.Get("type")
-		if typ, _ := typRaw.(string); typ == "function" {
+		if typ, _ := typRaw.(string); typ == "function" || typ == "custom" {
 			nameRaw, _ := v.Get("name")
 			name, _ := nameRaw.(string)
 			if name == "" {
@@ -644,12 +635,19 @@ func convertResponsesToolChoice(tc any) any {
 					}
 				}
 			}
+			namespace, _ := messageField(v, "namespace").(string)
+			name = flattenNamespaceToolName(namespace, name)
 			if name != "" {
-				return newObject("type", "function", "function", newObject("name", name))
+				if tools != nil {
+					if meta, ok := tools[name]; ok {
+						return "required", meta.UpstreamName
+					}
+				}
+				return "required", name
 			}
 		}
 	}
-	return nil
+	return nil, ""
 }
 
 // writeResponsesAggregate 聚合上游 SSE 后转换为 Responses 非流式响应。
@@ -672,7 +670,7 @@ func writeResponsesAggregate(w http.ResponseWriter, r *http.Request, resp *http.
 	observeModelCredit(acc, modelName, usage, reqID)
 	recordModelTokens(modelName, usage, reqID)
 	recordModelLatency(modelName, time.Since(startTime))
-	out, err := chatCompletionToResponses(completionJSON, modelName)
+	out, err := chatCompletionToResponsesWithTools(completionJSON, modelName, responsesToolMapFor(r))
 	if err != nil {
 		debugEvent(r, "error", "response_translation_failed", map[string]any{
 			"error_type": debugErrorType(err),
@@ -692,8 +690,13 @@ func writeResponsesAggregate(w http.ResponseWriter, r *http.Request, resp *http.
 	log.Printf("[#%d] Responses 非流式响应完成 (账号 %s [%s], 耗时 %v)", reqID, acc.Path, prof.Label, time.Since(startTime))
 }
 
-// chatCompletionToResponses 将 chat.completion JSON 转换为 Responses 响应对象。
+// chatCompletionToResponses 保留旧接口；主链路使用带工具映射的版本。
 func chatCompletionToResponses(chatJSON []byte, modelName string) ([]byte, error) {
+	return chatCompletionToResponsesWithTools(chatJSON, modelName, nil)
+}
+
+// chatCompletionToResponsesWithTools 将 chat.completion JSON 转换为 Responses 响应对象。
+func chatCompletionToResponsesWithTools(chatJSON []byte, modelName string, toolMap map[string]responsesToolMeta) ([]byte, error) {
 	var chat map[string]any
 	if err := json.Unmarshal(chatJSON, &chat); err != nil {
 		return nil, err
@@ -742,14 +745,7 @@ func chatCompletionToResponses(chatJSON []byte, modelName string) ([]byte, error
 			name, _ = fn["name"].(string)
 			args, _ = fn["arguments"].(string)
 		}
-		output = append(output, map[string]any{
-			"id":        "fc_" + compactUUID(),
-			"type":      "function_call",
-			"status":    "completed",
-			"call_id":   ifEmpty(callID, "call_"+compactUUID()),
-			"name":      name,
-			"arguments": args,
-		})
+		output = append(output, responsesToolCallItem(callID, name, args, toolMap))
 	}
 
 	now := time.Now().Unix()
@@ -887,6 +883,7 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 	var toolOrder []int
 	tcItemID := map[int]string{}
 	tcIndex := map[int]int{}
+	tcMeta := map[int]responsesToolMeta{}
 
 	openReasoning := func() {
 		if reasoningOpen {
@@ -1004,18 +1001,37 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 					if st.ID == "" {
 						st.ID = "call_" + compactUUID()
 					}
-					tcItemID[idx] = "fc_" + compactUUID()
+					meta, _ := responsesToolMetaFor(r, st.Name)
+					tcMeta[idx] = meta
 					tcIndex[idx] = nextIndex
 					nextIndex++
-					emit("response.output_item.added", map[string]any{
-						"output_index": tcIndex[idx],
-						"item": map[string]any{
-							"id": tcItemID[idx], "type": "function_call", "status": "in_progress",
-							"call_id": st.ID, "name": st.Name, "arguments": "",
-						},
-					})
+					if meta.Kind == responsesToolCustom {
+						tcItemID[idx] = "ctc_" + compactUUID()
+						emit("response.output_item.added", map[string]any{
+							"output_index": tcIndex[idx],
+							"item": map[string]any{
+								"id": tcItemID[idx], "type": "custom_tool_call", "status": "in_progress",
+								"call_id": st.ID, "name": meta.Name, "input": "",
+							},
+						})
+						continue
+					}
+					tcItemID[idx] = "fc_" + compactUUID()
+					itemName := st.Name
+					item := map[string]any{
+						"id": tcItemID[idx], "type": "function_call", "status": "in_progress",
+						"call_id": st.ID, "name": itemName, "arguments": "",
+					}
+					if meta.Namespace != "" {
+						item["name"] = meta.Name
+						item["namespace"] = meta.Namespace
+					}
+					emit("response.output_item.added", map[string]any{"output_index": tcIndex[idx], "item": item})
 				}
 				for _, ad := range argDeltas {
+					if tcMeta[ad.idx].Kind == responsesToolCustom {
+						continue // 自定义工具的 JSON 参数在收尾时还原为原始 input
+					}
 					emit("response.function_call_arguments.delta", map[string]any{
 						"item_id": tcItemID[ad.idx], "output_index": tcIndex[ad.idx], "delta": ad.arg,
 					})
@@ -1100,8 +1116,33 @@ func streamResponsesResponse(w http.ResponseWriter, r *http.Request, resp *http.
 	for _, idx := range toolOrder {
 		st := toolCalls[idx]
 		args := st.Args.String()
-		emit("response.function_call_arguments.done", map[string]any{"item_id": tcItemID[idx], "output_index": tcIndex[idx], "name": st.Name, "arguments": args})
+		meta := tcMeta[idx]
+		if meta.Kind == responsesToolCustom {
+			input := customToolInputFromArguments(args)
+			emit("response.custom_tool_call_input.delta", map[string]any{
+				"item_id": tcItemID[idx], "output_index": tcIndex[idx], "delta": input,
+			})
+			emit("response.custom_tool_call_input.done", map[string]any{
+				"item_id": tcItemID[idx], "output_index": tcIndex[idx], "input": input,
+			})
+			item := map[string]any{
+				"id": tcItemID[idx], "type": "custom_tool_call", "status": "completed",
+				"call_id": st.ID, "name": meta.Name, "input": input,
+			}
+			emit("response.output_item.done", map[string]any{"output_index": tcIndex[idx], "item": item})
+			idxToItem[tcIndex[idx]] = item
+			continue
+		}
+		eventName := st.Name
+		if meta.Namespace != "" {
+			eventName = meta.Name
+		}
+		emit("response.function_call_arguments.done", map[string]any{"item_id": tcItemID[idx], "output_index": tcIndex[idx], "name": eventName, "arguments": args})
 		item := map[string]any{"id": tcItemID[idx], "type": "function_call", "status": "completed", "call_id": st.ID, "name": st.Name, "arguments": args}
+		if meta.Namespace != "" {
+			item["name"] = meta.Name
+			item["namespace"] = meta.Namespace
+		}
 		emit("response.output_item.done", map[string]any{"output_index": tcIndex[idx], "item": item})
 		idxToItem[tcIndex[idx]] = item
 	}

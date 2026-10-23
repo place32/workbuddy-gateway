@@ -88,8 +88,8 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-      # 幂等：Release 已存在则覆盖上传资产（重跑失败任务不会报「已存在」错误）；
-      # 不存在则用仓库内的 release_notes_<tag>.md 作为说明，缺失时回退自动生成。
+      # 新 Release 先保持草稿，核对源提交和全部资产 SHA256 后才公开。
+      # 重跑沿用已有 Release；说明缺失时回退自动生成。
       - name: 发布 Release
         shell: pwsh
         env:
@@ -98,12 +98,36 @@ jobs:
           $tag = '${{ steps.tag.outputs.tag }}'
           $files = @(Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName })
           if ($files.Count -eq 0) { throw 'dist/ 下没有产物，拒绝发布空 Release' }
+          $manifest = Get-Content -LiteralPath dist/build-manifest.json -Raw | ConvertFrom-Json
+          $commit = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw '无法读取构建源提交' }
+          if ($manifest.source_commit -ne $commit -or $manifest.tracked_source_dirty -ne $false -or
+              $manifest.version -ne '${{ steps.tag.outputs.version }}' -or $manifest.artifacts.Count -ne 9 -or
+              $files.Count -ne 13) {
+            throw '构建源提交、版本或产物集合不符合发布要求'
+          }
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Release $tag 已存在，覆盖上传 $($files.Count) 个资产"
             gh release upload $tag @files --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Release 资产上传失败' }
           } else {
             $notesFile = "release_notes_$tag.md"
             $notesArgs = if (Test-Path -LiteralPath $notesFile) { @('--notes-file', $notesFile) } else { @('--generate-notes') }
-            gh release create $tag @files --verify-tag --title "WorkBuddy Local Gateway $tag" @notesArgs
+            gh release create $tag @files --draft --verify-tag --title "WorkBuddy Local Gateway $tag" @notesArgs
+            if ($LASTEXITCODE -ne 0) { throw 'Release 草稿创建失败' }
           }
+          $remote = gh release view $tag --json assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $remote.assets.Count -ne $files.Count) { throw '远端资产集合不完整' }
+          foreach ($file in $files) {
+            $local = Get-Item -LiteralPath $file
+            $asset = @($remote.assets | Where-Object { $_.name -ceq $local.Name })
+            $digest = 'sha256:' + (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($asset.Count -ne 1 -or $asset[0].state -ne 'uploaded' -or
+                $asset[0].size -ne $local.Length -or $asset[0].digest -cne $digest) {
+              throw "远端资产校验失败：$($local.Name)"
+            }
+            Write-Host "Verified $($local.Name) $digest"
+          }
+          gh release edit $tag --draft=false --latest --verify-tag
+          if ($LASTEXITCODE -ne 0) { throw 'Release 公开发布失败' }

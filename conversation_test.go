@@ -162,7 +162,12 @@ func TestConversationHeadersAllProtocolsStreamsSitesAndTools(t *testing.T) {
 							if getHeaderExact(req.Header, conversationIDHeader) != sessionID {
 								t.Error("original metadata was lost during protocol translation")
 							}
-							if req.URL.Host != strings.TrimPrefix(profileForEdition(site).Base, "https://") {
+							prof := profileForEdition(site)
+							base := prof.Base
+							if prof.ChatBase != "" && prof.Base == prof.DefaultBase {
+								base = prof.ChatBase
+							}
+							if req.URL.Host != strings.TrimPrefix(base, "https://") {
 								t.Errorf("wrong upstream site: %s", req.URL.Host)
 							}
 							var payload map[string]any

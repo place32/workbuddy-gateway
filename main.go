@@ -42,7 +42,7 @@ import (
 )
 
 const (
-	version = "1.14.24"
+	version = "1.14.30"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -117,6 +117,13 @@ var (
 // 以及 Go 在复用 keep-alive 连接时常见的 "server closed idle connection"。
 // 注意：context.Canceled 与 DeadlineExceeded 不属于此类——前者是客户端主动断开，
 // 后者是明确超时，重试都无意义甚至有害。
+//
+// Windows 上同一类故障的文案与 POSIX 不同：Winsock 的发送/接收失败表现为
+// "An existing connection was forcibly closed by the remote host"（WSAECONNRESET，
+// 常带 wsasend:/wsarecv: 前缀）或 "An established connection was aborted by the
+// software in your host machine"（WSAECONNABORTED），都不包含 "connection reset
+// by peer"。两套文案必须同时匹配，否则 Windows 上的 RST 会被当成永久错误：
+// doUpstreamRequest 不会重试，canReplayStream 也会因此拒绝首字节前重放。
 func isTransientNetworkError(err error) bool {
 	if err == nil {
 		return false
@@ -144,6 +151,10 @@ func isTransientNetworkError(err error) bool {
 		"unexpected eof",
 		"http2: server sent goaway",
 		"stream error",
+		// Windows Winsock：WSAECONNRESET / WSAECONNABORTED 的文案与 POSIX 不同，
+		// 不含 "connection reset by peer"。msg 已转小写，此处必须小写。
+		"forcibly closed",
+		"an established connection was aborted",
 	} {
 		if strings.Contains(msg, marker) {
 			return true
@@ -173,6 +184,14 @@ func upstreamBody(prof *upstreamProfile, raw []byte) ([]byte, bool) {
 	return buf.Bytes(), true
 }
 
+// legacyLargeBodyWarnBytes 是提示「未压缩大请求体」的阈值。
+// 仅当站点明确禁用 gzip 时提示；fork 的默认站点在 legacy 下也压缩。
+// 上行抖动时被对端中断的概率随之升高，因此超过该阈值时提示一次配置项。
+const legacyLargeBodyWarnBytes = 512 * 1024
+
+// legacyLargeBodyWarned 保证该提示在一个进程内只输出一次，避免逐请求刷屏。
+var legacyLargeBodyWarned atomic.Bool
+
 // doUpstreamRequest 发送上游请求，并对瞬时网络错误做有界重试。
 //
 // 仅在「尚未写出完整请求头」时重试；已发送 POST 后收到 EOF 无法判定上游
@@ -187,6 +206,14 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 		log.Printf("[出站兼容] traceId=%s requestId=%d 阶段=请求编码 结果=失败 业务影响=未发送上游", traceID, reqID)
 		debugEvent(r, "error", "upstream_body_encode_failed", map[string]any{"status_code": 502})
 		return nil, nil, encodeErr
+	}
+	if profile == requestProfileLegacy && !prof.GzipBody && len(wireBytes) >= legacyLargeBodyWarnBytes && legacyLargeBodyWarned.CompareAndSwap(false, true) {
+		log.Printf("[出站兼容] traceId=%s requestId=%d 请求体=%d字节 profile=legacy 未压缩 说明=出站请求体未压缩，上传耗时随体积线性增长，上行抖动时更容易被对端中断；当前站点未启用 GzipBody；fork 默认国内与国际站均启用 gzip",
+			traceID, reqID, len(wireBytes))
+		debugEvent(r, "info", "outbound_body_uncompressed_large", map[string]any{
+			"wire_body_bytes": len(wireBytes), "profile": profile,
+			"business_impact": "仅提示配置项，不改变出站行为",
+		})
 	}
 	var lastErr error
 	_, _, retries := upstreamSettings()
@@ -278,6 +305,8 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 type upstreamProfile struct {
 	Key             string // 存储于凭据文件 edition 字段的站点标识
 	Label           string // 控制台展示名
+	DefaultBase     string // Production API base; overridden Base keeps local test routing.
+	ChatBase        string // Model-only endpoint.
 	Base            string // 上游 API 基础地址
 	Platform        string // auth/state 的 platform 参数
 	PlatformName    string // X-IDE-Type / X-IDE-Name（宿主产品标识）
@@ -322,7 +351,8 @@ const (
 var (
 	profileCN = upstreamProfile{
 		Key: "cn", Label: "国内站",
-		Base: "https://copilot.tencent.com",
+		Base: "https://copilot.tencent.com", DefaultBase: "https://copilot.tencent.com",
+		ChatBase: "https://www.workbuddy.cn",
 		// auth/state 的 platform 取 product.json authentication.attributes.platform：国内站
 		// `workbuddy`（CLI 源码 `configuration.authentication?.attributes?.platform ?? configuration.platform`）。
 		Platform: "workbuddy",
@@ -347,7 +377,8 @@ var (
 	}
 	profileINTL = upstreamProfile{
 		Key: "intl", Label: "国际站",
-		Base: "https://www.workbuddy.ai",
+		Base: "https://www.workbuddy.ai", DefaultBase: "https://www.workbuddy.ai",
+		ChatBase: "https://www.workbuddy.ai",
 		// auth/state 的 platform 取 product.json authentication.attributes.platform。
 		Platform: "workbuddy-ai",
 		// 桌面宿主注入 bundled CLI 的 CLIENT_INFO_*（Desktop 源码 buildWorkbuddyClientInfoEnv）：
@@ -407,7 +438,14 @@ func (p *upstreamProfile) domain() string {
 	return clientDomain
 }
 
-func (p *upstreamProfile) chatURL() string { return p.Base + "/v2/chat/completions" }
+func (p *upstreamProfile) chatURL() string {
+	base := p.Base
+	// 测试或本地会把 Base 指向假上游；只有生产默认 Base 才切到 ChatBase。
+	if p.ChatBase != "" && (p.DefaultBase == "" || p.Base == p.DefaultBase) {
+		base = p.ChatBase
+	}
+	return base + "/v2/chat/completions"
+}
 
 func (p *upstreamProfile) quotaSummaryURL() string {
 	return p.PortalOrigin + "/billing/meter/get-user-resource-summary"
@@ -700,6 +738,9 @@ func main() {
 	})
 	serveCommand := command == "serve" || command == "run" || command == "start"
 	if serveCommand || command == "probe" {
+		if err := ensureRuntimeConfigFile(runtimeConfigFile); err != nil {
+			fmt.Fprintf(os.Stderr, "配置初始化警告: %v（继续使用内存默认值）\n", err)
+		}
 		if err := loadRuntimeConfig(runtimeConfigFile); err != nil {
 			fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
 			os.Exit(1)
@@ -3787,7 +3828,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		prof := acc.Profile()
 
 		debugEvent(r, "info", "upstream_request_started", map[string]any{
-			"upstream_host": prof.Base,
+			"upstream_host": prof.chatURL(),
 			"attempt":       attempt + 1,
 			"payload_bytes": len(upstreamBytes),
 		})
@@ -3799,7 +3840,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		acc.lock.Unlock()
 		if err != nil {
 			debugEvent(r, "error", "upstream_request_failed", map[string]any{
-				"upstream_host": prof.Base,
+				"upstream_host": prof.chatURL(),
 				"error_type":    debugErrorType(err),
 				"error":         safeDebugError(err),
 			})
@@ -3831,12 +3872,12 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			errStr := string(errBody)
 			debugFullUpstreamError(r, resp, errBody)
 			debugEvent(r, "warn", "upstream_response_rejected", map[string]any{
-				"upstream_host": prof.Base,
+				"upstream_host": prof.chatURL(),
 				"status_code":   resp.StatusCode,
 				"error_code":    modelStatusFromError(resp.StatusCode, errStr),
 			})
 			log.Printf("[#%d] 账号 %s [%s] 上游返回 HTTP %d: %s (耗时 %v)", reqID, acc.Path, prof.Label, resp.StatusCode, errStr, time.Since(startTime))
-			log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=失败 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)
+			log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=失败 账号=%s", traceID, reqID, prof.chatURL(), resp.StatusCode, acc.Path)
 
 			if isQuotaExhausted(resp.StatusCode, errStr) {
 				markModelQuotaBlocked(acc, modelName, errStr)
@@ -3892,10 +3933,10 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		}
 
 		debugEvent(r, "info", "upstream_response_received", map[string]any{
-			"upstream_host": prof.Base,
+			"upstream_host": prof.chatURL(),
 			"status_code":   resp.StatusCode,
 		})
-		log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=成功 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)
+		log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=成功 账号=%s", traceID, reqID, prof.chatURL(), resp.StatusCode, acc.Path)
 		recordModelSuccess(modelName)
 		// 用空闲看门狗包装响应体：持续有数据就永不超时，超过 upstreamIdleTimeout 无数据才中断。
 		// 关闭响应体时会一并取消上游 context，完成清理。

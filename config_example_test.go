@@ -59,6 +59,11 @@ func TestConfigExampleCoversEveryRuntimeField(t *testing.T) {
 	}
 	exampleSchema := runtimeFileConfig{}
 	exampleSchema.Models.Accounts = map[string]modelAccountFileConfig{"all": {}}
+	identityEnabled := true
+	exampleSchema.Identity = runtimeIdentityConfig{Enabled: &identityEnabled, Target: "WorkBuddy", Replacements: map[string]string{
+		"Claude Code": "WorkBuddy", "Claude": "WorkBuddy", "DeepSeek Harness": "WorkBuddy",
+		"Codex": "WorkBuddy", "ZCode": "WorkBuddy",
+	}}
 	schema, err := json.Marshal(exampleSchema)
 	if err != nil {
 		t.Fatal(err)
@@ -96,6 +101,7 @@ func TestConfigExampleCoversEveryRuntimeField(t *testing.T) {
 // 全新部署：直接使用示例文件必须能正常启动，并落到默认端口。
 func TestConfigExampleStartsFreshDeployment(t *testing.T) {
 	isolatedGatewayConfig(t)
+	t.Cleanup(func() { setIdentityConfig(runtimeIdentityConfig{}) })
 	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "config.example.json"))
 	if err != nil {
 		t.Fatal(err)

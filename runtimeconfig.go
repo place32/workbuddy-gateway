@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,9 @@ import (
 	"sync"
 	"time"
 )
+
+//go:embed config.example.json
+var embeddedDefaultRuntimeConfig []byte
 
 // 所有进程内配置文件读改写共用此锁，避免网页写入与热加载互相覆盖。
 // 锁序：runtimeConfigMu -> gatewayConfigMu；调度不持有此锁。
@@ -78,6 +82,93 @@ func hasModelNames(names []string) bool {
 	return false
 }
 
+// ensureRuntimeConfigFile creates a complete default config for a new user and
+// adds the identity block to an older config once. It never overwrites an
+// existing identity block and never prevents startup when the file is read-only.
+func ensureRuntimeConfigFile(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return writeNewRuntimeConfig(path)
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("config.json 不是普通文件")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil || doc == nil {
+		return nil // 交给正常配置校验报错；不覆盖半写或非法配置。
+	}
+	if _, exists := doc["identity"]; exists {
+		return nil
+	}
+	identity, err := json.Marshal(defaultIdentityConfig())
+	if err != nil {
+		return err
+	}
+	doc["identity"] = identity
+	updated, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	updated = append(updated, '\n')
+	if bytes.Equal(updated, raw) {
+		return nil
+	}
+	temporary := path + ".identity-" + fmt.Sprint(os.Getpid()) + ".tmp"
+	fd, err := os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	defer os.Remove(temporary)
+	if _, err := fd.Write(updated); err != nil {
+		fd.Close()
+		return err
+	}
+	if err := fd.Sync(); err != nil {
+		fd.Close()
+		return err
+	}
+	if err := fd.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		return err
+	}
+	log.Printf("[配置初始化] 已为旧配置补充 identity 段；其他配置保留，后续修改仍可热加载")
+	return nil
+}
+
+func writeNewRuntimeConfig(path string) error {
+	data := append([]byte(nil), embeddedDefaultRuntimeConfig...)
+	fd, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if errors.Is(err, os.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := fd.Write(data); err != nil {
+		fd.Close()
+		os.Remove(path)
+		return err
+	}
+	if err := fd.Sync(); err != nil {
+		fd.Close()
+		return err
+	}
+	if err := fd.Close(); err != nil {
+		return err
+	}
+	log.Printf("[配置初始化] 已生成默认 config.json")
+	return nil
+}
+
 func loadRuntimeConfig(path string) error {
 	runtimeConfigMu.Lock()
 	defer runtimeConfigMu.Unlock()
@@ -127,9 +218,21 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	setModelFilter(c.Models.Blocklist, c.Models.Allowlist)
 	_ = setModelAccountFilter(c.Models.Accounts)
 	setSystemPromptConfig(c.SystemPrompt.Fallback, c.SystemPrompt.Force)
+	setIdentityConfig(c.Identity)
+	identityEnabled, identityTarget, identityRuleCount := identitySettingsSummary()
+	log.Printf("[身份替换配置] traceId=%s 启用=%t 目标=%s 规则数=%d 说明=仅处理 system/developer/assistant 文本；热加载只影响后续请求", trace, identityEnabled, identityTarget, identityRuleCount)
 	previousProfile := officialRequests.Load()
 	setRequestProfile(profile)
-	if previousProfile != officialRequests.Load() {
+	// Always report the active compatibility profile at startup.
+	profileSource := "config.json upstream.requestProfile"
+	if c.Upstream.RequestProfile == "" {
+		profileSource = "缺省：config.json 未提供 upstream.requestProfile"
+	}
+	switch {
+	case !hot:
+		log.Printf("[出站兼容配置] traceId=%s profile=%s 来源=%s 结果=已应用 说明=gzip 按站点 GzipBody 配置，official 启用国内桌面端指纹；只影响后续模型请求，不修改登录与凭据",
+			trace, profile, profileSource)
+	case previousProfile != officialRequests.Load():
 		log.Printf("[出站兼容配置] traceId=%s profile=%s 结果=已应用 说明=只影响后续模型请求，正在执行的请求沿用原快照，不修改登录和凭据", trace, profile)
 	}
 	logRetentionDays.Store(int64(c.Logs.RetentionDays))

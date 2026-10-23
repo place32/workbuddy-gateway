@@ -177,7 +177,16 @@ func TestOfficialHeadersModelOnlyAndInternationalFallback(t *testing.T) {
 					t.Fatalf("unexpected header %s", name)
 				}
 			}
-			if req.Header.Get("Authorization") != "Bearer synthetic-access" {
+			for name, want := range map[string]string{
+				"x-requested-with": "XMLHttpRequest", "x-stainless-runtime": "node",
+				"x-stainless-runtime-version": "v22.21.1", "X-Agent-Intent": "craft",
+				"X-Agent-Purpose": "conversation", "X-Agent-Type": "main", "X-Product": "SaaS",
+			} {
+				if got := getHeaderExact(req.Header, name); got != want {
+					t.Fatalf("header %s=%q want %q", name, got, want)
+				}
+			}
+			if getHeaderExact(req.Header, "Authorization") != "Bearer synthetic-access" {
 				t.Fatal("model access token was lost")
 			}
 			for _, name := range append([]string{"X-Request-ID", conversationMessageIDHeader,
